@@ -1410,7 +1410,33 @@ class ScatteredRevisionApp:
         self.root.destroy()
 
 
+def _run_frozen_self_test() -> int:
+    import docx_xml_utils
+    import step1_extract_and_diff  # noqa: F401
+    import step1_render_draft  # noqa: F401
+    import step2_parse_reviewed  # noqa: F401
+    import step2_render_final  # noqa: F401
+
+    if getattr(sys, "frozen", False) and hasattr(sys, "_MEIPASS"):
+        bundled_cfg = Path(sys._MEIPASS) / "resources" / "config.json"
+        if not bundled_cfg.is_file():
+            raise FileNotFoundError(f"Bundled config.json missing inside EXE: {bundled_cfg}")
+
+    cfg = docx_xml_utils.load_config()
+    if cfg.get("col2_up_highlight") != "yellow" or not cfg.get("language_code_map"):
+        raise RuntimeError(f"Invalid config loaded in self-test: {cfg}")
+    langs = load_languages()
+    if not langs:
+        raise RuntimeError("Empty language registry in self-test")
+    pool = ApiKeyPool(["AQ.SelfTestDummyKey12345678", "AIzaSelfTestDummyKey87654321"])
+    if len(pool) != 2:
+        raise RuntimeError("ApiKeyPool self-test failed")
+    return 0
+
+
 def main():
+    if "--self-test" in sys.argv:
+        sys.exit(_run_frozen_self_test())
     _enable_high_dpi()
     root = tk.Tk()
     ScatteredRevisionApp(root)

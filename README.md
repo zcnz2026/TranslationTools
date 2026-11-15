@@ -69,6 +69,7 @@ python -m PyInstaller --noconfirm --clean --onefile --windowed `
   --paths ".\零散改点工具" `
   --paths ".\.agents\skills\scattered-revision\scripts" `
   --add-data ".\.agents\skills\scattered-revision\scripts;skill_scripts" `
+  --add-data ".\.agents\skills\scattered-revision\resources;resources" `
   --hidden-import docx_xml_utils `
   --hidden-import step1_extract_and_diff `
   --hidden-import step1_render_draft `

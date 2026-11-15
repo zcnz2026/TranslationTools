@@ -29,7 +29,9 @@ def main() -> None:
     check_only = "--check-only" in sys.argv
     repo_root = Path(__file__).resolve().parents[2]
     tool_dir = repo_root / TOOL_DIR_NAME
-    skill_scripts_dir = repo_root / ".agents" / "skills" / "scattered-revision" / "scripts"
+    skill_dir = repo_root / ".agents" / "skills" / "scattered-revision"
+    skill_scripts_dir = skill_dir / "scripts"
+    skill_resources_dir = skill_dir / "resources"
     req_file = tool_dir / "requirements-build.txt"
 
     if not tool_dir.is_dir():
@@ -64,7 +66,8 @@ def main() -> None:
     work_dir = work_root / "work"
     spec_dir = work_root / "spec"
 
-    add_data_arg = f"{skill_scripts_dir}{os.pathsep}skill_scripts"
+    add_scripts_arg = f"{skill_scripts_dir}{os.pathsep}skill_scripts"
+    add_resources_arg = f"{skill_resources_dir}{os.pathsep}resources"
     pyi_cmd = [
         sys.executable,
         "-m",
@@ -86,7 +89,9 @@ def main() -> None:
         "--paths",
         str(skill_scripts_dir),
         "--add-data",
-        add_data_arg,
+        add_scripts_arg,
+        "--add-data",
+        add_resources_arg,
         "--hidden-import",
         "docx_xml_utils",
         "--hidden-import",
@@ -112,6 +117,10 @@ def main() -> None:
     built_exe = dist_dir / "ScatteredRevisionTool.exe"
     if not built_exe.is_file():
         raise RuntimeError(f"Expected built EXE not found: {built_exe}")
+
+    print("[3.5/5] Verifying frozen EXE self-test (bundled config.json & modules)...")
+    subprocess.check_call([str(built_exe), "--self-test"], env=env)
+    print("      Frozen EXE self-test passed!")
 
     print("[4/5] Packaging portable ZIP with UTF-8 filenames...")
     art_dir = repo_root / "artifact_out"

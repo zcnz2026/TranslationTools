@@ -25,6 +25,50 @@ RPR_ORDER = [
 RPR_RANK = {name: idx for idx, name in enumerate(RPR_ORDER)}
 
 
+DEFAULT_CONFIG = {
+    "default_author": "整理组",
+    "col2_up_highlight": "yellow",
+    "col2_rv_highlight": "cyan",
+    "col3_up_highlight": "yellow",
+    "col3_rv_highlight": "lightGray",
+    "accept_col2_rv_revisions": False,
+    "split_col3_rv_paragraph": False,
+    "rv_word_change_ratio_threshold": 0.42,
+    "header_paragraphs": [],
+    "ensure_top_blank_lines": 2,
+    "language_code_map": {
+        "法语": "FR", "中英法": "FR",
+        "葡萄牙语": "PT", "葡语": "PT", "中英葡": "PT",
+        "西班牙语": "ES", "西语": "ES", "中英西": "ES",
+        "德语": "DE", "中英德": "DE",
+        "意大利语": "IT", "意语": "IT", "中英意": "IT",
+        "希腊语": "GR", "腊语": "GR", "中英腊": "GR",
+        "俄语": "RU", "中英俄": "RU",
+        "乌克兰语": "UK", "乌语": "UK", "中英乌": "UK",
+        "韩语": "KO", "朝鲜语": "KO", "中英韩": "KO",
+        "日语": "JA", "日本语": "JA", "中英日": "JA",
+        "泰语": "TH", "中英泰": "TH",
+        "越南语": "VI", "越语": "VI", "中英越": "VI",
+        "印度尼西亚语": "ID", "印尼语": "ID", "中英印尼": "ID",
+        "马来语": "MS", "中英马来": "MS",
+        "塔加洛语": "TL", "他加禄语": "TL", "菲律宾语": "TL", "中英塔": "TL",
+        "缅甸语": "MY", "缅语": "MY", "中英缅": "MY",
+        "高棉语": "KM", "柬埔寨语": "KM", "中英柬": "KM",
+        "老挝语": "LO", "中英老": "LO",
+        "阿拉伯语": "AR", "阿语": "AR", "中英阿": "AR",
+        "土耳其语": "TR", "土语": "TR", "中英土": "TR",
+        "波斯语": "FA", "中英波斯": "FA",
+        "希伯来语": "HE", "印地语": "HI", "乌尔都语": "UR", "孟加拉语": "BN",
+        "波兰语": "PL", "中英波": "PL",
+        "荷兰语": "NL", "中英荷": "NL",
+        "罗马尼亚语": "RO", "中英罗": "RO",
+        "捷克语": "CS", "匈牙利语": "HU", "保加利亚语": "BG", "瑞典语": "SV",
+        "蒙古语": "MN", "斯瓦希里语": "SW", "阿姆哈拉语": "AM",
+    },
+    "exclude_library_dir_keywords": ["标记结果", "初筛", "答案", "output", "temp"],
+}
+
+
 def load_config():
     import os
     import sys
@@ -34,6 +78,9 @@ def load_config():
     ]
     if getattr(sys, "frozen", False) and hasattr(sys, "_MEIPASS"):
         candidates.insert(0, Path(sys._MEIPASS) / "resources" / "config.json")
+        candidates.insert(1, Path(sys._MEIPASS) / "skill_scripts" / "resources" / "config.json")
+    if getattr(sys, "frozen", False):
+        candidates.insert(0, Path(sys.executable).resolve().parent / "config.json")
 
     cfg = None
     for cfg_path in candidates:
@@ -42,7 +89,7 @@ def load_config():
                 cfg = json.load(f)
             break
     if cfg is None:
-        raise FileNotFoundError(f"config.json not found in {[str(c) for c in candidates]}")
+        cfg = copy.deepcopy(DEFAULT_CONFIG)
 
     # Merge user-extensible languages.json if present
     lang_json_candidates = []
