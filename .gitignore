@@ -1,0 +1,21 @@
+# 敏感凭据与本机个人配置文件（严禁提交至版本库）
+.env
+*.env
+!.env.example
+**/app_settings.json
+
+# 本地业务稿件、语种总库、测试输出与内部会议记录（严禁上传）
+1、零散改点稿*/
+零散改点_测试输出/
+*.docx
+~$*.docx
+code_artifact.md
+整理 这里的所有需求*.md
+
+# 编译产物与 Python 缓存
+*.exe
+__pycache__/
+*.py[cod]
+build/
+dist/
+*.spec
