@@ -46,6 +46,7 @@ from word_counter import (
     format_counted_docx_name,
     parse_doc_filename,
 )
+from win_dnd import WinFileDropManager
 
 
 def _enable_high_dpi():
@@ -514,9 +515,9 @@ class LanguageManagerDialog(tk.Toplevel):
 class ScatteredRevisionApp:
     def __init__(self, root: tk.Tk):
         self.root = root
-        self.root.title("零散改点自动整理工具 v1.4  (三版输出 + 独立字数统计重命名 + 多 Key 无限轮换)")
-        self.root.geometry("980x810")
-        self.root.minsize(890, 720)
+        self.root.title("零散改点自动整理工具 v1.4.1  (支持文件/文件夹直接拖拽 + 左侧导航 + 三版输出 + 字数统计)")
+        self.root.geometry("1100x800")
+        self.root.minsize(980, 700)
 
         self.log_queue: queue.Queue = queue.Queue()
         self.is_running = False
@@ -527,11 +528,15 @@ class ScatteredRevisionApp:
         self._pool_multiline_text: str = ""
         self._syncing_key_var: bool = False
         self.wc_files: list[str] = []
+        self.active_tab_key: str = "main"
+        self._nav_items: dict = {}
+        self.dnd = WinFileDropManager(self.root, fallback_cb=self._on_drop_fallback)
 
         self._setup_styles()
         self._init_vars()
         self._load_settings()
         self._build_ui()
+        self._setup_drag_and_drop()
         self._refresh_key_pool_badge()
         self.root.protocol("WM_DELETE_WINDOW", self._on_close)
         self._poll_log_queue()
@@ -727,20 +732,202 @@ class ScatteredRevisionApp:
             pass
 
     def _build_ui(self):
-        outer = ttk.Frame(self.root, padding=8)
+        outer = tk.Frame(self.root)
         outer.pack(fill=tk.BOTH, expand=True)
 
-        self.notebook = ttk.Notebook(outer)
-        self.notebook.pack(fill=tk.BOTH, expand=True)
+        # Left Navigation Sidebar ("标签选项放到左边")
+        self.sidebar = tk.Frame(
+            outer,
+            bg="#ffffff",
+            width=204,
+            highlightbackground="#cbd5e1",
+            highlightthickness=1,
+        )
+        self.sidebar.pack(side=tk.LEFT, fill=tk.Y)
+        self.sidebar.pack_propagate(False)
 
-        self.tab_main = ttk.Frame(self.notebook, padding=8)
-        self.tab_wc = ttk.Frame(self.notebook, padding=10)
+        brand_box = tk.Frame(self.sidebar, bg="#ffffff", padx=14, pady=14)
+        brand_box.pack(fill=tk.X)
+        tk.Label(
+            brand_box,
+            text="零散改点整理工具",
+            font=("Microsoft YaHei UI", 11, "bold"),
+            fg="#0f172a",
+            bg="#ffffff",
+            anchor=tk.W,
+        ).pack(fill=tk.X)
+        tk.Label(
+            brand_box,
+            text="v1.4.1 · 支持拖拽文件/文件夹",
+            font=("Microsoft YaHei UI", 8),
+            fg="#64748b",
+            bg="#ffffff",
+            anchor=tk.W,
+        ).pack(fill=tk.X, pady=(3, 0))
 
-        self.notebook.add(self.tab_main, text="  📝 零散改点自动整理  ")
-        self.notebook.add(self.tab_wc, text="  📊 计算文档字数 & 更新文件名  ")
+        tk.Frame(self.sidebar, bg="#e2e8f0", height=1).pack(fill=tk.X, padx=12, pady=(0, 10))
+
+        tk.Label(
+            self.sidebar,
+            text="功能标签页",
+            font=("Microsoft YaHei UI", 8, "bold"),
+            fg="#64748b",
+            bg="#ffffff",
+            anchor=tk.W,
+            padx=14,
+        ).pack(fill=tk.X, pady=(0, 6))
+
+        self.nav_btn_main = self._create_sidebar_tab(
+            key="main",
+            title="📝 零散改点整理",
+            subtitle="初筛 · 标色 · 三版定稿",
+        )
+        self.nav_btn_wc = self._create_sidebar_tab(
+            key="wc",
+            title="📊 计算文档字数",
+            subtitle="算英文词数 · 改文件名",
+        )
+
+        # Bottom Drag & Drop quick tip inside left sidebar
+        dnd_tip_card = tk.Frame(
+            self.sidebar,
+            bg="#f8fafc",
+            highlightbackground="#cbd5e1",
+            highlightthickness=1,
+            padx=10,
+            pady=10,
+        )
+        dnd_tip_card.pack(side=tk.BOTTOM, fill=tk.X, padx=10, pady=12)
+        tk.Label(
+            dnd_tip_card,
+            text="📥 快捷拖拽说明",
+            font=("Microsoft YaHei UI", 9, "bold"),
+            fg="#1d4ed8",
+            bg="#f8fafc",
+            anchor=tk.W,
+        ).pack(fill=tk.X)
+        tk.Label(
+            dnd_tip_card,
+            text=(
+                "可直接从桌面或资源管理器把 .docx 文档或文件夹拖入：\n"
+                "• 右侧各路径输入框\n"
+                "• 右侧空白处/预览列表\n"
+                "• 左侧对应功能标签"
+            ),
+            font=("Microsoft YaHei UI", 8),
+            fg="#475569",
+            bg="#f8fafc",
+            justify=tk.LEFT,
+            anchor=tk.W,
+            wraplength=172,
+        ).pack(fill=tk.X, pady=(4, 0))
+
+        # Right Content Area
+        self.content_area = ttk.Frame(outer, padding=(10, 8, 10, 8))
+        self.content_area.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+        self.content_area.rowconfigure(0, weight=1)
+        self.content_area.columnconfigure(0, weight=1)
+
+        self.tab_main = ttk.Frame(self.content_area)
+        self.tab_wc = ttk.Frame(self.content_area)
+
+        self.tab_main.grid(row=0, column=0, sticky=tk.NSEW)
+        self.tab_wc.grid(row=0, column=0, sticky=tk.NSEW)
 
         self._build_tab1_pipeline(self.tab_main)
         self._build_tab2_word_counter(self.tab_wc)
+
+        self._switch_tab("main")
+
+    def _create_sidebar_tab(self, key: str, title: str, subtitle: str) -> tk.Frame:
+        card = tk.Frame(
+            self.sidebar,
+            bg="#ffffff",
+            highlightbackground="#e2e8f0",
+            highlightthickness=1,
+            cursor="hand2",
+        )
+        card.pack(fill=tk.X, padx=10, pady=4)
+
+        bar = tk.Frame(card, bg="#ffffff", width=4)
+        bar.pack(side=tk.LEFT, fill=tk.Y)
+
+        inner = tk.Frame(card, bg="#ffffff", padx=10, pady=9, cursor="hand2")
+        inner.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+
+        lbl_title = tk.Label(
+            inner,
+            text=title,
+            font=("Microsoft YaHei UI", 10, "bold"),
+            fg="#1e293b",
+            bg="#ffffff",
+            anchor=tk.W,
+            cursor="hand2",
+        )
+        lbl_title.pack(fill=tk.X)
+
+        lbl_sub = tk.Label(
+            inner,
+            text=subtitle,
+            font=("Microsoft YaHei UI", 8),
+            fg="#64748b",
+            bg="#ffffff",
+            anchor=tk.W,
+            cursor="hand2",
+        )
+        lbl_sub.pack(fill=tk.X, pady=(2, 0))
+
+        self._nav_items[key] = {
+            "card": card,
+            "bar": bar,
+            "inner": inner,
+            "title": lbl_title,
+            "sub": lbl_sub,
+        }
+
+        def _on_click(_e=None):
+            self._switch_tab(key)
+
+        def _on_enter(_e=None):
+            if self.active_tab_key != key:
+                for w in (card, inner, lbl_title, lbl_sub):
+                    w.configure(bg="#f8fafc")
+                bar.configure(bg="#cbd5e1")
+
+        def _on_leave(_e=None):
+            if self.active_tab_key != key:
+                for w in (card, inner, lbl_title, lbl_sub):
+                    w.configure(bg="#ffffff")
+                bar.configure(bg="#ffffff")
+
+        for w in (card, bar, inner, lbl_title, lbl_sub):
+            w.bind("<Button-1>", _on_click)
+        card.bind("<Enter>", _on_enter)
+        card.bind("<Leave>", _on_leave)
+        return card
+
+    def _switch_tab(self, key: str):
+        self.active_tab_key = key
+        if key == "main":
+            self.tab_wc.grid_remove()
+            self.tab_main.grid(row=0, column=0, sticky=tk.NSEW)
+        else:
+            self.tab_main.grid_remove()
+            self.tab_wc.grid(row=0, column=0, sticky=tk.NSEW)
+
+        for k, parts in self._nav_items.items():
+            is_act = k == key
+            bg = "#eff6ff" if is_act else "#ffffff"
+            border = "#93c5fd" if is_act else "#e2e8f0"
+            bar_c = "#2563eb" if is_act else "#ffffff"
+            fg_t = "#1d4ed8" if is_act else "#1e293b"
+            fg_s = "#2563eb" if is_act else "#64748b"
+
+            parts["card"].configure(bg=bg, highlightbackground=border)
+            parts["bar"].configure(bg=bar_c)
+            parts["inner"].configure(bg=bg)
+            parts["title"].configure(bg=bg, fg=fg_t)
+            parts["sub"].configure(bg=bg, fg=fg_s)
 
     def _build_tab1_pipeline(self, main: ttk.Frame):
         # 1. API & Model Frame
@@ -808,27 +995,39 @@ class ScatteredRevisionApp:
         ).pack(side=tk.LEFT)
 
         # 2. Paths & Multi-Language Options Frame
-        path_frame = ttk.LabelFrame(main, text=" 2. 文档、总库路径与多语种输出设置 ", padding=10)
+        path_frame = ttk.LabelFrame(
+            main,
+            text=" 2. 文档、总库路径与多语种输出设置（📥 支持直接将文件/文件夹拖拽到对应输入框或页面任意空白处） ",
+            padding=10,
+        )
         path_frame.pack(fill=tk.X, pady=(0, 8))
         path_frame.columnconfigure(1, weight=1)
 
-        ttk.Label(path_frame, text="待整理文档 (.docx)：").grid(row=0, column=0, sticky=tk.W, pady=4)
-        ttk.Entry(path_frame, textvariable=self.input_docx_var).grid(row=0, column=1, sticky=tk.EW, pady=4, padx=4)
+        self.lbl_input_docx = ttk.Label(path_frame, text="待整理文档 (.docx)：")
+        self.lbl_input_docx.grid(row=0, column=0, sticky=tk.W, pady=4)
+        self.ent_input_docx = ttk.Entry(path_frame, textvariable=self.input_docx_var)
+        self.ent_input_docx.grid(row=0, column=1, sticky=tk.EW, pady=4, padx=4)
         ttk.Button(path_frame, text="浏览...", width=10, command=self._browse_input).grid(row=0, column=2, padx=2)
 
-        ttk.Label(path_frame, text="对应语种总库目录：").grid(row=1, column=0, sticky=tk.W, pady=4)
-        ttk.Entry(path_frame, textvariable=self.library_dir_var).grid(row=1, column=1, sticky=tk.EW, pady=4, padx=4)
+        self.lbl_library_dir = ttk.Label(path_frame, text="对应语种总库目录：")
+        self.lbl_library_dir.grid(row=1, column=0, sticky=tk.W, pady=4)
+        self.ent_library_dir = ttk.Entry(path_frame, textvariable=self.library_dir_var)
+        self.ent_library_dir.grid(row=1, column=1, sticky=tk.EW, pady=4, padx=4)
         ttk.Button(path_frame, text="浏览...", width=10, command=self._browse_library).grid(row=1, column=2, padx=2)
 
-        ttk.Label(path_frame, text="输出保存目录：").grid(row=2, column=0, sticky=tk.W, pady=4)
-        ttk.Entry(path_frame, textvariable=self.output_dir_var).grid(row=2, column=1, sticky=tk.EW, pady=4, padx=4)
+        self.lbl_output_dir = ttk.Label(path_frame, text="输出保存目录：")
+        self.lbl_output_dir.grid(row=2, column=0, sticky=tk.W, pady=4)
+        self.ent_output_dir = ttk.Entry(path_frame, textvariable=self.output_dir_var)
+        self.ent_output_dir.grid(row=2, column=1, sticky=tk.EW, pady=4, padx=4)
         out_btns = ttk.Frame(path_frame)
         out_btns.grid(row=2, column=2, columnspan=2, sticky=tk.W)
         ttk.Button(out_btns, text="浏览...", width=10, command=self._browse_output).pack(side=tk.LEFT, padx=2)
         ttk.Button(out_btns, text="打开目录", width=10, command=self._open_output_dir).pack(side=tk.LEFT, padx=2)
 
-        ttk.Label(path_frame, text="初筛确认稿 (第二步用)：").grid(row=3, column=0, sticky=tk.W, pady=4)
-        ttk.Entry(path_frame, textvariable=self.draft_docx_var).grid(row=3, column=1, sticky=tk.EW, pady=4, padx=4)
+        self.lbl_draft_docx = ttk.Label(path_frame, text="初筛确认稿 (第二步用)：")
+        self.lbl_draft_docx.grid(row=3, column=0, sticky=tk.W, pady=4)
+        self.ent_draft_docx = ttk.Entry(path_frame, textvariable=self.draft_docx_var)
+        self.ent_draft_docx.grid(row=3, column=1, sticky=tk.EW, pady=4, padx=4)
         draft_btns = ttk.Frame(path_frame)
         draft_btns.grid(row=3, column=2, columnspan=2, sticky=tk.W)
         ttk.Button(draft_btns, text="浏览...", width=10, command=self._browse_draft).pack(side=tk.LEFT, padx=2)
@@ -970,7 +1169,7 @@ class ScatteredRevisionApp:
 
         key_cnt = len(self._get_all_keys_list())
         self._append_log(
-            f"欢迎使用零散改点自动整理工具 v1.4！已载入 {key_cnt} 个 API Key、{len(self.languages)} 种语言；支持导出无改点版文档与独立字数统计标签页。"
+            f"欢迎使用零散改点自动整理工具 v1.4.1！已载入 {key_cnt} 个 API Key、{len(self.languages)} 种语言；支持直接拖拽文件与文件夹。"
         )
 
     def _build_tab2_word_counter(self, parent: ttk.Frame):
@@ -990,8 +1189,30 @@ class ScatteredRevisionApp:
         ).pack(fill=tk.X)
 
         # 2. File picker & naming parameters
-        cfg_frame = ttk.LabelFrame(parent, text=" 1. 选择文档与命名参数 ", padding=10)
+        cfg_frame = ttk.LabelFrame(parent, text=" 1. 拖拽 / 选择文档与命名参数 ", padding=10)
         cfg_frame.pack(fill=tk.X, pady=(0, 8))
+
+        drop_zone = tk.Frame(
+            cfg_frame,
+            bg="#eff6ff",
+            highlightbackground="#93c5fd",
+            highlightthickness=1,
+            padx=12,
+            pady=7,
+            cursor="hand2",
+        )
+        drop_zone.pack(fill=tk.X, pady=(0, 8))
+        dz_lbl = tk.Label(
+            drop_zone,
+            text="📥 直接把一个或多个 .docx 文档、文件夹拖拽到此窗口任意位置即可自动载入（点击此处也可选择文件）",
+            font=("Microsoft YaHei UI", 9, "bold"),
+            fg="#1d4ed8",
+            bg="#eff6ff",
+            cursor="hand2",
+        )
+        dz_lbl.pack(fill=tk.X)
+        drop_zone.bind("<Button-1>", lambda _e: self._wc_add_files())
+        dz_lbl.bind("<Button-1>", lambda _e: self._wc_add_files())
 
         file_btns = ttk.Frame(cfg_frame)
         file_btns.pack(fill=tk.X, pady=(0, 8))
@@ -1065,17 +1286,23 @@ class ScatteredRevisionApp:
             value="inplace",
             variable=self.wc_save_mode_var,
         ).pack(side=tk.LEFT, padx=(4, 16))
-        ttk.Radiobutton(
+        self.wc_copy_radio = ttk.Radiobutton(
             row_mode,
             text="另存副本到指定文件夹：",
             value="copy",
             variable=self.wc_save_mode_var,
-        ).pack(side=tk.LEFT)
-        ttk.Entry(row_mode, textvariable=self.wc_copy_dir_var, width=30).pack(side=tk.LEFT, padx=4, fill=tk.X, expand=True)
+        )
+        self.wc_copy_radio.pack(side=tk.LEFT)
+        self.wc_copy_dir_entry = ttk.Entry(row_mode, textvariable=self.wc_copy_dir_var, width=30)
+        self.wc_copy_dir_entry.pack(side=tk.LEFT, padx=4, fill=tk.X, expand=True)
         ttk.Button(row_mode, text="浏览...", width=8, command=self._wc_browse_copy_dir).pack(side=tk.LEFT)
 
         # 3. Preview & Results Treeview
-        tbl_box = ttk.LabelFrame(parent, text=" 2. 第 2 列英文字数统计与新文件名预览（双击任意行可打开所在目录） ", padding=8)
+        tbl_box = ttk.LabelFrame(
+            parent,
+            text=" 2. 第 2 列英文字数统计与新文件名预览（📥 支持直接将文件/文件夹拖入下表；双击行可打开目录） ",
+            padding=8,
+        )
         tbl_box.pack(fill=tk.BOTH, expand=True, pady=(0, 8))
 
         cols = ("old_name", "lang", "up_words", "rv_words", "new_name", "status")
@@ -1126,7 +1353,170 @@ class ScatteredRevisionApp:
             command=self._wc_refresh_previews,
         ).pack(side=tk.RIGHT, padx=(0, 8))
 
+    # ---------------- Drag & Drop Integration ----------------
+
+    def _setup_drag_and_drop(self):
+        # Left sidebar tab buttons: dropping onto a tab switches to it and applies the drop
+        self.dnd.register_target(self.nav_btn_main, lambda ps: (self._switch_tab("main"), self._on_drop_tab1_general(ps)))
+        self.dnd.register_target(self.nav_btn_wc, lambda ps: (self._switch_tab("wc"), self._wc_ingest_paths(ps)))
+
+        # Tab 1 specific input rows
+        for w in (self.lbl_input_docx, self.ent_input_docx):
+            self.dnd.register_target(w, self._on_drop_input_docx)
+        for w in (self.lbl_library_dir, self.ent_library_dir):
+            self.dnd.register_target(w, self._on_drop_library_dir)
+        for w in (self.lbl_output_dir, self.ent_output_dir):
+            self.dnd.register_target(w, self._on_drop_output_dir)
+        for w in (self.lbl_draft_docx, self.ent_draft_docx):
+            self.dnd.register_target(w, self._on_drop_draft_docx)
+
+        # Tab 2 specific copy-folder target
+        for w in (self.wc_copy_radio, self.wc_copy_dir_entry):
+            self.dnd.register_target(w, self._on_drop_wc_copy_dir)
+
+        self.dnd.install()
+
+    def _on_drop_fallback(self, paths: list[Path]):
+        if self.active_tab_key == "wc":
+            self._wc_ingest_paths(paths)
+        else:
+            self._on_drop_tab1_general(paths)
+
+    @staticmethod
+    def _extract_docx_from_paths(paths: list[Path]) -> list[Path]:
+        out: list[Path] = []
+        for p in paths:
+            try:
+                rp = p.resolve()
+                if rp.is_file() and rp.suffix.lower() == ".docx" and not rp.name.startswith("~$"):
+                    out.append(rp)
+                elif rp.is_dir():
+                    top = sorted(x for x in rp.glob("*.docx") if not x.name.startswith("~$"))
+                    if top:
+                        out.extend(top)
+                    else:
+                        out.extend(sorted(x for x in rp.rglob("*.docx") if not x.name.startswith("~$")))
+            except Exception:
+                continue
+        return out
+
+    def _on_drop_input_docx(self, paths: list[Path]):
+        docxs = self._extract_docx_from_paths(paths)
+        if not docxs:
+            messagebox.showinfo("拖拽提示", "【待整理文档】请拖入 .docx 格式的 Word 文档。")
+            return
+        picked = docxs[0]
+        self.input_docx_var.set(str(picked))
+        if not self.output_dir_var.get().strip():
+            self.output_dir_var.set(str(picked.parent))
+        self._save_settings()
+        self._append_log(f"📥 已拖入【待整理文档】：{picked}")
+        self.stage_var.set(f"📥 已载入待整理文档：{picked.name}")
+
+    def _on_drop_library_dir(self, paths: list[Path]):
+        p = paths[0].resolve()
+        target_dir = p if p.is_dir() else p.parent
+        if not target_dir.is_dir():
+            return
+        self.library_dir_var.set(str(target_dir))
+        self._save_settings()
+        self._append_log(f"📥 已拖入【对应语种总库目录】：{target_dir}")
+        self.stage_var.set(f"📥 已载入总库目录：{target_dir.name}")
+
+    def _on_drop_output_dir(self, paths: list[Path]):
+        p = paths[0].resolve()
+        target_dir = p if p.is_dir() else p.parent
+        if not target_dir.is_dir():
+            return
+        self.output_dir_var.set(str(target_dir))
+        self._save_settings()
+        self._append_log(f"📥 已拖入【输出保存目录】：{target_dir}")
+        self.stage_var.set(f"📥 已设定输出目录：{target_dir.name}")
+
+    def _on_drop_draft_docx(self, paths: list[Path]):
+        docxs = self._extract_docx_from_paths(paths)
+        if not docxs:
+            messagebox.showinfo("拖拽提示", "【初筛确认稿】请拖入 .docx 格式的 Word 文档。")
+            return
+        picked = docxs[0]
+        self.draft_docx_var.set(str(picked))
+        if not self.output_dir_var.get().strip():
+            self.output_dir_var.set(str(picked.parent))
+        self._save_settings()
+        self._append_log(f"📥 已拖入【初筛确认稿】：{picked}")
+        self.stage_var.set(f"📥 已载入初筛确认稿：{picked.name}")
+
+    def _on_drop_tab1_general(self, paths: list[Path]):
+        docx_files: list[Path] = []
+        dirs: list[Path] = []
+        for p in paths:
+            try:
+                rp = p.resolve()
+                if rp.is_dir():
+                    dirs.append(rp)
+                elif rp.is_file() and rp.suffix.lower() == ".docx" and not rp.name.startswith("~$"):
+                    docx_files.append(rp)
+            except Exception:
+                continue
+
+        applied = []
+        for df in docx_files:
+            if df.name.startswith("初筛_"):
+                self.draft_docx_var.set(str(df))
+                if not self.output_dir_var.get().strip():
+                    self.output_dir_var.set(str(df.parent))
+                applied.append(f"初筛稿={df.name}")
+                self._append_log(f"📥 已自动识别并填入【初筛确认稿】：{df}")
+            else:
+                self.input_docx_var.set(str(df))
+                if not self.output_dir_var.get().strip():
+                    self.output_dir_var.set(str(df.parent))
+                applied.append(f"待整理文档={df.name}")
+                self._append_log(f"📥 已自动识别并填入【待整理文档】：{df}")
+
+        lib_assigned = False
+        for d in dirs:
+            has_corpus_docx = any(
+                not f.name.startswith("~$") for f in d.rglob("*.docx")
+            )
+            if has_corpus_docx and not lib_assigned:
+                self.library_dir_var.set(str(d))
+                lib_assigned = True
+                applied.append(f"总库目录={d.name}")
+                self._append_log(f"📥 已自动识别并填入【对应语种总库目录】：{d}")
+            else:
+                self.output_dir_var.set(str(d))
+                applied.append(f"输出目录={d.name}")
+                self._append_log(f"📥 已填入【输出保存目录】：{d}")
+
+        if not applied:
+            messagebox.showinfo("拖拽提示", "请拖入 .docx 文档或文件夹。")
+            return
+
+        self._save_settings()
+        self.stage_var.set("📥 拖拽载入成功：" + "  |  ".join(applied))
+
+    def _on_drop_wc_copy_dir(self, paths: list[Path]):
+        p = paths[0].resolve()
+        target_dir = p if p.is_dir() else p.parent
+        if target_dir.is_dir():
+            self.wc_copy_dir_var.set(str(target_dir))
+            self.wc_save_mode_var.set("copy")
+
     # ---------------- Tab 2 Word Counter Methods ----------------
+
+    def _wc_ingest_paths(self, paths: list[Path]):
+        found_docx = self._extract_docx_from_paths(paths)
+        if not found_docx:
+            messagebox.showinfo("提示", "拖入或选择的项目中未找到任何有效的 .docx 文档。")
+            return
+        existing_norm = {os.path.normcase(str(Path(x).resolve())) for x in self.wc_files}
+        for rp in found_docx:
+            key = os.path.normcase(str(rp))
+            if key not in existing_norm:
+                existing_norm.add(key)
+                self.wc_files.append(str(rp))
+        self._wc_refresh_previews()
 
     def _wc_add_files(self):
         paths = filedialog.askopenfilenames(
@@ -1135,33 +1525,13 @@ class ScatteredRevisionApp:
         )
         if not paths:
             return
-        existing_norm = {os.path.normcase(str(Path(x).resolve())) for x in self.wc_files}
-        for raw_p in paths:
-            rp = Path(raw_p).resolve()
-            if rp.name.startswith("~$"):
-                continue
-            key = os.path.normcase(str(rp))
-            if key not in existing_norm:
-                existing_norm.add(key)
-                self.wc_files.append(str(rp))
-        self._wc_refresh_previews()
+        self._wc_ingest_paths([Path(x) for x in paths])
 
     def _wc_add_folder(self):
         d = filedialog.askdirectory(title="选择包含 Word 文档的文件夹")
         if not d:
             return
-        dp = Path(d).resolve()
-        docx_list = sorted(p for p in dp.glob("*.docx") if not p.name.startswith("~$"))
-        if not docx_list:
-            messagebox.showinfo("提示", "该文件夹下未找到任何 .docx 文档。")
-            return
-        existing_norm = {os.path.normcase(str(Path(x).resolve())) for x in self.wc_files}
-        for rp in docx_list:
-            key = os.path.normcase(str(rp))
-            if key not in existing_norm:
-                existing_norm.add(key)
-                self.wc_files.append(str(rp))
-        self._wc_refresh_previews()
+        self._wc_ingest_paths([Path(d)])
 
     def _wc_remove_selected(self):
         sel = self.wc_tree.selection()
@@ -1796,6 +2166,10 @@ class ScatteredRevisionApp:
 
     def _on_close(self):
         self._save_settings()
+        try:
+            self.dnd.unhook()
+        except Exception:
+            pass
         self.root.destroy()
 
 
@@ -1805,6 +2179,7 @@ def _run_frozen_self_test() -> int:
     import step1_render_draft  # noqa: F401
     import step2_parse_reviewed  # noqa: F401
     import step2_render_final  # noqa: F401
+    import win_dnd  # noqa: F401
 
     if getattr(sys, "frozen", False) and hasattr(sys, "_MEIPASS"):
         bundled_cfg = Path(sys._MEIPASS) / "resources" / "config.json"

@@ -111,6 +111,8 @@ def main() -> None:
         "--hidden-import",
         "word_counter",
         "--hidden-import",
+        "win_dnd",
+        "--hidden-import",
         "pipeline",
         str(tool_dir / "app_gui.py"),
     ]
