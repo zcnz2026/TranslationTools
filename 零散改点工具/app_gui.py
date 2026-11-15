@@ -527,8 +527,8 @@ class LanguageManagerDialog(tk.Toplevel):
 class ScatteredRevisionApp:
     def __init__(self, root: tk.Tk):
         self.root = root
-        self.root.title("零散改点自动整理工具 v1.5.0  (零散改点 · 字数统计 · 弟兄交通整理 · 支持文件/文件夹直接拖拽)")
-        self.root.geometry("1120x820")
+        self.root.title("零散改点自动整理工具 v1.5.1  (零散改点 · 字数统计 · 弟兄交通整理 · 支持文件/文件夹直接拖拽)")
+        self.root.geometry("1120x825")
         self.root.minsize(980, 700)
 
         self.log_queue: queue.Queue = queue.Queue()
@@ -616,6 +616,7 @@ class ScatteredRevisionApp:
         self.fel_date_var = tk.StringVar(value=datetime.now().strftime("%Y%m%d"))
         self.fel_quote_label_var = tk.StringVar(value=QUOTE_MODES[0][0])
         self.fel_output_mode_var = tk.StringVar(value="single_only")  # "single_only", "merged_only", "both"
+        self.fel_enable_ai_var = tk.BooleanVar(value=True)
         self.fel_summary_var = tk.StringVar(
             value="当前共 0 份分篇文档  |  支持直接拖入整个分篇文件夹或多个 .docx 自动排序"
         )
@@ -741,6 +742,7 @@ class ScatteredRevisionApp:
                 saved_fel_quote = cfg.get("fel_quote_label", "")
                 if saved_fel_quote in {q[0] for q in QUOTE_MODES}:
                     self.fel_quote_label_var.set(saved_fel_quote)
+                self.fel_enable_ai_var.set(bool(cfg.get("fel_enable_ai", True)))
             except Exception:
                 pass
 
@@ -775,6 +777,7 @@ class ScatteredRevisionApp:
             "fel_lang": self._get_fel_lang_code(),
             "fel_output_mode": self.fel_output_mode_var.get(),
             "fel_quote_label": self.fel_quote_label_var.get(),
+            "fel_enable_ai": self.fel_enable_ai_var.get(),
         }
         try:
             with open(SETTINGS_FILE, "w", encoding="utf-8") as f:
@@ -809,7 +812,7 @@ class ScatteredRevisionApp:
         ).pack(fill=tk.X)
         tk.Label(
             brand_box,
-            text="v1.5.0 · 支持拖拽文件/文件夹",
+            text="v1.5.1 · 支持拖拽文件/文件夹",
             font=("Microsoft YaHei UI", 8),
             fg="#64748b",
             bg="#ffffff",
@@ -1232,7 +1235,7 @@ class ScatteredRevisionApp:
 
         key_cnt = len(self._get_all_keys_list())
         self._append_log(
-            f"欢迎使用零散改点自动整理工具 v1.5.0！已载入 {key_cnt} 个 API Key、{len(self.languages)} 种语言；支持零散改点、字数统计与弟兄交通整理。"
+            f"欢迎使用零散改点自动整理工具 v1.5.1！已载入 {key_cnt} 个 API Key、{len(self.languages)} 种语言；支持零散改点、字数统计与弟兄交通整理。"
         )
 
     def _build_tab2_word_counter(self, parent: ttk.Frame):
@@ -1516,7 +1519,7 @@ class ScatteredRevisionApp:
         ).pack(side=tk.LEFT, padx=(3, 0), fill=tk.X, expand=True)
 
         mode_row = ttk.Frame(cfg_frame)
-        mode_row.pack(fill=tk.X, pady=(4, 0))
+        mode_row.pack(fill=tk.X, pady=(4, 2))
         ttk.Label(mode_row, text="输出方式：", font=("Microsoft YaHei UI", 9, "bold")).pack(side=tk.LEFT)
         for disp_txt, mode_val in OUTPUT_MODES:
             ttk.Radiobutton(
@@ -1526,6 +1529,15 @@ class ScatteredRevisionApp:
                 variable=self.fel_output_mode_var,
                 command=self._fel_refresh_previews,
             ).pack(side=tk.LEFT, padx=(6, 10))
+
+        ai_opt_row = ttk.Frame(cfg_frame)
+        ai_opt_row.pack(fill=tk.X, pady=(2, 0))
+        ttk.Checkbutton(
+            ai_opt_row,
+            text="使用 AI 自动还原第 3 列段内局部蓝粗引文（原稿已有蓝粗自动跳过；取消勾选则 100% 纯本地离线秒出）",
+            variable=self.fel_enable_ai_var,
+            command=self._save_settings,
+        ).pack(side=tk.LEFT)
 
         # 2. Sorted Part List & Output Filename Preview Treeview
         tbl_box = ttk.LabelFrame(
@@ -1982,14 +1994,15 @@ class ScatteredRevisionApp:
             messagebox.showwarning("提示", "请先指定【输出保存目录】。")
             return
 
+        use_ai = self.fel_enable_ai_var.get()
         keys = self._get_all_keys_list()
-        if not keys:
+        if use_ai and not keys:
             proceed = messagebox.askyesno(
                 "未配置 API Key 提醒",
-                "当前尚未填写 API Key。\n\n"
+                "当前已勾选「使用 AI 自动还原第 3 列段内局部蓝粗引文」，但尚未填写 API Key。\n\n"
                 "• 拆内容控件、关闭修订模式、清批注、弯引号替换、四号/小四/五号字、固定值20磅行距、动态列宽均衡及整格蓝粗标题/问答均可【本地直接完成】。\n"
-                "• 但段落内部的局部跨语种神话/经文引文蓝粗定位需要调用 AI 模型。\n\n"
-                "是否仍在无 API Key 模式下继续执行？",
+                "• 仅段落内部的局部跨语种神话/经文引文蓝粗定位需要调用 AI 模型。\n\n"
+                "是否直接以纯本地极速模式继续执行？",
             )
             if not proceed:
                 return
@@ -2002,13 +2015,14 @@ class ScatteredRevisionApp:
         quote_mode = self._get_fel_quote_mode_code()
         out_mode = self.fel_output_mode_var.get()
         dt_str = self.fel_date_var.get().strip()
-        pool = ApiKeyPool(keys, rotation_mode=rot_mode) if keys else None
+        pool = ApiKeyPool(keys, rotation_mode=rot_mode) if (use_ai and keys) else None
         files_snapshot = list(self.fel_files)
 
+        ai_tag = "AI开启(含503退避重试+备用模型兜底)" if use_ai else "纯本地离线极速模式"
         self._set_running(True, final_stage=f"正在启动【弟兄交通整理】（共 {len(files_snapshot)} 份文档）...")
         self._log("=" * 64)
         self._log(
-            f"⚡ 启动【弟兄交通稿件整理】 | 文档数：{len(files_snapshot)} | 输出模式：{out_mode} | 语种：{lang_code}"
+            f"⚡ 启动【弟兄交通稿件整理】 | 文档数：{len(files_snapshot)} | 输出模式：{out_mode} | 语种：{lang_code} | {ai_tag}"
         )
 
         def worker():
@@ -2021,6 +2035,7 @@ class ScatteredRevisionApp:
                     tri_prefix_override=tri_pfx,
                     quote_mode=quote_mode,
                     date_yyyymmdd=dt_str,
+                    enable_ai_col3=use_ai,
                     api_key=pool,
                     model=model,
                     api_mode=api_mode,
@@ -2029,15 +2044,20 @@ class ScatteredRevisionApp:
                     progress_fn=self._progress,
                 )
                 saved = res["saved_files"]
+                failed_ai = res.get("ai_failed_items") or []
                 files_str = "\n".join(saved)
                 self._log(f"🎉 弟兄交通整理全部完成！共输出 {len(saved)} 份文档（修订状态：关闭）：\n{files_str}")
+                warn_block = ""
+                if failed_ai:
+                    warn_list = "\n".join(f"• {x}" for x in failed_ai)
+                    warn_block = f"\n\n⚠️ 以下段落因模型接口繁忙暂未自动定位段内蓝粗（其余全部已完成导出，建议在 Word 中核对该行）：\n{warn_list}"
                 self.log_queue.put(("done", (True, f"整理完成！共输出 {len(saved)} 份文档（修订: 关闭）")))
                 self.log_queue.put(
                     (
                         "popup_info",
                         (
                             "弟兄交通整理完成",
-                            f"前缀：{res['tri_prefix']}\n已输出 {len(saved)} 份定稿文档（修订模式已关闭）：\n\n{files_str}",
+                            f"前缀：{res['tri_prefix']}\n已输出 {len(saved)} 份定稿文档（修订模式已关闭）：\n\n{files_str}{warn_block}",
                         ),
                     )
                 )

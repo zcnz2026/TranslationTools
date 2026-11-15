@@ -1193,16 +1193,59 @@ _FELLOWSHIP_ALIGN_SCHEMA = {
 }
 
 
+def _normalize_existing_col3_styled_paragraph(p_fl: ET.Element) -> None:
+    """Normalize existing Col 3 blue shades to #0000FF and unbold outer quotes / post-quote citations locally."""
+    full_txt = _get_p_text(p_fl)
+    if not full_txt:
+        return
+    n = len(full_txt)
+    char_blue = [False] * n
+    char_bold = [False] * n
+    pos = 0
+    for r in p_fl.findall(f"{W}r"):
+        seg = "".join(t.text or "" for t in r.findall(f"{W}t"))
+        if not seg:
+            continue
+        bl = is_run_blue(r)
+        bd = is_run_bold(r)
+        for i in range(pos, min(n, pos + len(seg))):
+            char_blue[i] = bl
+            char_bold[i] = bd
+        pos += len(seg)
+
+    # Outer quotes are never bold
+    for i, ch in enumerate(full_txt):
+        if ch in ALL_OUTER_QUOTE_CHARS:
+            char_bold[i] = False
+
+    # Post-quote citations are never bold
+    for c0, c1 in find_post_quote_citation_spans(full_txt):
+        for idx in range(c0, c1):
+            char_bold[idx] = False
+
+    cuts: Set[int] = set()
+    for i in range(1, n):
+        if char_blue[i] != char_blue[i - 1] or char_bold[i] != char_bold[i - 1]:
+            cuts.add(i)
+
+    sliced = split_paragraph_runs_at_offsets(p_fl, cuts)
+    for r_s, _r_e, r_el in sliced:
+        set_run_blue(r_el, char_blue[r_s])
+        set_run_bold(r_el, char_bold[r_s])
+
+
 def sync_table_col3_blue_and_bold(
     tbl: ET.Element,
     api_pool: Optional[ApiKeyPool],
     model: str,
     api_mode: str,
+    enable_ai_col3: bool = True,
     log_fn: Optional[Callable[[str], None]] = None,
-) -> Dict[str, int]:
+) -> Dict:
     """Synchronize Col 3 blue (#0000FF) and bold (<w:b/>) from Col 2/Col 1 across all rows of `tbl`."""
     rows = tbl.findall(f"{W}tr")
     tier1_synced = 0
+    skipped_existing = 0
     ai_tasks: List[Dict] = []
 
     for r_idx, tr in enumerate(rows):
@@ -1243,10 +1286,20 @@ def sync_table_col3_blue_and_bold(
                 if apply_colon_prefix_style(p_fl, blue=prof["prefix_blue"], bold=prof["prefix_bold"]):
                     tier1_synced += 1
             elif mode == "partial_ai":
-                # Check if Col 3 already has both blue & bold matching roughly; if not (or to ensure precision), queue AI
                 col3_txt = _get_p_text(p_fl)
                 if not col3_txt.strip():
                     continue
+                # Optimization 1: If Col 3 ALREADY has translator-preserved blue/bold matching Col 2's needs, normalize locally & skip AI
+                prof_fl = extract_col_style_profile(p_fl)
+                en_has_blue = any(bl for _, bl, _ in prof["segments"])
+                en_has_bold = any(bd for _, _, bd in prof["segments"])
+                fl_has_blue = any(bl for _, bl, _ in prof_fl["segments"])
+                fl_has_bold = any(bd for _, _, bd in prof_fl["segments"])
+                if (not en_has_blue or fl_has_blue) and (not en_has_bold or fl_has_bold):
+                    _normalize_existing_col3_styled_paragraph(p_fl)
+                    skipped_existing += 1
+                    continue
+
                 ai_tasks.append(
                     {
                         "row_idx": r_idx,
@@ -1258,10 +1311,16 @@ def sync_table_col3_blue_and_bold(
                 )
 
     ai_synced = 0
+    failed_rows: List[int] = []
     if ai_tasks:
-        if api_pool is None or len(api_pool) == 0:
+        row_nums = sorted({t["row_idx"] + 1 for t in ai_tasks})
+        if not enable_ai_col3:
             if log_fn:
-                row_nums = sorted({t["row_idx"] + 1 for t in ai_tasks})
+                log_fn(
+                    f"   ℹ️ 纯本地极速模式：第 {row_nums} 行含段内局部引文已跳过 AI（整格标题/问答已全部本地同步）。"
+                )
+        elif api_pool is None or len(api_pool) == 0:
+            if log_fn:
                 log_fn(
                     f"⚠️ 提示：第 {row_nums} 行含段内局部经文/神话引文，当前未填写 API Key，已跳过跨语种段内引文定位（整格标题/问答已全部本地同步）。"
                 )
@@ -1283,26 +1342,40 @@ def sync_table_col3_blue_and_bold(
                     "Align the <BB>, <BL>, and <BD> spans from `col2_annotated_english` onto `col3_text`:\n"
                     + json.dumps(payload_items, ensure_ascii=False, indent=2)
                 )
-                resp = call_gemini_json(
-                    api_key=api_pool,
-                    model=model,
-                    system_instruction=_FELLOWSHIP_ALIGN_SYSTEM_PROMPT,
-                    user_prompt=user_prompt,
-                    json_schema=_FELLOWSHIP_ALIGN_SCHEMA,
-                    api_mode=api_mode,
-                    log_fn=log_fn,
-                )
-                res_list = resp.get("results", []) if isinstance(resp, dict) else []
-                by_id = {int(x.get("id", -1)): x.get("spans", []) for x in res_list if isinstance(x, dict)}
-                for local_id, task in enumerate(batch):
-                    spans = by_id.get(local_id, [])
-                    applied_n = apply_ai_spans_to_col3_paragraph(task["p_fl"], spans)
-                    if applied_n > 0:
-                        ai_synced += 1
-                        if log_fn:
-                            log_fn(f"   ✓ 第 {task['row_idx'] + 1} 行第 3 列已精准还原 {applied_n} 处蓝字/加粗引文")
+                try:
+                    resp = call_gemini_json(
+                        api_key=api_pool,
+                        model=model,
+                        system_instruction=_FELLOWSHIP_ALIGN_SYSTEM_PROMPT,
+                        user_prompt=user_prompt,
+                        json_schema=_FELLOWSHIP_ALIGN_SCHEMA,
+                        api_mode=api_mode,
+                        log_fn=log_fn,
+                    )
+                    res_list = resp.get("results", []) if isinstance(resp, dict) else []
+                    by_id = {int(x.get("id", -1)): x.get("spans", []) for x in res_list if isinstance(x, dict)}
+                    for local_id, task in enumerate(batch):
+                        spans = by_id.get(local_id, [])
+                        applied_n = apply_ai_spans_to_col3_paragraph(task["p_fl"], spans)
+                        if applied_n > 0:
+                            ai_synced += 1
+                            if log_fn:
+                                log_fn(f"   ✓ 第 {task['row_idx'] + 1} 行第 3 列已精准还原 {applied_n} 处蓝字/加粗引文")
+                except Exception as ai_ex:
+                    batch_rows = sorted({t["row_idx"] + 1 for t in batch})
+                    failed_rows.extend(batch_rows)
+                    if log_fn:
+                        log_fn(
+                            f"   ⚠️ 第 {batch_rows} 行第 3 列段内引文 AI 定位暂受限（{ai_ex}），已保留该段原文并继续导出文档，请人工核对该行蓝粗！"
+                        )
 
-    return {"tier1_synced": tier1_synced, "ai_paragraphs_total": len(ai_tasks), "ai_synced": ai_synced}
+    return {
+        "tier1_synced": tier1_synced,
+        "skipped_existing": skipped_existing,
+        "ai_paragraphs_total": len(ai_tasks),
+        "ai_synced": ai_synced,
+        "failed_rows": sorted(set(failed_rows)),
+    }
 
 
 # ---------------- Step 7: Spacing, Typography & Content-Proportional 3-Column Widths ----------------
@@ -1632,6 +1705,7 @@ def run_fellowship_pipeline(
     tri_prefix_override: str = "",
     quote_mode: str = "auto",  # "auto", "curly", "skip"
     date_yyyymmdd: str = "",
+    enable_ai_col3: bool = True,
     api_key=None,
     model: str = "gemini-3.5-flash-lite",
     api_mode: str = "auto",
@@ -1672,10 +1746,11 @@ def run_fellowship_pipeline(
     dt_str = re.sub(r"[^0-9]", "", date_yyyymmdd or "") or datetime.now().strftime("%Y%m%d")
 
     pool = None
-    if isinstance(api_key, ApiKeyPool):
-        pool = api_key
-    elif api_key:
-        pool = ApiKeyPool(api_key, rotation_mode=rotation_mode)
+    if enable_ai_col3:
+        if isinstance(api_key, ApiKeyPool):
+            pool = api_key
+        elif api_key:
+            pool = ApiKeyPool(api_key, rotation_mode=rotation_mode)
 
     # Check part sequence continuity
     part_nums = [extract_part_num_from_filename(p.name) for p in sorted_paths]
@@ -1696,6 +1771,7 @@ def run_fellowship_pipeline(
         apply_q_col3 = resolved_code != "FR"
 
     processed_docs: List[Dict] = []
+    ai_failed_items: List[str] = []
     total_files = len(sorted_paths)
 
     for idx, src_p in enumerate(sorted_paths):
@@ -1742,8 +1818,11 @@ def run_fellowship_pipeline(
             api_pool=pool,
             model=model,
             api_mode=api_mode,
+            enable_ai_col3=enable_ai_col3,
             log_fn=log,
         )
+        if sync_stats.get("failed_rows"):
+            ai_failed_items.append(f"{src_p.name}（第 {sync_stats['failed_rows']} 行）")
 
         # 6. Exact 20pt line spacing + 14pt title / 12pt body / 10.5pt post-quote citations
         cit_cnt = enforce_table_spacing_and_typography(tbl=tbl)
@@ -1751,9 +1830,14 @@ def run_fellowship_pipeline(
         # 7. Balance 3-column widths for single-part output
         w_tuple = balance_three_column_widths(doc_root, tbl)
 
+        skip_note = (
+            f", 已有蓝粗保留 {sync_stats['skipped_existing']} 段"
+            if sync_stats.get("skipped_existing")
+            else ""
+        )
         log(
             f"   ✓ 拆内容控件 {sdt_n} 处 | 清批注/修订 {cmt_n + rev_n} 处 | "
-            f"第3列蓝粗同步(整格/前缀 {sync_stats['tier1_synced']} 处, AI引文 {sync_stats['ai_synced']} 段) | "
+            f"第3列蓝粗同步(整格/前缀 {sync_stats['tier1_synced']} 处{skip_note}, AI引文 {sync_stats['ai_synced']} 段) | "
             f"五号字出处 {cit_cnt} 处 | 列宽 {w_tuple}"
         )
 
@@ -1831,4 +1915,5 @@ def run_fellowship_pipeline(
         "saved_files": saved_files,
         "tri_prefix": tri_prefix,
         "lang_code": resolved_code,
+        "ai_failed_items": ai_failed_items,
     }

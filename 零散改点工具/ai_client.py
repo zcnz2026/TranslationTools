@@ -278,13 +278,13 @@ def call_gemini_json(
     user_prompt: str,
     json_schema: Optional[dict] = None,
     api_mode: str = "auto",
-    max_retries: int = 2,
+    max_retries: int = 4,
     rotation_mode: str = "round_robin",
     log_fn: Optional[Callable[[str], None]] = None,
 ) -> dict:
     """
-    Call Gemini / Vertex AI with multi-key rotation & automatic failover.
-    If a key hits rate limits (429), runs out of quota, or errors out, immediately switches to the next key.
+    Call Gemini / Vertex AI with multi-key rotation, exponential 503/429 backoff, & model spike fallback.
+    If a key hits rate limits (429), 503 high demand, or errors out, switches keys or backs off cleanly.
     """
     pool = api_key if isinstance(api_key, ApiKeyPool) else ApiKeyPool(api_key, rotation_mode=rotation_mode)
     safe_model = validate_model_id(model)
@@ -292,6 +292,7 @@ def call_gemini_json(
 
     total_keys = len(pool)
     last_err: Optional[Exception] = None
+    last_status: Optional[int] = None
 
     for sweep in range(max_retries):
         cand_indices = pool.get_candidate_order()
@@ -315,6 +316,7 @@ def call_gemini_json(
                 return parsed_json
             except Exception as ex:
                 status_code = getattr(ex, "http_status", None)
+                last_status = status_code
                 clean_reason = redact_secrets(str(ex), extra_secret=pool.all_keys)
                 f_kind = pool.mark_failure(k_idx, status_code, clean_reason)
                 last_err = RuntimeError(f"{k_lbl} -> {clean_reason}")
@@ -327,17 +329,46 @@ def call_gemini_json(
                     elif sweep + 1 < max_retries:
                         next_hint = "，准备下一轮重试可用密钥"
 
-                    tag_txt = "密钥无效/无权限(本轮已跳过)" if f_kind == "permanent" else "额度不足/超速/网络波动(冷却切换)"
+                    tag_txt = "密钥无效/无权限(本轮已跳过)" if f_kind == "permanent" else "额度不足/超速/高峰拥堵(冷却切换)"
                     if log_fn:
                         log_fn(f"  ⚠️ {k_lbl} {tag_txt} [{status_code or 'ERR'}]{next_hint}...")
 
-        # All available keys failed in this sweep -> brief backoff before next sweep if transient keys remain
+        # All available keys failed in this sweep -> exponential backoff (3s -> 6s -> 12s) before next sweep
         remaining_after = pool.get_candidate_order()
         if remaining_after and sweep + 1 < max_retries:
-            wait_s = 1.8 * (sweep + 1)
-            if log_fn and total_keys > 1:
-                log_fn(f"  ⏳ 当前轮次可用 Key 均暂时受限，等待 {wait_s:.1f}s 后重试...")
+            wait_s = min(15.0, 3.0 * (2 ** sweep))
+            if log_fn:
+                if total_keys > 1:
+                    log_fn(f"  ⏳ 当前轮次可用 Key 均暂时受限 [{last_status or 'ERR'}]，等待 {wait_s:.0f}s 后进行第 {sweep + 2}/{max_retries} 轮重试...")
+                else:
+                    log_fn(f"  ⏳ 模型接口高峰拥堵/暂时受限 [HTTP {last_status or 'ERR'}]，等待 {wait_s:.0f}s 后自动第 {sweep + 2}/{max_retries} 次重试...")
             time.sleep(wait_s)
+
+    # Automatic fallback model on persistent 502/503/504 high-demand spikes
+    if last_status in (502, 503, 504) and safe_model == "gemini-3.5-flash-lite":
+        alt_model = "gemini-3.1-flash-lite"
+        alt_quoted = urllib.parse.quote(alt_model, safe="")
+        cand_indices = pool.get_candidate_order()
+        if cand_indices:
+            if log_fn:
+                log_fn(f"  ↻ 模型 {safe_model} 持续高峰拥堵 (HTTP {last_status})，自动切换备用模型 {alt_model} 继续执行...")
+            for k_idx in cand_indices:
+                k_val = pool.keys[k_idx]
+                try:
+                    parsed_json, _ = _call_single_key_once(
+                        key=k_val,
+                        safe_model=alt_model,
+                        quoted_model=alt_quoted,
+                        system_instruction=system_instruction,
+                        user_prompt=user_prompt,
+                        json_schema=json_schema,
+                        api_mode=api_mode,
+                    )
+                    pool.mark_success(k_idx)
+                    return parsed_json
+                except Exception as alt_ex:
+                    clean_alt = redact_secrets(str(alt_ex), extra_secret=pool.all_keys)
+                    last_err = RuntimeError(f"{mask_key_label(k_idx, k_val)} -> {clean_alt}")
 
     if total_keys > 1:
         raise RuntimeError(f"密钥池中全部 {total_keys} 个 API Key 均调用失败！最后错误：{last_err}")
