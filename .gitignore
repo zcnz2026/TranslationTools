@@ -14,6 +14,8 @@ code_artifact.md
 
 # 编译产物与 Python 缓存
 *.exe
+*.zip
+SHA256SUMS.txt
 __pycache__/
 *.py[cod]
 build/
