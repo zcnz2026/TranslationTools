@@ -1,13 +1,15 @@
 """Native Windows Explorer file & folder drag-and-drop for Tkinter (100% stdlib ctypes).
 
-Hooks WM_DROPFILES on the top-level HWND using 64-bit-safe SetWindowLongPtrW / CallWindowProcW,
-extracts full UTF-16 Unicode paths via DragQueryFileW, resolves the exact drop target widget via
-DragQueryPoint + ClientToScreen + root.winfo_containing, and cleanly unhooks on window close.
+Hooks WM_DROPFILES on the top-level HWND using 64-bit-safe GetWindowLongPtrW / SetWindowLongPtrW /
+CallWindowProcW, extracts full UTF-16 Unicode paths via DragQueryFileW, and enqueues drop events
+into a lock-free SimpleQueue polled by Tkinter's normal event loop (strictly avoiding any _tkinter
+calls inside the raw Win32 WndProc callback, which would corrupt _tkinter's GIL thread state).
 """
 
 import ctypes
 from ctypes import wintypes
 from pathlib import Path
+import queue
 import sys
 import tkinter as tk
 from typing import Callable, List, Optional, Tuple
@@ -43,10 +45,12 @@ class WinFileDropManager:
         self.root = root
         self.fallback_cb = fallback_cb
         self._targets: List[Tuple[tk.Misc, Callable[[List[Path]], None]]] = []
+        self._drop_queue: "queue.SimpleQueue[Tuple[List[str], int, int]]" = queue.SimpleQueue()
         self._hwnd: Optional[int] = None
         self._old_wndproc: Optional[int] = None
         self._new_wndproc_ref = None
         self._hooked = False
+        self._after_id: Optional[str] = None
 
         if sys.platform == "win32":
             self._init_win32_apis()
@@ -59,9 +63,14 @@ class WinFileDropManager:
         self._user32.GetParent.restype = wintypes.HWND
 
         if ctypes.sizeof(ctypes.c_void_p) == 8 and hasattr(self._user32, "SetWindowLongPtrW"):
+            self._get_wnd_long_ptr = self._user32.GetWindowLongPtrW
             self._set_wnd_long_ptr = self._user32.SetWindowLongPtrW
         else:
+            self._get_wnd_long_ptr = self._user32.GetWindowLongW
             self._set_wnd_long_ptr = self._user32.SetWindowLongW
+
+        self._get_wnd_long_ptr.argtypes = [wintypes.HWND, ctypes.c_int]
+        self._get_wnd_long_ptr.restype = ctypes.c_void_p
         self._set_wnd_long_ptr.argtypes = [wintypes.HWND, ctypes.c_int, ctypes.c_void_p]
         self._set_wnd_long_ptr.restype = ctypes.c_void_p
 
@@ -73,6 +82,14 @@ class WinFileDropManager:
             wintypes.LPARAM,
         ]
         self._user32.CallWindowProcW.restype = LRESULT
+
+        self._user32.DefWindowProcW.argtypes = [
+            wintypes.HWND,
+            wintypes.UINT,
+            wintypes.WPARAM,
+            wintypes.LPARAM,
+        ]
+        self._user32.DefWindowProcW.restype = LRESULT
 
         self._user32.ClientToScreen.argtypes = [wintypes.HWND, ctypes.POINTER(wintypes.POINT)]
         self._user32.ClientToScreen.restype = wintypes.BOOL
@@ -109,7 +126,7 @@ class WinFileDropManager:
         self._targets.append((widget, callback))
 
     def install(self) -> bool:
-        """Install WM_DROPFILES hook on the top-level window. Call after widgets are created."""
+        """Install WM_DROPFILES hook on the top-level window. Call before root.mainloop()."""
         if sys.platform != "win32" or self._hooked:
             return self._hooked
 
@@ -119,6 +136,10 @@ class WinFileDropManager:
         if not top_hwnd:
             return False
 
+        orig_ptr = self._get_wnd_long_ptr(top_hwnd, GWLP_WNDPROC)
+        if not orig_ptr:
+            return False
+
         if self._change_msg_filter is not None:
             for msg_id in (WM_DROPFILES, WM_COPYDATA, WM_COPYGLOBALDATA):
                 try:
@@ -126,34 +147,74 @@ class WinFileDropManager:
                 except Exception:
                     pass
 
-        self._shell32.DragAcceptFiles(top_hwnd, True)
+        self._hwnd = top_hwnd
+        self._old_wndproc = orig_ptr
 
+        # IMPORTANT: Never call any self.root.* (_tkinter) method inside _wnd_proc!
+        # _tkinter releases the GIL in Tcl_DoOneEvent while holding its internal Tcl state;
+        # calling back into _tkinter from a raw ctypes WNDPROC corrupts _tkinter's saved
+        # PyThreadState (causing Fatal Python error: PyEval_RestoreThread -> 0xc0000409).
         def _wnd_proc(hwnd, msg, wparam, lparam):
             if msg == WM_DROPFILES:
                 try:
-                    self._handle_wm_dropfiles(hwnd, wparam)
+                    self._enqueue_wm_dropfiles(hwnd, wparam)
                 except Exception:
                     pass
                 return 0
-            return self._user32.CallWindowProcW(self._old_wndproc, hwnd, msg, wparam, lparam)
+            old_p = self._old_wndproc
+            if old_p:
+                return self._user32.CallWindowProcW(old_p, hwnd, msg, wparam, lparam)
+            return self._user32.DefWindowProcW(hwnd, msg, wparam, lparam)
 
         self._new_wndproc_ref = WNDPROC(_wnd_proc)
         proc_ptr = ctypes.cast(self._new_wndproc_ref, ctypes.c_void_p).value
         prev_ptr = self._set_wnd_long_ptr(top_hwnd, GWLP_WNDPROC, proc_ptr)
         if not prev_ptr:
-            self._shell32.DragAcceptFiles(top_hwnd, False)
+            self._hwnd = None
+            self._old_wndproc = None
             self._new_wndproc_ref = None
             return False
 
-        self._hwnd = top_hwnd
         self._old_wndproc = prev_ptr
+        self._shell32.DragAcceptFiles(top_hwnd, True)
         self._hooked = True
+        self._schedule_poll()
         return True
+
+    def _schedule_poll(self):
+        if not self._hooked:
+            return
+        try:
+            if self.root.winfo_exists():
+                self._after_id = self.root.after(60, self._poll_drop_queue)
+        except Exception:
+            pass
+
+    def _poll_drop_queue(self):
+        self._after_id = None
+        if not self._hooked:
+            return
+        try:
+            while not self._drop_queue.empty():
+                paths, screen_x, screen_y = self._drop_queue.get_nowait()
+                try:
+                    self.dispatch_drop(paths, screen_x, screen_y)
+                except Exception:
+                    pass
+        finally:
+            self._schedule_poll()
 
     def unhook(self):
         """Restore original WndProc cleanly before window destruction."""
         if not self._hooked or sys.platform != "win32":
             return
+        self._hooked = False
+        if self._after_id is not None:
+            try:
+                self.root.after_cancel(self._after_id)
+            except Exception:
+                pass
+            self._after_id = None
         try:
             if self._hwnd:
                 self._shell32.DragAcceptFiles(self._hwnd, False)
@@ -162,12 +223,11 @@ class WinFileDropManager:
         except Exception:
             pass
         finally:
-            self._hooked = False
             self._hwnd = None
             self._old_wndproc = None
-            self._new_wndproc_ref = None
+            # Keep _new_wndproc_ref alive briefly in case an in-flight message unwinds
 
-    def _handle_wm_dropfiles(self, hwnd: int, hdrop: int):
+    def _enqueue_wm_dropfiles(self, hwnd: int, hdrop: int):
         pt = wintypes.POINT(0, 0)
         paths: List[str] = []
         try:
@@ -187,8 +247,7 @@ class WinFileDropManager:
             self._shell32.DragFinish(hdrop)
 
         if paths:
-            screen_x, screen_y = int(pt.x), int(pt.y)
-            self.root.after(0, lambda: self.dispatch_drop(paths, screen_x, screen_y))
+            self._drop_queue.put((paths, int(pt.x), int(pt.y)))
 
     def resolve_callback_for_widget(
         self, widget: Optional[tk.Misc]
