@@ -7,7 +7,6 @@ import re
 import sys
 import threading
 import time
-import traceback
 from pathlib import Path
 import tkinter as tk
 from tkinter import filedialog, messagebox, ttk
@@ -20,6 +19,14 @@ from ai_client import (
     test_all_api_keys,
     test_api_connection,
 )
+
+try:
+    from ai_client import format_friendly_api_error
+except ImportError:
+    def format_friendly_api_error(ex, total_keys: int = 1) -> str:  # type: ignore[misc]
+        lines = str(ex).strip().splitlines()
+        return lines[0] if lines else str(ex)
+
 from fellowship_processor import (
     OUTPUT_MODES,
     QUOTE_MODES,
@@ -44,7 +51,11 @@ from lang_registry import (
     resolve_combo_to_code,
     save_languages,
 )
-from pipeline import run_step1_pipeline, run_step2_pipeline
+import pipeline as _pipeline_mod
+
+run_oneclick_pipeline = getattr(_pipeline_mod, "run_oneclick_pipeline", None)
+ensure_library_index = getattr(_pipeline_mod, "ensure_library_index", None)
+
 from security_utils import (
     dpapi_decrypt_str,
     dpapi_encrypt_str,
@@ -59,6 +70,83 @@ from word_counter import (
     parse_doc_filename,
 )
 from win_dnd import WinFileDropManager
+
+
+APP_VERSION = "v1.6.0"
+
+
+def _clean_single_line_message(raw_obj) -> str:
+    raw = str(raw_obj or "").strip()
+    if not raw:
+        return "未知错误"
+    kept = []
+    for ln in raw.splitlines():
+        s = ln.strip()
+        if not s:
+            continue
+        if s.startswith("Traceback (most recent call last)") or s.startswith('File "'):
+            continue
+        if s.startswith("{") or s.startswith("}") or s.startswith("]"):
+            continue
+        if re.match(r'^"[A-Za-z0-9_]+":', s):
+            continue
+        kept.append(s)
+    first = kept[0] if kept else raw.splitlines()[0].strip()
+    first = re.sub(r"[:：\s]*\{.*$", "", first).strip()
+    return first or "处理异常，请检查文档或配置后重试"
+
+
+def _format_exception_concise(
+    ex: BaseException,
+    keys: list[str] | None = None,
+    api_related: bool = False,
+) -> str:
+    secret_list = keys or []
+    total_keys = max(1, len(secret_list))
+    if isinstance(ex, PermissionError):
+        fname = getattr(ex, "filename", None)
+        hint = f"（{Path(fname).name}）" if fname else ""
+        return redact_secrets(
+            f"文件写入受阻{hint}：目标文档可能正在 Word 中打开，请先关闭后重试。",
+            extra_secret=secret_list,
+        )
+    if isinstance(ex, FileNotFoundError):
+        return redact_secrets(_clean_single_line_message(ex), extra_secret=secret_list)
+
+    raw = str(ex or "").strip()
+    looks_api = (
+        api_related
+        or hasattr(ex, "http_status")
+        or any(
+            tok in raw
+            for tok in (
+                "HTTP ",
+                "API Key",
+                "API key",
+                "api_key",
+                "generativelanguage",
+                "aiplatform",
+                "OAuth2",
+                "RESOURCE_EXHAUSTED",
+                "UNAVAILABLE",
+                "UNAUTHENTICATED",
+                "PERMISSION_DENIED",
+                "INVALID_ARGUMENT",
+                "urlopen error",
+                "timed out",
+                "SSLError",
+                "密钥池",
+            )
+        )
+    )
+    if looks_api:
+        try:
+            friendly = format_friendly_api_error(ex, total_keys=total_keys)
+        except TypeError:
+            friendly = format_friendly_api_error(ex, total_keys)
+        return redact_secrets(_clean_single_line_message(friendly), extra_secret=secret_list)
+
+    return redact_secrets(_clean_single_line_message(ex), extra_secret=secret_list)
 
 
 def _enable_high_dpi():
@@ -289,7 +377,12 @@ class ApiKeyPoolDialog(tk.Toplevel):
         def _each(done_i: int, tot: int, item: dict):
             icon = "✅" if item["ok"] else "❌"
             tag = "ok" if item["ok"] else "bad"
-            self._ui_queue.put(("line", (f"[{done_i}/{tot}] {icon} {item['masked']}：{item['detail']}", tag)))
+            raw_detail = str(item.get("detail", ""))
+            if item["ok"]:
+                detail = redact_secrets(_clean_single_line_message(raw_detail), extra_secret=keys)
+            else:
+                detail = _format_exception_concise(RuntimeError(raw_detail), keys=keys, api_related=True)
+            self._ui_queue.put(("line", (f"[{done_i}/{tot}] {icon} {item['masked']}：{detail}", tag)))
 
         def worker():
             try:
@@ -303,7 +396,7 @@ class ApiKeyPoolDialog(tk.Toplevel):
                 bad_keys = [r["key"] for r in reps if not r["ok"]]
                 self._ui_queue.put(("done", (ok_cnt, bad_keys)))
             except Exception as ex:
-                safe_err = redact_secrets(str(ex), extra_secret=keys)
+                safe_err = _format_exception_concise(ex, keys=keys, api_related=True)
                 self._ui_queue.put(("line", (f"❌ 检测出错：{safe_err}", "bad")))
                 self._ui_queue.put(("done", (0, [])))
 
@@ -527,7 +620,9 @@ class LanguageManagerDialog(tk.Toplevel):
 class ScatteredRevisionApp:
     def __init__(self, root: tk.Tk):
         self.root = root
-        self.root.title("零散改点自动整理工具 v1.5.1  (零散改点 · 字数统计 · 弟兄交通整理 · 支持文件/文件夹直接拖拽)")
+        self.root.title(
+            f"零散改点自动整理工具 {APP_VERSION}  (零散改点一键定稿 · 字数统计 · 弟兄交通整理 · 支持文件/文件夹直接拖拽)"
+        )
         self.root.geometry("1120x825")
         self.root.minsize(980, 700)
 
@@ -544,6 +639,10 @@ class ScatteredRevisionApp:
         self._fel_inspect_cache: dict[str, dict] = {}
         self.active_tab_key: str = "main"
         self._nav_items: dict = {}
+        self._indexing_lock = threading.Lock()
+        self._indexing_inflight: set[str] = set()
+        self._last_typed_lib_norm: str = ""
+        self.settings: dict = self._read_raw_settings_dict()
         self.dnd = WinFileDropManager(self.root, fallback_cb=self._on_drop_fallback)
 
         self._setup_styles()
@@ -555,6 +654,22 @@ class ScatteredRevisionApp:
         self.root.protocol("WM_DELETE_WINDOW", self._on_close)
         self._poll_log_queue()
         self._tick_elapsed_timer()
+
+        init_lib = self.library_dir_var.get().strip()
+        if init_lib and Path(init_lib).is_dir():
+            self._warm_library_index_async(init_lib)
+
+    @staticmethod
+    def _read_raw_settings_dict() -> dict:
+        if SETTINGS_FILE.exists():
+            try:
+                with open(SETTINGS_FILE, "r", encoding="utf-8") as f:
+                    data = json.load(f)
+                if isinstance(data, dict):
+                    return data
+            except Exception:
+                pass
+        return {}
 
     def _setup_styles(self):
         style = ttk.Style(self.root)
@@ -587,14 +702,14 @@ class ScatteredRevisionApp:
         self.input_docx_var = tk.StringVar(value="")
         self.library_dir_var = tk.StringVar(value="")
         self.output_dir_var = tk.StringVar(value="")
-        self.draft_docx_var = tk.StringVar(value="")
 
         self.lang_var = tk.StringVar(value=AUTO_COMBO_LABEL)
         self.doc_name_var = tk.StringVar(value="")
         self.dual_outputs_var = tk.BooleanVar(value=True)
+        self.sc1_enable_ai_var = tk.BooleanVar(value=bool(self.settings.get("sc1_enable_ai", True)))
 
         self.progress_var = tk.DoubleVar(value=0.0)
-        self.stage_var = tk.StringVar(value="状态：就绪（请选择文档与目录后点击上方按钮执行）")
+        self.stage_var = tk.StringVar(value="状态：就绪（请选择文档与目录后点击「⚡ 一键输出定稿」）")
         self.pct_timer_var = tk.StringVar(value="0%")
 
         # Tab 2 (Word Count & Filename Updater) vars
@@ -707,6 +822,8 @@ class ScatteredRevisionApp:
             try:
                 with open(SETTINGS_FILE, "r", encoding="utf-8") as f:
                     cfg = json.load(f)
+                if isinstance(cfg, dict):
+                    self.settings = dict(cfg)
                 self.remember_key_var.set(bool(cfg.get("remember_key", True)))
                 enc_token = str(cfg.get("api_key_dpapi", "")).strip()
                 if enc_token:
@@ -733,6 +850,7 @@ class ScatteredRevisionApp:
                 saved_wc_lang = cfg.get("wc_lang", saved_lang)
                 self.wc_lang_var.set(self._code_to_combo_display(saved_wc_lang))
                 self.dual_outputs_var.set(bool(cfg.get("dual_outputs", True)))
+                self.sc1_enable_ai_var.set(bool(cfg.get("sc1_enable_ai", True)))
                 self.fel_output_dir_var.set(cfg.get("fel_output_dir", ""))
                 saved_fel_lang = cfg.get("fel_lang", "AUTO")
                 self.fel_lang_var.set(self._code_to_combo_display(saved_fel_lang))
@@ -749,6 +867,13 @@ class ScatteredRevisionApp:
         if not loaded_key_raw:
             loaded_key_raw = load_api_key_from_env(_app_base_dir())
         self._set_pool_multiline_and_sync_entry(loaded_key_raw)
+
+        lib_val = self.library_dir_var.get().strip()
+        if lib_val and Path(lib_val).is_dir():
+            try:
+                self._last_typed_lib_norm = os.path.normcase(str(Path(lib_val).resolve()))
+            except Exception:
+                pass
 
         if migrated_plaintext:
             self._save_settings()
@@ -773,12 +898,14 @@ class ScatteredRevisionApp:
             "lang": self._get_selected_lang_code(),
             "wc_lang": self._get_wc_lang_code(),
             "dual_outputs": self.dual_outputs_var.get(),
+            "sc1_enable_ai": self.sc1_enable_ai_var.get(),
             "fel_output_dir": self.fel_output_dir_var.get().strip(),
             "fel_lang": self._get_fel_lang_code(),
             "fel_output_mode": self.fel_output_mode_var.get(),
             "fel_quote_label": self.fel_quote_label_var.get(),
             "fel_enable_ai": self.fel_enable_ai_var.get(),
         }
+        self.settings = dict(cfg)
         try:
             with open(SETTINGS_FILE, "w", encoding="utf-8") as f:
                 json.dump(cfg, f, ensure_ascii=False, indent=2)
@@ -812,7 +939,7 @@ class ScatteredRevisionApp:
         ).pack(fill=tk.X)
         tk.Label(
             brand_box,
-            text="v1.5.1 · 支持拖拽文件/文件夹",
+            text=f"{APP_VERSION} · 支持拖拽文件/文件夹",
             font=("Microsoft YaHei UI", 8),
             fg="#64748b",
             bg="#ffffff",
@@ -834,7 +961,7 @@ class ScatteredRevisionApp:
         self.nav_btn_main = self._create_sidebar_tab(
             key="main",
             title="📝 零散改点整理",
-            subtitle="初筛 · 标色 · 三版定稿",
+            subtitle="一键定稿 · 自动建库 · 三版输出",
         )
         self.nav_btn_wc = self._create_sidebar_tab(
             key="wc",
@@ -1079,6 +1206,8 @@ class ScatteredRevisionApp:
         self.lbl_library_dir.grid(row=1, column=0, sticky=tk.W, pady=4)
         self.ent_library_dir = ttk.Entry(path_frame, textvariable=self.library_dir_var)
         self.ent_library_dir.grid(row=1, column=1, sticky=tk.EW, pady=4, padx=4)
+        self.ent_library_dir.bind("<Return>", self._on_library_entry_committed)
+        self.ent_library_dir.bind("<FocusOut>", self._on_library_entry_committed)
         ttk.Button(path_frame, text="浏览...", width=10, command=self._browse_library).grid(row=1, column=2, padx=2)
 
         self.lbl_output_dir = ttk.Label(path_frame, text="输出保存目录：")
@@ -1090,17 +1219,8 @@ class ScatteredRevisionApp:
         ttk.Button(out_btns, text="浏览...", width=10, command=self._browse_output).pack(side=tk.LEFT, padx=2)
         ttk.Button(out_btns, text="打开目录", width=10, command=self._open_output_dir).pack(side=tk.LEFT, padx=2)
 
-        self.lbl_draft_docx = ttk.Label(path_frame, text="初筛确认稿 (第二步用)：")
-        self.lbl_draft_docx.grid(row=3, column=0, sticky=tk.W, pady=4)
-        self.ent_draft_docx = ttk.Entry(path_frame, textvariable=self.draft_docx_var)
-        self.ent_draft_docx.grid(row=3, column=1, sticky=tk.EW, pady=4, padx=4)
-        draft_btns = ttk.Frame(path_frame)
-        draft_btns.grid(row=3, column=2, columnspan=2, sticky=tk.W)
-        ttk.Button(draft_btns, text="浏览...", width=10, command=self._browse_draft).pack(side=tk.LEFT, padx=2)
-        ttk.Button(draft_btns, text="打开初筛稿", width=10, command=self._open_draft_file).pack(side=tk.LEFT, padx=2)
-
         opt_row1 = ttk.Frame(path_frame)
-        opt_row1.grid(row=4, column=0, columnspan=4, sticky=tk.EW, pady=(6, 2))
+        opt_row1.grid(row=3, column=0, columnspan=4, sticky=tk.EW, pady=(6, 2))
 
         ttk.Label(opt_row1, text="目标语种：").pack(side=tk.LEFT)
         self.lang_cb = ttk.Combobox(
@@ -1121,11 +1241,12 @@ class ScatteredRevisionApp:
         ttk.Entry(opt_row1, textvariable=self.doc_name_var, width=22).pack(side=tk.LEFT, padx=(4, 0))
 
         opt_row2 = ttk.Frame(path_frame)
-        opt_row2.grid(row=5, column=0, columnspan=4, sticky=tk.EW, pady=(4, 0))
+        opt_row2.grid(row=4, column=0, columnspan=4, sticky=tk.EW, pady=(4, 0))
         ttk.Checkbutton(
             opt_row2,
             text="同时输出三份定稿：【发译者版(仅改点)】+【完整留底版】+【无改点内容版】",
             variable=self.dual_outputs_var,
+            command=self._save_settings,
         ).pack(side=tk.LEFT)
         ttk.Label(
             opt_row2,
@@ -1133,39 +1254,31 @@ class ScatteredRevisionApp:
             foreground="#64748b",
         ).pack(side=tk.LEFT)
 
-        # 3. Action Buttons & Determinate Progress Frame
-        act_frame = ttk.LabelFrame(main, text=" 3. 执行操作（支持两步走复核 / 一键直出） ", padding=10)
+        opt_row3 = ttk.Frame(path_frame)
+        opt_row3.grid(row=5, column=0, columnspan=4, sticky=tk.EW, pady=(4, 0))
+        ttk.Checkbutton(
+            opt_row3,
+            text="使用 AI 辅助分级与第 3 列精准对齐（若 API Key 失效或取消勾选，自动按本地大概位置标色，绝不停工）",
+            variable=self.sc1_enable_ai_var,
+            command=self._save_settings,
+        ).pack(side=tk.LEFT)
+
+        # 3. One-Click Primary Action & Determinate Progress Frame
+        act_frame = ttk.LabelFrame(main, text=" 3. 一键执行与实时进度（自动匹配总库 · 无损保留批注 · 直接输出定稿） ", padding=10)
         act_frame.pack(fill=tk.X, pady=(0, 8))
 
         btn_row = ttk.Frame(act_frame)
         btn_row.pack(fill=tk.X)
         btn_row.columnconfigure(0, weight=1)
-        btn_row.columnconfigure(1, weight=1)
-        btn_row.columnconfigure(2, weight=1)
 
-        self.btn_step1 = ttk.Button(
+        self.btn_oneclick = ttk.Button(
             btn_row,
-            text="① 第一步：生成初筛稿 (供人工复核)",
-            style="Action.TButton",
-            command=self._on_run_step1,
-        )
-        self.btn_step1.grid(row=0, column=0, sticky=tk.EW, padx=(0, 6))
-
-        self.btn_step2 = ttk.Button(
-            btn_row,
-            text="② 第二步：由初筛稿生成定稿",
-            style="Action.TButton",
-            command=self._on_run_step2,
-        )
-        self.btn_step2.grid(row=0, column=1, sticky=tk.EW, padx=6)
-
-        self.btn_all = ttk.Button(
-            btn_row,
-            text="⚡ 一键直出全部定稿 (初筛 + 三份定稿)",
+            text="⚡ 一键输出定稿",
             style="Primary.TButton",
-            command=self._on_run_all,
+            command=self._on_run_oneclick,
         )
-        self.btn_all.grid(row=0, column=2, sticky=tk.EW, padx=(6, 0))
+        self.btn_oneclick.grid(row=0, column=0, sticky=tk.EW)
+        self.btn_all = self.btn_oneclick
 
         prog_info = ttk.Frame(act_frame)
         prog_info.pack(fill=tk.X, pady=(10, 3))
@@ -1202,7 +1315,7 @@ class ScatteredRevisionApp:
         log_top.pack(fill=tk.X, pady=(0, 4))
         ttk.Label(
             log_top,
-            text="所有步骤、多 Key 自动轮换/切换提示、语种识别及保存结果均在此实时滚动显示：",
+            text="后台总库索引、多 Key 自动轮换、离线估算兜底及保存结果均在此实时滚动显示：",
             foreground="#64748b",
         ).pack(side=tk.LEFT)
         ttk.Button(log_top, text="清空日志", width=9, command=self._clear_log).pack(side=tk.RIGHT)
@@ -1235,7 +1348,7 @@ class ScatteredRevisionApp:
 
         key_cnt = len(self._get_all_keys_list())
         self._append_log(
-            f"欢迎使用零散改点自动整理工具 v1.5.1！已载入 {key_cnt} 个 API Key、{len(self.languages)} 种语言；支持零散改点、字数统计与弟兄交通整理。"
+            f"欢迎使用零散改点自动整理工具 {APP_VERSION}！已载入 {key_cnt} 个 API Key、{len(self.languages)} 种语言；支持一键输出定稿、后台自动建库与离线标色兜底。"
         )
 
     def _build_tab2_word_counter(self, parent: ttk.Frame):
@@ -1641,11 +1754,64 @@ class ScatteredRevisionApp:
             "dim",
         )
 
-    # ---------------- Drag & Drop Integration ----------------
+    # ---------------- Drag & Drop & Background Library Indexing ----------------
+
+    def _warm_library_index_async(self, lib_dir: str):
+        raw = (lib_dir or "").strip()
+        if not raw or ensure_library_index is None:
+            return
+        try:
+            rp = Path(raw).resolve()
+        except Exception:
+            return
+        if not rp.is_dir():
+            return
+
+        norm_key = os.path.normcase(str(rp))
+        self._last_typed_lib_norm = norm_key
+        with self._indexing_lock:
+            if norm_key in self._indexing_inflight:
+                return
+            self._indexing_inflight.add(norm_key)
+
+        def _bg_worker():
+            t0 = time.perf_counter()
+            try:
+                info = ensure_library_index(str(rp))
+                if isinstance(info, dict):
+                    total_files = info.get("total_files", 0)
+                    total_rows = info.get("total_rows", 0)
+                    elapsed_sec = float(info.get("elapsed_sec", time.perf_counter() - t0))
+                    self._log(
+                        f"📚 总库后台索引已就绪：共 {total_files} 篇文档（{total_rows} 段），支持无标题极速检索（耗时 {elapsed_sec:.1f}s）"
+                    )
+            except Exception as ex:
+                clean_msg = _format_exception_concise(ex)
+                self._log(f"⚠️ 总库后台预建索引跳过：{clean_msg}")
+            finally:
+                with self._indexing_lock:
+                    self._indexing_inflight.discard(norm_key)
+
+        threading.Thread(target=_bg_worker, daemon=True).start()
+
+    def _on_library_entry_committed(self, _event=None):
+        raw = self.library_dir_var.get().strip()
+        if not raw:
+            return
+        try:
+            rp = Path(raw).resolve()
+        except Exception:
+            return
+        if not rp.is_dir():
+            return
+        norm_key = os.path.normcase(str(rp))
+        if norm_key != self._last_typed_lib_norm:
+            self._save_settings()
+            self._warm_library_index_async(str(rp))
 
     def _setup_drag_and_drop(self):
         # Left sidebar tab buttons: dropping onto a tab switches to it and applies the drop
-        self.dnd.register_target(self.nav_btn_main, lambda ps: (self._switch_tab("main"), self._on_drop_tab1_general(ps)))
+        self.dnd.register_target(self.nav_btn_main, lambda ps: (self._switch_tab("main"), self._handle_tab1_drop(ps)))
         self.dnd.register_target(self.nav_btn_wc, lambda ps: (self._switch_tab("wc"), self._wc_ingest_paths(ps)))
         self.dnd.register_target(self.nav_btn_fel, lambda ps: (self._switch_tab("fel"), self._fel_ingest_paths(ps)))
 
@@ -1656,8 +1822,6 @@ class ScatteredRevisionApp:
             self.dnd.register_target(w, self._on_drop_library_dir)
         for w in (self.lbl_output_dir, self.ent_output_dir):
             self.dnd.register_target(w, self._on_drop_output_dir)
-        for w in (self.lbl_draft_docx, self.ent_draft_docx):
-            self.dnd.register_target(w, self._on_drop_draft_docx)
 
         # Tab 2 specific copy-folder target
         for w in (self.wc_copy_radio, self.wc_copy_dir_entry):
@@ -1675,7 +1839,7 @@ class ScatteredRevisionApp:
         elif self.active_tab_key == "fel":
             self._fel_ingest_paths(paths)
         else:
-            self._on_drop_tab1_general(paths)
+            self._handle_tab1_drop(paths)
 
     @staticmethod
     def _extract_docx_from_paths(paths: list[Path]) -> list[Path]:
@@ -1717,6 +1881,7 @@ class ScatteredRevisionApp:
         self._save_settings()
         self._append_log(f"📥 已拖入【对应语种总库目录】：{target_dir}")
         self.stage_var.set(f"📥 已载入总库目录：{target_dir.name}")
+        self._warm_library_index_async(str(target_dir))
 
     def _on_drop_output_dir(self, paths: list[Path]):
         p = paths[0].resolve()
@@ -1728,20 +1893,7 @@ class ScatteredRevisionApp:
         self._append_log(f"📥 已拖入【输出保存目录】：{target_dir}")
         self.stage_var.set(f"📥 已设定输出目录：{target_dir.name}")
 
-    def _on_drop_draft_docx(self, paths: list[Path]):
-        docxs = self._extract_docx_from_paths(paths)
-        if not docxs:
-            messagebox.showinfo("拖拽提示", "【初筛确认稿】请拖入 .docx 格式的 Word 文档。")
-            return
-        picked = docxs[0]
-        self.draft_docx_var.set(str(picked))
-        if not self.output_dir_var.get().strip():
-            self.output_dir_var.set(str(picked.parent))
-        self._save_settings()
-        self._append_log(f"📥 已拖入【初筛确认稿】：{picked}")
-        self.stage_var.set(f"📥 已载入初筛确认稿：{picked.name}")
-
-    def _on_drop_tab1_general(self, paths: list[Path]):
+    def _handle_tab1_drop(self, paths: list[Path]):
         docx_files: list[Path] = []
         dirs: list[Path] = []
         for p in paths:
@@ -1755,34 +1907,40 @@ class ScatteredRevisionApp:
                 continue
 
         applied = []
-        for df in docx_files:
-            if df.name.startswith("初筛_"):
-                self.draft_docx_var.set(str(df))
-                if not self.output_dir_var.get().strip():
-                    self.output_dir_var.set(str(df.parent))
-                applied.append(f"初筛稿={df.name}")
-                self._append_log(f"📥 已自动识别并填入【初筛确认稿】：{df}")
-            else:
-                self.input_docx_var.set(str(df))
-                if not self.output_dir_var.get().strip():
-                    self.output_dir_var.set(str(df.parent))
-                applied.append(f"待整理文档={df.name}")
-                self._append_log(f"📥 已自动识别并填入【待整理文档】：{df}")
+        if docx_files:
+            df = docx_files[0]
+            self.input_docx_var.set(str(df))
+            if not self.output_dir_var.get().strip():
+                self.output_dir_var.set(str(df.parent))
+            applied.append(f"待整理文档={df.name}")
+            self._append_log(f"📥 已载入【待整理文档】：{df}")
 
-        lib_assigned = False
-        for d in dirs:
-            has_corpus_docx = any(
-                not f.name.startswith("~$") for f in d.rglob("*.docx")
-            )
-            if has_corpus_docx and not lib_assigned:
-                self.library_dir_var.set(str(d))
-                lib_assigned = True
-                applied.append(f"总库目录={d.name}")
-                self._append_log(f"📥 已自动识别并填入【对应语种总库目录】：{d}")
-            else:
-                self.output_dir_var.set(str(d))
-                applied.append(f"输出目录={d.name}")
-                self._append_log(f"📥 已填入【输出保存目录】：{d}")
+        if len(dirs) == 1:
+            d = dirs[0]
+            self.library_dir_var.set(str(d))
+            applied.append(f"总库目录={d.name}")
+            self._append_log(f"📥 已载入【对应语种总库目录】：{d}")
+            self._warm_library_index_async(str(d))
+        elif len(dirs) >= 2:
+            lib_assigned = False
+            for d in dirs:
+                has_corpus_docx = any(not f.name.startswith("~$") for f in d.rglob("*.docx"))
+                if has_corpus_docx and not lib_assigned:
+                    self.library_dir_var.set(str(d))
+                    lib_assigned = True
+                    applied.append(f"总库目录={d.name}")
+                    self._append_log(f"📥 已自动识别并填入【对应语种总库目录】：{d}")
+                    self._warm_library_index_async(str(d))
+                elif not lib_assigned:
+                    self.library_dir_var.set(str(d))
+                    lib_assigned = True
+                    applied.append(f"总库目录={d.name}")
+                    self._append_log(f"📥 已载入【对应语种总库目录】：{d}")
+                    self._warm_library_index_async(str(d))
+                else:
+                    self.output_dir_var.set(str(d))
+                    applied.append(f"输出目录={d.name}")
+                    self._append_log(f"📥 已填入【输出保存目录】：{d}")
 
         if not applied:
             messagebox.showinfo("拖拽提示", "请拖入 .docx 文档或文件夹。")
@@ -1790,6 +1948,8 @@ class ScatteredRevisionApp:
 
         self._save_settings()
         self.stage_var.set("📥 拖拽载入成功：" + "  |  ".join(applied))
+
+    _on_drop_tab1_general = _handle_tab1_drop
 
     def _on_drop_wc_copy_dir(self, paths: list[Path]):
         p = paths[0].resolve()
@@ -1966,11 +2126,12 @@ class ScatteredRevisionApp:
                     ),
                 )
             except Exception as ex:
+                clean_ex = _format_exception_concise(ex)
                 self.fel_tree.insert(
                     "",
                     tk.END,
                     iid=str(idx),
-                    values=(f"#{idx + 1}", p.name, "-", "-", f"解析失败：{ex}"),
+                    values=(f"#{idx + 1}", p.name, "-", "-", f"解析失败：{clean_ex}"),
                 )
 
         if not self.fel_files:
@@ -2061,11 +2222,16 @@ class ScatteredRevisionApp:
                         ),
                     )
                 )
+            except SystemExit as se:
+                msg = f"弟兄交通整理中止（退出码 {se.code}）：若目标文档已在 Word 中打开，请先关闭后重试。"
+                self._log(f"❌ {msg}")
+                self.log_queue.put(("done", (False, msg)))
+                self.log_queue.put(("popup_error", ("弟兄交通整理中止", msg)))
             except Exception as ex:
-                tb = traceback.format_exc()
-                self._log(f"❌ 弟兄交通整理出错：{ex}\n{tb}")
-                self.log_queue.put(("done", (False, f"整理出错：{ex}")))
-                self.log_queue.put(("popup_error", ("弟兄交通整理出错", str(ex))))
+                err_msg = _format_exception_concise(ex, keys=keys)
+                self._log(f"❌ 弟兄交通整理出错：{err_msg}")
+                self.log_queue.put(("done", (False, f"整理出错：{err_msg}")))
+                self.log_queue.put(("popup_error", ("弟兄交通整理出错", err_msg)))
 
         threading.Thread(target=worker, daemon=True).start()
 
@@ -2174,11 +2340,12 @@ class ScatteredRevisionApp:
                     ),
                 )
             except Exception as ex:
+                clean_ex = _format_exception_concise(ex)
                 self.wc_tree.insert(
                     "",
                     tk.END,
                     iid=str(idx),
-                    values=(p.name, "-", "-", "-", f"解析失败：{ex}", "❌ 错误"),
+                    values=(p.name, "-", "-", "-", f"解析失败：{clean_ex}", "❌ 错误"),
                 )
 
         self.wc_summary_var.set(
@@ -2235,12 +2402,13 @@ class ScatteredRevisionApp:
                     ),
                 )
             except Exception as ex:
-                err_msgs.append(f"• {p.name}：{ex}")
+                clean_ex = _format_exception_concise(ex)
+                err_msgs.append(f"• {p.name}：{clean_ex}")
                 self.wc_tree.insert(
                     "",
                     tk.END,
                     iid=str(idx),
-                    values=(p.name, "-", "-", "-", str(ex), "❌ 失败"),
+                    values=(p.name, "-", "-", "-", clean_ex, "❌ 失败"),
                 )
 
         self.wc_summary_var.set(
@@ -2346,26 +2514,20 @@ class ScatteredRevisionApp:
             self.input_docx_var.set(p)
             if not self.output_dir_var.get().strip():
                 self.output_dir_var.set(str(Path(p).parent))
+            self._save_settings()
 
     def _browse_library(self):
         d = filedialog.askdirectory(title="选择对应语种《七卷书》总库文件夹")
         if d:
             self.library_dir_var.set(d)
+            self._save_settings()
+            self._warm_library_index_async(d)
 
     def _browse_output(self):
         d = filedialog.askdirectory(title="选择输出保存文件夹")
         if d:
             self.output_dir_var.set(d)
-
-    def _browse_draft(self):
-        p = filedialog.askopenfilename(
-            title="选择已复核的初筛稿 (.docx)",
-            filetypes=[("Word 文档", "*.docx")],
-        )
-        if p:
-            self.draft_docx_var.set(p)
-            if not self.output_dir_var.get().strip():
-                self.output_dir_var.set(str(Path(p).parent))
+            self._save_settings()
 
     def _open_output_dir(self):
         d = self.output_dir_var.get().strip()
@@ -2374,14 +2536,6 @@ class ScatteredRevisionApp:
             os.startfile(str(p))
         else:
             messagebox.showinfo("提示", "请先选择真实存在的输出文件夹目录。")
-
-    def _open_draft_file(self):
-        raw = self.draft_docx_var.get().strip()
-        p = Path(raw).resolve() if raw else None
-        if p and p.is_file() and p.suffix.lower() == ".docx":
-            os.startfile(str(p))
-        else:
-            messagebox.showinfo("提示", "当前还没有有效的 .docx 初筛稿文件，请先执行第一步或手动选择初筛稿。")
 
     def _log(self, msg: str):
         self.log_queue.put(("log", msg))
@@ -2422,13 +2576,16 @@ class ScatteredRevisionApp:
 
         ts = datetime.now().strftime("%H:%M:%S")
         tag = None
-        if any(k in stripped for k in ("▶", "⚡")):
+        lead = stripped.lstrip()
+        if any(k in stripped for k in ("▶", "⚡", "ℹ️")):
             tag = "header"
-        elif any(k in stripped for k in ("✅", "🎉", "Successfully aligned", "Final Document Saved")):
+        elif any(k in stripped for k in ("✅", "🎉", "📚", "Successfully aligned", "Final Document Saved")):
             tag = "ok"
+        elif lead.startswith("⚠️") or any(k in stripped for k in ("↻", "⏳")):
+            tag = "retry"
         elif any(k in stripped for k in ("❌", "ERROR", "失败", "出错", "中止")):
             tag = "err"
-        elif any(k in stripped for k in ("↻", "⚠️", "⏳", "提示", "提醒")):
+        elif any(k in stripped for k in ("⚠️", "提示", "提醒", "跳过")):
             tag = "retry"
 
         line = f"[{ts}] {stripped}\n"
@@ -2467,8 +2624,6 @@ class ScatteredRevisionApp:
                         fmt_t = self._format_pct_timer()
                         self.pct_timer_var.set(fmt_t)
                         self.fel_pct_timer_var.set(fmt_t)
-                    elif kind == "draft_ready":
-                        self.draft_docx_var.set(str(payload))
                     elif kind == "done":
                         ok_flag, final_stage = payload
                         self._set_running(False, ok=ok_flag, final_stage=final_stage)
@@ -2479,7 +2634,7 @@ class ScatteredRevisionApp:
                         title, text = payload
                         messagebox.showerror(title, redact_secrets(str(text), extra_secret=all_secs))
                 except Exception as inner_ex:
-                    self._append_log(f"❌ 日志队列处理异常：{inner_ex}")
+                    self._append_log(f"❌ 日志队列处理异常：{_format_exception_concise(inner_ex)}")
         finally:
             self.root.after(80, self._poll_log_queue)
 
@@ -2487,9 +2642,7 @@ class ScatteredRevisionApp:
         self.is_running = running
         state = tk.DISABLED if running else tk.NORMAL
         for b in (
-            self.btn_step1,
-            self.btn_step2,
-            self.btn_all,
+            self.btn_oneclick,
             self.test_btn,
             self.pool_btn,
             self.btn_fel_run,
@@ -2550,41 +2703,59 @@ class ScatteredRevisionApp:
                 self.log_queue.put(("done", (True, msg)))
                 self.log_queue.put(("popup_info", ("连接测试通过", msg)))
             except Exception as ex:
-                err = f"连接失败：{ex}"
-                self._log(f"❌ {err}")
-                self.log_queue.put(("done", (False, "API 连接失败，请检查密钥或网络")))
-                self.log_queue.put(("popup_error", ("API 连接失败", err)))
+                friendly = _format_exception_concise(ex, keys=keys, api_related=True)
+                self._log(f"❌ {friendly}")
+                self.log_queue.put(("done", (False, friendly)))
+                self.log_queue.put(("popup_error", ("API 连接失败", friendly)))
 
         threading.Thread(target=worker, daemon=True).start()
 
-    def _on_run_step1(self):
+    def _on_run_oneclick(self):
         self._save_settings()
         inp = self.input_docx_var.get().strip()
         lib = self.library_dir_var.get().strip()
         out = self.output_dir_var.get().strip()
-        keys = self._get_all_keys_list()
-        if not keys:
-            messagebox.showwarning("提示", "请先填写至少 1 个 API Key（支持填写无限个自动轮换）。")
-            return
         if not inp or not lib or not out:
             messagebox.showwarning("提示", "请先选择【待整理文档】、【对应语种总库目录】和【输出保存目录】。")
             return
+        if run_oneclick_pipeline is None:
+            messagebox.showerror("组件未就绪", "未找到 pipeline.run_oneclick_pipeline，请检查程序文件完整性。")
+            return
 
+        want_ai = bool(self.sc1_enable_ai_var.get())
+        keys = self._get_all_keys_list()
         model = self._get_model_id()
         mode = self._get_api_mode_code()
         rot_mode = self._get_rotation_mode_code()
         lang = self._get_selected_lang_code()
-        pool = ApiKeyPool(keys, rotation_mode=rot_mode)
+        doc_name = self.doc_name_var.get().strip()
+        dual = self.dual_outputs_var.get()
 
-        self._set_running(True, final_stage="正在启动第一步：生成初筛稿...")
+        auto_no_key_local = False
+        if want_ai and not keys:
+            effective_enable_ai = False
+            auto_no_key_local = True
+        else:
+            effective_enable_ai = want_ai
+
+        pool = ApiKeyPool(keys, rotation_mode=rot_mode) if (effective_enable_ai and keys) else ""
+
+        self._set_running(True, final_stage="正在启动一键输出定稿...")
         self._log("=" * 64)
-        self._log(
-            f"⚡ 开始执行【第一步：生成初筛稿】 | 模型：{model} | 密钥池：{len(pool)} 个 Key | 语种设定：{lang}"
+        mode_summary = (
+            f"AI 辅助（模型：{model} | 密钥池：{len(keys)} 个 Key）"
+            if effective_enable_ai
+            else "本地位置估算模式（免 API Key）"
         )
+        self._log(f"⚡ 启动【一键输出定稿】 | {mode_summary} | 语种设定：{lang}")
+        if auto_no_key_local:
+            self._log("ℹ️ 未填写 API Key，本次自动使用「本地位置估算模式」完成标色并导出定稿")
+        elif not want_ai:
+            self._log("ℹ️ 已关闭 AI 辅助开关，本次使用「本地位置估算模式」离线完成标色并导出定稿")
 
         def worker():
             try:
-                res = run_step1_pipeline(
+                res = run_oneclick_pipeline(
                     input_docx=inp,
                     library_dir=lib,
                     output_dir=out,
@@ -2593,176 +2764,81 @@ class ScatteredRevisionApp:
                     api_mode=mode,
                     rotation_mode=rot_mode,
                     lang=lang,
+                    doc_name=doc_name,
+                    dual_outputs=dual,
+                    enable_ai=effective_enable_ai,
                     log_fn=self._log,
                     progress_fn=self._progress,
                 )
-                draft_p = res["draft_path"]
-                det_code = res.get("lang_code", "")
-                det_disp = find_lang_display_name(det_code, self.languages)
-                self.log_queue.put(("draft_ready", draft_p))
-                self._log(f"✅ 第一步完成！当前语种：{det_disp} | 初筛稿已保存至：{draft_p}")
-                self._log("💡 可点击上方【打开初筛稿】在 Word 中检查/微调黄青高亮，保存关闭后点击【② 第二步：由初筛稿生成定稿】。")
-                self.log_queue.put(("done", (True, f"第一步完成！（语种：{det_disp}，初筛稿已就绪）")))
+                saved_files = list(res.get("saved_files") or [])
+                det_lang = res.get("lang_code") or lang
+                det_disp = find_lang_display_name(det_lang, self.languages)
+                skipped_count = int(res.get("skipped_count") or 0)
+                used_local_fallback = bool(res.get("used_local_fallback", False))
+                up_words = res.get("up_words")
+                rv_words = res.get("rv_words")
+
+                files_str = "\n".join(saved_files)
+                extra_notes: list[str] = []
+                if effective_enable_ai and used_local_fallback:
+                    fb_note = (
+                        "⚠️ 标色说明：因 API Key 失效、额度受限或网络异常，已自动切换「本地位置估算模式」完成第 3 列外文标色。"
+                    )
+                    self._log(fb_note)
+                    extra_notes.append(fb_note)
+                elif not effective_enable_ai:
+                    extra_notes.append("ℹ️ 标色模式：本地位置估算模式（离线大概位置标色）")
+
+                if skipped_count > 0:
+                    skip_note = (
+                        f"⚠️ 总库匹配提醒：共有 {skipped_count} 行未在总库匹配到原文，已优雅跳过"
+                        "（发译者版与无改点版已自动剔除，完整留底版已红字标注）。"
+                    )
+                    self._log(skip_note)
+                    extra_notes.append(skip_note)
+
+                wc_line = ""
+                if up_words is not None and rv_words is not None:
+                    wc_line = f"\n第 2 列统计：UP {up_words} words, RV {rv_words} words"
+
+                self._log(f"🎉 一键输出定稿完成！（语种：{det_disp}）共输出 {len(saved_files)} 份文件：\n{files_str}")
+
+                stage_flags = []
+                if effective_enable_ai and used_local_fallback:
+                    stage_flags.append("已自动切换本地估算标色")
+                elif not effective_enable_ai:
+                    stage_flags.append("本地估算标色")
+                if skipped_count > 0:
+                    stage_flags.append(f"跳过 {skipped_count} 行未匹配")
+                flag_suffix = f"；{'，'.join(stage_flags)}" if stage_flags else ""
+
+                self.log_queue.put(
+                    ("done", (True, f"一键输出定稿完成！（{det_disp}，共 {len(saved_files)} 份文件{flag_suffix}）"))
+                )
+                notes_block = ("\n\n" + "\n".join(extra_notes)) if extra_notes else ""
                 self.log_queue.put(
                     (
                         "popup_info",
-                        ("第一步完成", f"语种：{det_disp}\n初筛稿已生成：\n{draft_p}\n\n可人工复核后点击【第二步】输出定稿。"),
+                        (
+                            "一键输出定稿完成",
+                            f"语种：{det_disp}{wc_line}\n已成功生成 {len(saved_files)} 份定稿文档：\n\n{files_str}{notes_block}",
+                        ),
                     )
                 )
             except SystemExit as se:
-                msg = f"处理中止 (退出码 {se.code})，请查看下方实时日志详情（若目标文档已在 Word 打开请先关闭）。"
+                msg = f"执行中止（退出码 {se.code}）：请查看运行日志；若目标文档已在 Word 中打开请先关闭后重试。"
                 self._log(f"❌ {msg}")
-                self.log_queue.put(("done", (False, "第一步中止，请查看日志")))
+                self.log_queue.put(("done", (False, msg)))
                 self.log_queue.put(("popup_error", ("执行中止", msg)))
             except Exception as ex:
-                tb = traceback.format_exc()
-                self._log(f"❌ 第一步出错：{ex}\n{tb}")
-                self.log_queue.put(("done", (False, f"第一步出错：{ex}")))
-                self.log_queue.put(("popup_error", ("第一步出错", str(ex))))
+                err_msg = _format_exception_concise(ex, keys=keys)
+                self._log(f"❌ 执行出错：{err_msg}")
+                self.log_queue.put(("done", (False, f"执行出错：{err_msg}")))
+                self.log_queue.put(("popup_error", ("执行出错", err_msg)))
 
         threading.Thread(target=worker, daemon=True).start()
 
-    def _on_run_step2(self):
-        self._save_settings()
-        draft = self.draft_docx_var.get().strip()
-        out = self.output_dir_var.get().strip()
-        keys = self._get_all_keys_list()
-        if not keys:
-            messagebox.showwarning("提示", "请先填写至少 1 个 API Key（支持填写无限个自动轮换）。")
-            return
-        if not draft or not out:
-            messagebox.showwarning("提示", "请先选择【初筛确认稿】和【输出保存目录】。")
-            return
-
-        model = self._get_model_id()
-        mode = self._get_api_mode_code()
-        rot_mode = self._get_rotation_mode_code()
-        lang = self._get_selected_lang_code()
-        doc_name = self.doc_name_var.get().strip()
-        dual = self.dual_outputs_var.get()
-        pool = ApiKeyPool(keys, rotation_mode=rot_mode)
-
-        self._set_running(True, final_stage="正在启动第二步：外文对齐并生成定稿...")
-        self._log("=" * 64)
-        self._log(
-            f"⚡ 开始执行【第二步：由初筛稿生成定稿】 | 模型：{model} | 密钥池：{len(pool)} 个 Key | 语种设定：{lang}"
-        )
-
-        def worker():
-            try:
-                res = run_step2_pipeline(
-                    draft_docx=draft,
-                    output_dir=out,
-                    api_key=pool,
-                    model=model,
-                    api_mode=mode,
-                    rotation_mode=rot_mode,
-                    lang=lang,
-                    doc_name=doc_name,
-                    dual_outputs=dual,
-                    log_fn=self._log,
-                    progress_fn=self._progress,
-                )
-                det_disp = find_lang_display_name(res.get("lang_code", ""), self.languages)
-                files_str = "\n".join(res["saved_files"])
-                self._log(f"🎉 第二步完成！（语种：{det_disp}）定稿已输出：\n{files_str}")
-                self.log_queue.put(("done", (True, f"定稿生成完成（{det_disp}，共 {len(res['saved_files'])} 个文件）")))
-                self.log_queue.put(("popup_info", ("定稿生成完成", f"语种：{det_disp}\n已成功生成以下定稿文件：\n\n{files_str}")))
-            except SystemExit as se:
-                msg = f"第二步中止 (退出码 {se.code})，请查看日志详情（若文件已在 Word 中打开，请先关闭后重试）。"
-                self._log(f"❌ {msg}")
-                self.log_queue.put(("done", (False, "第二步中止，请查看日志")))
-                self.log_queue.put(("popup_error", ("第二步中止", msg)))
-            except Exception as ex:
-                tb = traceback.format_exc()
-                self._log(f"❌ 第二步出错：{ex}\n{tb}")
-                self.log_queue.put(("done", (False, f"第二步出错：{ex}")))
-                self.log_queue.put(("popup_error", ("第二步出错", str(ex))))
-
-        threading.Thread(target=worker, daemon=True).start()
-
-    def _on_run_all(self):
-        self._save_settings()
-        inp = self.input_docx_var.get().strip()
-        lib = self.library_dir_var.get().strip()
-        out = self.output_dir_var.get().strip()
-        keys = self._get_all_keys_list()
-        if not keys:
-            messagebox.showwarning("提示", "请先填写至少 1 个 API Key（支持填写无限个自动轮换）。")
-            return
-        if not inp or not lib or not out:
-            messagebox.showwarning("提示", "请先选择【待整理文档】、【对应语种总库目录】和【输出保存目录】。")
-            return
-
-        model = self._get_model_id()
-        mode = self._get_api_mode_code()
-        rot_mode = self._get_rotation_mode_code()
-        lang = self._get_selected_lang_code()
-        doc_name = self.doc_name_var.get().strip()
-        dual = self.dual_outputs_var.get()
-        pool = ApiKeyPool(keys, rotation_mode=rot_mode)
-
-        self._set_running(True, final_stage="正在启动一键全自动直出（第一步 + 第二步）...")
-        self._log("=" * 64)
-        self._log(
-            f"⚡ 启动【一键全自动直出】（初筛评估 + 三份定稿导出） | 模型：{model} | 密钥池：{len(pool)} 个 Key | 语种设定：{lang}"
-        )
-
-        def _prog_s1(p: float, msg: str):
-            self._progress(p * 0.40, f"[总阶段 1/2] {msg}")
-
-        def _prog_s2(p: float, msg: str):
-            self._progress(40.0 + p * 0.60, f"[总阶段 2/2] {msg}")
-
-        def worker():
-            try:
-                r1 = run_step1_pipeline(
-                    input_docx=inp,
-                    library_dir=lib,
-                    output_dir=out,
-                    api_key=pool,
-                    model=model,
-                    api_mode=mode,
-                    rotation_mode=rot_mode,
-                    lang=lang,
-                    log_fn=self._log,
-                    progress_fn=_prog_s1,
-                )
-                draft_p = r1["draft_path"]
-                det_lang = r1.get("lang_code") or lang
-                det_disp = find_lang_display_name(det_lang, self.languages)
-                self.log_queue.put(("draft_ready", draft_p))
-
-                r2 = run_step2_pipeline(
-                    draft_docx=draft_p,
-                    output_dir=out,
-                    api_key=pool,
-                    model=model,
-                    api_mode=mode,
-                    rotation_mode=rot_mode,
-                    lang=det_lang,
-                    doc_name=doc_name,
-                    dual_outputs=dual,
-                    log_fn=self._log,
-                    progress_fn=_prog_s2,
-                )
-                all_files = [draft_p] + r2["saved_files"]
-                files_str = "\n".join(all_files)
-                self._log(f"🎉 一键全自动直出全部完成！（语种：{det_disp}）共生成 {len(all_files)} 个文件：\n{files_str}")
-                self.log_queue.put(("done", (True, f"一键直出完成！（{det_disp}，共生成 {len(all_files)} 个文件）")))
-                self.log_queue.put(("popup_info", ("全部完成", f"语种：{det_disp}\n已成功生成初筛稿与定稿：\n\n{files_str}")))
-            except SystemExit as se:
-                msg = f"执行中止 (退出码 {se.code})，请查看运行日志（若目标文件已在 Word 中打开，请先关闭）。"
-                self._log(f"❌ {msg}")
-                self.log_queue.put(("done", (False, "执行中止，请查看日志")))
-                self.log_queue.put(("popup_error", ("执行中止", msg)))
-            except Exception as ex:
-                tb = traceback.format_exc()
-                self._log(f"❌ 执行出错：{ex}\n{tb}")
-                self.log_queue.put(("done", (False, f"执行出错：{ex}")))
-                self.log_queue.put(("popup_error", ("执行出错", str(ex))))
-
-        threading.Thread(target=worker, daemon=True).start()
+    _on_run_all = _on_run_oneclick
 
     def _on_close(self):
         self._save_settings()
@@ -2775,16 +2851,22 @@ class ScatteredRevisionApp:
 
 def _run_frozen_self_test() -> int:
     import docx_xml_utils
+    import library_index
     import step1_extract_and_diff  # noqa: F401
     import step1_render_draft  # noqa: F401
     import step2_parse_reviewed  # noqa: F401
     import step2_render_final  # noqa: F401
     import win_dnd  # noqa: F401
+    from ai_client import format_friendly_api_error as _ai_friendly_err
+    from ai_client import local_align_col3_spans
 
     if getattr(sys, "frozen", False) and hasattr(sys, "_MEIPASS"):
         bundled_cfg = Path(sys._MEIPASS) / "resources" / "config.json"
         if not bundled_cfg.is_file():
             raise FileNotFoundError(f"Bundled config.json missing inside EXE: {bundled_cfg}")
+
+    if not callable(getattr(library_index, "ensure_library_index", None)):
+        raise RuntimeError("library_index.ensure_library_index missing in self-test")
 
     cfg = docx_xml_utils.load_config()
     if cfg.get("col2_up_highlight") != "yellow" or not cfg.get("language_code_map"):
@@ -2795,6 +2877,40 @@ def _run_frozen_self_test() -> int:
     pool = ApiKeyPool(["self_test_placeholder_1", "self_test_placeholder_2"])
     if len(pool) != 2:
         raise RuntimeError("ApiKeyPool self-test failed")
+
+    # Verify format_friendly_api_error strips raw JSON & produces concise Chinese message
+    friendly_sample = _ai_friendly_err(
+        'HTTP 401: {"error": {"code": 401, "message": "API key not valid"}}',
+        total_keys=3,
+    )
+    if not isinstance(friendly_sample, str) or not friendly_sample.strip() or "\n" in friendly_sample or "{" in friendly_sample:
+        raise RuntimeError(f"format_friendly_api_error self-test failed: {friendly_sample!r}")
+
+    # Verify local_align_col3_spans offline approximate Col 3 alignment
+    sample_old_en = "First sentence remains untouched. Second sentence contains a local phrase update here."
+    sample_col3 = "Première phrase reste intacte. Deuxième phrase contient une mise à jour locale ici."
+    phrase = "local phrase update"
+    c_start = sample_old_en.index(phrase)
+    c_end = c_start + len(phrase)
+    local_res = local_align_col3_spans(
+        sample_col3,
+        sample_old_en,
+        [
+            {
+                "span_id": "r0_s0",
+                "type": "up",
+                "old_en_in_col3": phrase,
+                "old_en_char_start": c_start,
+                "old_en_char_end": c_end,
+                "left_old_context": sample_old_en[:c_start],
+                "right_old_context": sample_old_en[c_end:],
+            }
+        ],
+        docx_xml_utils.find_fuzzy_substring_span,
+    )
+    aligned_sub = local_res.get("r0_s0", "") if isinstance(local_res, dict) else ""
+    if not aligned_sub or docx_xml_utils.find_fuzzy_substring_span(sample_col3, aligned_sub) is None:
+        raise RuntimeError(f"local_align_col3_spans self-test failed: {local_res!r}")
 
     # Verify word_counter filename parser & formatter
     p1 = parse_doc_filename("GR_God’s Words_(UP 10 words, RV 20 words)_20261114", known_codes={"GR"})
