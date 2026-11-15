@@ -6,6 +6,7 @@ import xml.etree.ElementTree as ET
 
 from docx_xml_utils import (
     NS,
+    SKIPPED_ROW_MARKER,
     W,
     apply_highlights_to_col3_cell,
     compute_col2_up_rv_words,
@@ -21,6 +22,24 @@ from docx_xml_utils import (
 )
 
 RV_HIGHLIGHT_VALS = {"cyan", "blue", "darkCyan"}
+
+
+def is_skipped_row(tr: ET.Element) -> bool:
+    tcs = tr.findall("w:tc", NS)
+    if len(tcs) < 3:
+        return False
+    return get_cell_plain_text(tcs[2]).strip() == SKIPPED_ROW_MARKER
+
+
+def remove_skipped_rows_in_body(body: ET.Element) -> int:
+    """Remove all skipped rows (`【未在总库匹配到原文，已跳过】` in Col 3) from tables in `body`."""
+    removed_rows = 0
+    for tbl in body.findall("w:tbl", NS):
+        for tr in list(tbl.findall("w:tr", NS)):
+            if is_skipped_row(tr):
+                tbl.remove(tr)
+                removed_rows += 1
+    return removed_rows
 
 
 def normalize_rv_highlights_in_col2(tc2: ET.Element, target_rv_color: str = "cyan"):
@@ -103,6 +122,8 @@ def accept_rv_revisions_in_col2(tc2: ET.Element, target_rv_color: str = "cyan"):
 
 def table_has_col2_changes(tbl_el: ET.Element, active_hl_vals: set) -> bool:
     for tr in tbl_el.findall("w:tr", NS):
+        if is_skipped_row(tr):
+            continue
         tcs = tr.findall("w:tc", NS)
         if len(tcs) < 2:
             continue
@@ -118,6 +139,7 @@ def table_has_col2_changes(tbl_el: ET.Element, active_hl_vals: set) -> bool:
 def filter_tables_in_body(body: ET.Element, up_color: str, rv_color: str, keep_changed: bool) -> tuple[int, int]:
     """
     Filter tables in `body` along with each removed table's preceding title paragraph(s) and trailing blank separator(s).
+    - Tables with 0 remaining rows (e.g. all rows were skipped) are ALWAYS removed!
     - keep_changed=True  -> keep ONLY tables with Col 2 changes/highlights (translator version)
     - keep_changed=False -> keep ONLY tables with ZERO Col 2 changes/highlights (unchanged-only version)
     Returns (kept_tables, removed_tables).
@@ -142,12 +164,21 @@ def filter_tables_in_body(body: ET.Element, up_color: str, rv_color: str, keep_c
     for idx, ch in enumerate(children):
         if ch.tag.split("}")[-1] != "tbl":
             continue
-        has_change = table_has_col2_changes(ch, active_hl_vals)
-        should_remove = (not has_change) if keep_changed else has_change
+        rem_trs = ch.findall("w:tr", NS)
+        if not rem_trs:
+            should_remove = True
+        else:
+            has_change = table_has_col2_changes(ch, active_hl_vals)
+            should_remove = (not has_change) if keep_changed else has_change
+
         if should_remove:
             removed_tables += 1
             to_remove.add(idx)
             b_idx = idx - 1
+            # Also handle optional single blank paragraph between title <w:p> and <w:tbl>
+            if b_idx >= 1 and _is_blank_p(children[b_idx]) and _is_nonempty_p(children[b_idx - 1]):
+                to_remove.add(b_idx)
+                b_idx -= 1
             while b_idx >= 0 and _is_nonempty_p(children[b_idx]):
                 to_remove.add(b_idx)
                 b_idx -= 1
@@ -207,10 +238,12 @@ def main():
     root, _, ns_pairs = load_docx_xml(draft_path)
     body = root.find("w:body", NS)
 
-    # 1. Handle RV highlights/revisions in ALL Col 2 cells (default: retain Track Changes inside cyan!)
+    # 1. Handle RV highlights/revisions in ALL non-skipped Col 2 cells (default: retain Track Changes inside cyan!)
     accept_rv = cfg.get("accept_col2_rv_revisions", False)
     for tbl in body.findall("w:tbl", NS):
         for tr in tbl.findall("w:tr", NS):
+            if is_skipped_row(tr):
+                continue
             tcs = tr.findall("w:tc", NS)
             if len(tcs) >= 2:
                 if accept_rv:
@@ -221,9 +254,11 @@ def main():
     # 2. Apply Col 3 highlights (yellow for UP, lightGray for RV, NO extra line breaks)
     unmatched = []
     matched_count = 0
-    for rt in tasks_data["row_tasks"]:
+    for rt in tasks_data.get("row_tasks", []):
         tbl_el = body[rt["body_idx"]]
         tr = tbl_el.findall("w:tr", NS)[rt["row_idx"]]
+        if is_skipped_row(tr):
+            continue
         tc3 = tr.findall("w:tc", NS)[2]
         col3_text = get_cell_plain_text(tc3)
 
@@ -252,18 +287,19 @@ def main():
         apply_highlights_to_col3_cell(tc3, char_spans)
 
     if unmatched:
-        print("WARNING: Some spans failed to match in Col 3:")
+        print(f"WARNING: {len(unmatched)} span(s) failed to match in Col 3 and were skipped:")
         for sid, tstr, oen in unmatched:
             print(f"  - {sid}: target={tstr!r} (from old_en={oen!r})")
-        raise SystemExit(2)
 
-    # 2.5 Optional table filtering
+    # 2.5 Skipped-row removal + table filtering for translator / unchanged-only outputs
     if args.only_unchanged_tables:
+        rem_skip = remove_skipped_rows_in_body(body)
         kept_cnt, removed_cnt = filter_tables_in_body(body, col2_up, col2_rv, keep_changed=False)
-        print(f"Kept {kept_cnt} unchanged tables (removed {removed_cnt} changed tables).")
+        print(f"Kept {kept_cnt} unchanged tables (removed {removed_cnt} changed/empty tables, {rem_skip} skipped rows).")
     elif args.remove_unchanged_tables:
+        rem_skip = remove_skipped_rows_in_body(body)
         kept_cnt, removed_cnt = filter_tables_in_body(body, col2_up, col2_rv, keep_changed=True)
-        print(f"Kept {kept_cnt} changed tables (removed {removed_cnt} unchanged tables).")
+        print(f"Kept {kept_cnt} changed tables (removed {removed_cnt} unchanged/empty tables, {rem_skip} skipped rows).")
 
     # 3. Optional top header paragraphs (if configured in config.json; empty by default)
     header_paras = cfg.get("header_paragraphs", [])
@@ -273,7 +309,7 @@ def main():
             p_el.append(make_run(hp_text))
             body.insert(idx, p_el)
 
-    # 4. Compute exact UP & RV English word counts from Col 2 (punctuation excluded)
+    # 4. Compute exact UP & RV English word counts from Col 2 (punctuation & skipped rows excluded)
     up_words, rv_words = compute_final_col2_word_counts(root, col2_up, col2_rv)
     count_tag = f"(UP {up_words} words, RV {rv_words} words)"
 
@@ -291,7 +327,8 @@ def main():
     out_path = safe_join_output_file(outdir, out_filename)
 
     save_docx_xml(draft_path, out_path, root, ns_pairs)
-    print(f"Successfully aligned {matched_count}/{matched_count} Col 3 spans (0 unmatched).")
+    total_attempted = matched_count + len(unmatched)
+    print(f"Successfully aligned {matched_count}/{total_attempted} Col 3 spans ({len(unmatched)} unmatched).")
     print(f"Final Col 2 Word Counts: UP = {up_words} words, RV = {rv_words} words")
     print(f"Final Document Saved: {out_path}")
 

@@ -2,16 +2,49 @@ import copy
 import difflib
 import json
 import re
+import threading
 import zipfile
 import xml.etree.ElementTree as ET
 from datetime import datetime, timezone
 from pathlib import Path
+from xml.sax.saxutils import quoteattr
 
 W_URI = "http://schemas.openxmlformats.org/wordprocessingml/2006/main"
+R_URI = "http://schemas.openxmlformats.org/officeDocument/2006/relationships"
 XML_URI = "http://www.w3.org/XML/1998/namespace"
+PKG_REL_URI = "http://schemas.openxmlformats.org/package/2006/relationships"
+CONTENT_TYPES_URI = "http://schemas.openxmlformats.org/package/2006/content-types"
+
 W = f"{{{W_URI}}}"
+R_NS = f"{{{R_URI}}}"
 XML_SPACE = f"{{{XML_URI}}}space"
-NS = {"w": W_URI}
+NS = {"w": W_URI, "r": R_URI}
+
+COMMENTS_REL_TYPE = "http://schemas.openxmlformats.org/officeDocument/2006/relationships/comments"
+COMMENTS_CONTENT_TYPE = "application/vnd.openxmlformats-officedocument.wordprocessingml.comments+xml"
+SKIPPED_ROW_MARKER = "【未在总库匹配到原文，已跳过】"
+
+_STRIPPED_COMMENT_PART_SUFFIXES = (
+    "commentsextended.xml",
+    "commentsids.xml",
+    "commentsextensible.xml",
+)
+_STRIPPED_COMMENT_ZIP_NAMES = frozenset({
+    "word/commentsExtended.xml",
+    "word/commentsIds.xml",
+    "word/commentsExtensible.xml",
+    "word/_rels/comments.xml.rels",
+    "word/_rels/commentsExtended.xml.rels",
+    "word/_rels/commentsIds.xml.rels",
+    "word/_rels/commentsExtensible.xml.rels",
+})
+_STRIPPED_COMMENT_REL_TYPES = (
+    "/commentsExtended",
+    "/commentsIds",
+    "/commentsExtensible",
+)
+
+_ET_NS_LOCK = threading.Lock()
 
 # Strict ECMA-376 CT_RPr child tag order
 RPR_ORDER = [
@@ -23,6 +56,10 @@ RPR_ORDER = [
     "specVanish", "oMath", "rPrChange"
 ]
 RPR_RANK = {name: idx for idx, name in enumerate(RPR_ORDER)}
+
+INLINE_SEMANTIC_RPR_TAGS = frozenset({
+    "b", "bCs", "i", "iCs", "u", "strike", "dstrike", "vertAlign", "caps", "smallCaps", "rtl", "cs"
+})
 
 
 DEFAULT_CONFIG = {
@@ -139,12 +176,15 @@ def load_config():
 
 def register_xml_namespaces(xml_bytes: bytes):
     head = xml_bytes[:8192].decode("utf-8", errors="ignore")
-    m = re.search(r"<w:document\b[^>]*>", head)
+    m = re.search(r"<w:(?:document|comments)\b[^>]*>", head)
     open_tag = m.group(0) if m else ""
     ns_pairs = re.findall(r'xmlns:([A-Za-z0-9_.-]+)="([^"]+)"', open_tag)
-    for prefix, uri in ns_pairs:
-        ET.register_namespace(prefix, uri)
-    ET.register_namespace("w", W_URI)
+    with _ET_NS_LOCK:
+        for prefix, uri in ns_pairs:
+            if prefix != "xml":
+                ET.register_namespace(prefix, uri)
+        ET.register_namespace("w", W_URI)
+        ET.register_namespace("r", R_URI)
     return open_tag, ns_pairs
 
 
@@ -208,9 +248,19 @@ def _validate_docx_zip(zf: zipfile.ZipFile) -> None:
 def _assert_safe_openxml_bytes(xml_bytes: bytes) -> None:
     """Block DTD / Entity declarations (Billion Laughs / XXE) before XML parsing."""
     if len(xml_bytes) > MAX_DOCX_MEMBER_BYTES:
-        raise ValueError("word/document.xml exceeds maximum allowed byte size.")
+        raise ValueError("OpenXML member exceeds maximum allowed byte size.")
     if _DTD_RE.search(xml_bytes):
         raise ValueError("Unsafe XML DOCTYPE/ENTITY declaration rejected in OpenXML document.")
+
+
+def _local_name(tag_or_attr: str) -> str:
+    return tag_or_attr.split("}")[-1] if "}" in tag_or_attr else tag_or_attr
+
+
+def _ns_uri(tag_or_attr: str) -> str:
+    if tag_or_attr.startswith("{") and "}" in tag_or_attr:
+        return tag_or_attr[1:tag_or_attr.index("}")]
+    return ""
 
 
 def load_docx_xml(docx_path: Path):
@@ -225,13 +275,854 @@ def load_docx_xml(docx_path: Path):
     return root, open_tag, ns_pairs
 
 
-def save_docx_xml(src_docx_path: Path, dst_docx_path: Path, root: ET.Element, ns_pairs):
-    register_xml_namespaces(b"")
-    for prefix, uri in ns_pairs:
-        ET.register_namespace(prefix, uri)
-    ET.register_namespace("w", W_URI)
+def new_comments_root() -> ET.Element:
+    return ET.Element(f"{W}comments")
 
-    xml_str = ET.tostring(root, encoding="unicode")
+
+def load_docx_comments_xml(docx_path: Path):
+    """Load word/comments.xml from a .docx if present, returning sanitized <w:comments> Element or None."""
+    with zipfile.ZipFile(docx_path, "r") as z:
+        _validate_docx_zip(z)
+        if "word/comments.xml" not in z.namelist():
+            return None
+        info = z.getinfo("word/comments.xml")
+        with z.open(info, "r") as fp:
+            xml_bytes = fp.read(MAX_DOCX_MEMBER_BYTES + 1)
+    _assert_safe_openxml_bytes(xml_bytes)
+    raw_root = ET.fromstring(xml_bytes)
+    clean_root = new_comments_root()
+    seen_ids = set()
+    for c_el in raw_root.findall(f"{W}comment"):
+        cid_raw = c_el.attrib.get(f"{W}id", "").strip()
+        try:
+            cid_int = int(cid_raw)
+        except ValueError:
+            continue
+        if cid_int in seen_ids:
+            continue
+        seen_ids.add(cid_int)
+        clean_root.append(sanitize_comment_element(c_el, cid_int))
+    return clean_root
+
+
+def load_docx_comments_map(docx_path: Path) -> dict:
+    """Return {str(w:id): <w:comment Element>} from word/comments.xml of docx_path (empty dict if none)."""
+    c_root = load_docx_comments_xml(docx_path)
+    if c_root is None:
+        return {}
+    out = {}
+    for c_el in c_root.findall(f"{W}comment"):
+        cid = c_el.attrib.get(f"{W}id", "").strip()
+        if cid and cid not in out:
+            out[cid] = c_el
+    return out
+
+
+class CommentIdAllocator:
+    """Thread-safe / monotonic integer w:id allocator above all existing comment IDs in target document."""
+
+    def __init__(self, doc_root: ET.Element = None, comments_root: ET.Element = None):
+        max_id = 0
+        found_any = False
+        if doc_root is not None:
+            for elem in doc_root.iter():
+                loc = _local_name(elem.tag)
+                if loc in ("commentRangeStart", "commentRangeEnd", "commentReference"):
+                    val = elem.attrib.get(f"{W}id", "").strip()
+                    try:
+                        iv = int(val)
+                        found_any = True
+                        if iv > max_id:
+                            max_id = iv
+                    except ValueError:
+                        pass
+        if comments_root is not None:
+            for c_el in comments_root.findall(f"{W}comment"):
+                val = c_el.attrib.get(f"{W}id", "").strip()
+                try:
+                    iv = int(val)
+                    found_any = True
+                    if iv > max_id:
+                        max_id = iv
+                except ValueError:
+                    pass
+        self._next = (max_id + 1) if found_any else 1
+
+    def next_id(self) -> int:
+        nid = self._next
+        self._next += 1
+        return nid
+
+
+def _clean_comment_subtree_children(parent_in: ET.Element) -> list:
+    """Clean children inside a <w:comment> paragraph/run so zero broken external rels, styles, bookmarks, or paraIds remain."""
+    UNWRAP_TAGS = {"hyperlink", "smartTag", "customXml", "ins", "moveTo", "fldSimple"}
+    DROP_TAGS = {
+        "del", "moveFrom", "moveFromRangeStart", "moveFromRangeEnd",
+        "moveToRangeStart", "moveToRangeEnd",
+        "bookmarkStart", "bookmarkEnd", "permStart", "permEnd", "proofErr",
+        "footnoteReference", "endnoteReference",
+        "commentRangeStart", "commentRangeEnd", "commentReference",
+        "drawing", "pict", "object",
+    }
+    ALLOWED_RUN_CHILDREN = {
+        "rPr", "t", "tab", "br", "cr", "noBreakHyphen", "softHyphen", "annotationRef"
+    }
+
+    result = []
+    for ch in list(parent_in):
+        ns = _ns_uri(ch.tag)
+        loc = _local_name(ch.tag)
+        if loc == "sdt" and ns == W_URI:
+            sdt_content = ch.find(f"{W}sdtContent")
+            if sdt_content is not None:
+                result.extend(_clean_comment_subtree_children(sdt_content))
+            continue
+        if ns != W_URI:
+            continue
+        if loc in DROP_TAGS:
+            continue
+        if loc in UNWRAP_TAGS:
+            result.extend(_clean_comment_subtree_children(ch))
+            continue
+        if loc == "pPr":
+            new_ppr = ET.Element(f"{W}pPr")
+            for sub in list(ch):
+                if _ns_uri(sub.tag) != W_URI:
+                    continue
+                sloc = _local_name(sub.tag)
+                if sloc in ("pStyle", "numPr", "sectPr", "pPrChange"):
+                    continue
+                cp_sub = copy.deepcopy(sub)
+                _strip_unsafe_attrs_recursive(cp_sub)
+                if sloc == "rPr":
+                    remove_rpr_child(cp_sub, "rStyle")
+                    remove_rpr_child(cp_sub, "rPrChange")
+                new_ppr.append(cp_sub)
+            if len(new_ppr) > 0:
+                result.append(new_ppr)
+            continue
+        if loc == "r":
+            new_r = ET.Element(f"{W}r")
+            has_content = False
+            for sub in list(ch):
+                if _ns_uri(sub.tag) != W_URI:
+                    continue
+                sloc = _local_name(sub.tag)
+                if sloc not in ALLOWED_RUN_CHILDREN:
+                    continue
+                if sloc == "rPr":
+                    cp_rpr = copy.deepcopy(sub)
+                    _strip_unsafe_attrs_recursive(cp_rpr)
+                    remove_rpr_child(cp_rpr, "rStyle")
+                    remove_rpr_child(cp_rpr, "rPrChange")
+                    if len(cp_rpr) > 0:
+                        new_r.insert(0, cp_rpr)
+                else:
+                    cp_sub = copy.deepcopy(sub)
+                    _strip_unsafe_attrs_recursive(cp_sub)
+                    new_r.append(cp_sub)
+                    has_content = True
+            if has_content:
+                result.append(new_r)
+            continue
+    return result
+
+
+def _strip_unsafe_attrs_recursive(elem: ET.Element) -> None:
+    """Keep only W_URI (excluding rsid/paraId/textId) and XML_URI attributes across elem subtree."""
+    for node in elem.iter():
+        for attr_k in list(node.attrib.keys()):
+            ans = _ns_uri(attr_k)
+            aloc = _local_name(attr_k)
+            if aloc in ("paraId", "textId") or aloc.startswith("rsid"):
+                del node.attrib[attr_k]
+            elif ans not in (W_URI, XML_URI, ""):
+                del node.attrib[attr_k]
+
+
+def sanitize_comment_element(comment_el: ET.Element, new_id: int) -> ET.Element:
+    """Build a 100% self-contained, valid <w:comment> element with w:id=new_id."""
+    author = comment_el.attrib.get(f"{W}author") or "整理组"
+    date_val = comment_el.attrib.get(f"{W}date")
+    initials = comment_el.attrib.get(f"{W}initials")
+
+    attrs = {f"{W}id": str(new_id), f"{W}author": author}
+    if date_val:
+        attrs[f"{W}date"] = date_val
+    if initials is not None:
+        attrs[f"{W}initials"] = initials
+
+    out_c = ET.Element(f"{W}comment", attrs)
+    for p in comment_el.findall(f".//{W}p"):
+        # Avoid nested paragraphs if any table existed inside comment; flatten paragraphs cleanly
+        new_p = ET.Element(f"{W}p")
+        for cleaned_ch in _clean_comment_subtree_children(p):
+            new_p.append(cleaned_ch)
+        out_c.append(new_p)
+
+    if len(out_c) == 0:
+        out_c.append(ET.Element(f"{W}p"))
+    return out_c
+
+
+def _make_comment_ref_run(cid_str: str) -> ET.Element:
+    r = ET.Element(f"{W}r")
+    ET.SubElement(r, f"{W}commentReference", {f"{W}id": cid_str})
+    return r
+
+
+def _insert_after_ppr(p_el: ET.Element, new_el: ET.Element) -> None:
+    """Insert new_el at the start of <w:p> immediately AFTER <w:pPr> (preserving ECMA-376 CT_P order)."""
+    if len(p_el) > 0 and _local_name(p_el[0].tag) == "pPr":
+        p_el.insert(1, new_el)
+    else:
+        p_el.insert(0, new_el)
+
+
+def _clean_src_col3_p_children(node: ET.Element) -> list:
+    """
+    Flatten & sanitize children of a cloned library Col 3 <w:p>:
+      - Unwrap sdt/sdtContent, hyperlink, ins, moveTo, smartTag, customXml, fldSimple
+      - Drop del, moveFrom*, bookmarkStart/End, footnoteReference, endnoteReference, permStart/End, proofErr, drawing/pict/object
+      - Keep commentRangeStart, commentRangeEnd, and <w:r> (splitting out commentReference into its own clean <w:r> if mixed with text)
+      - Strip w14:paraId / w14:textId and external r:* attributes.
+    """
+    UNWRAP_TAGS = {"hyperlink", "smartTag", "customXml", "ins", "moveTo", "fldSimple"}
+    DROP_TAGS = {
+        "pPr", "del", "moveFrom", "moveFromRangeStart", "moveFromRangeEnd",
+        "moveToRangeStart", "moveToRangeEnd",
+        "bookmarkStart", "bookmarkEnd", "permStart", "permEnd", "proofErr",
+        "footnoteReference", "endnoteReference",
+        "drawing", "pict", "object",
+    }
+    TEXT_RUN_CHILDREN = {"t", "tab", "br", "cr", "noBreakHyphen", "softHyphen"}
+
+    out = []
+    for ch in list(node):
+        ns = _ns_uri(ch.tag)
+        loc = _local_name(ch.tag)
+        if loc == "sdt" and ns == W_URI:
+            sc = ch.find(f"{W}sdtContent")
+            if sc is not None:
+                out.extend(_clean_src_col3_p_children(sc))
+            continue
+        if ns != W_URI:
+            continue
+        if loc in DROP_TAGS:
+            continue
+        if loc in UNWRAP_TAGS:
+            out.extend(_clean_src_col3_p_children(ch))
+            continue
+        if loc in ("commentRangeStart", "commentRangeEnd"):
+            cid = ch.attrib.get(f"{W}id", "").strip()
+            if cid:
+                out.append(ET.Element(f"{W}{loc}", {f"{W}id": cid}))
+            continue
+        if loc == "commentReference":
+            cid = ch.attrib.get(f"{W}id", "").strip()
+            if cid:
+                out.append(_make_comment_ref_run(cid))
+            continue
+        if loc == "r":
+            old_rpr = ch.find(f"{W}rPr")
+            # Check for nested commentRangeStart/End or text/commentReference inside <w:r>
+            text_subs = []
+            cref_ids = []
+            for sub in list(ch):
+                if _ns_uri(sub.tag) != W_URI:
+                    continue
+                sloc = _local_name(sub.tag)
+                if sloc in TEXT_RUN_CHILDREN:
+                    cp_s = copy.deepcopy(sub)
+                    _strip_unsafe_attrs_recursive(cp_s)
+                    text_subs.append(cp_s)
+                elif sloc == "commentReference":
+                    cid = sub.attrib.get(f"{W}id", "").strip()
+                    if cid:
+                        cref_ids.append(cid)
+                elif sloc in ("commentRangeStart", "commentRangeEnd"):
+                    cid = sub.attrib.get(f"{W}id", "").strip()
+                    if cid:
+                        out.append(ET.Element(f"{W}{sloc}", {f"{W}id": cid}))
+            if text_subs:
+                nr = ET.Element(f"{W}r")
+                if old_rpr is not None:
+                    cp_rpr = copy.deepcopy(old_rpr)
+                    _strip_unsafe_attrs_recursive(cp_rpr)
+                    nr.append(cp_rpr)
+                for ts in text_subs:
+                    nr.append(ts)
+                out.append(nr)
+            for cid in cref_ids:
+                out.append(_make_comment_ref_run(cid))
+    return out
+
+
+def clean_and_migrate_col3_paragraphs(
+    src_tc3: ET.Element,
+    target_tc3: ET.Element,
+    target_tc2: ET.Element,
+    src_comments_map: dict = None,
+    target_comments_root: ET.Element = None,
+    id_allocator: CommentIdAllocator = None,
+) -> list:
+    """
+    Clone text, inline emphasis, and Word comments from library Col 3 (`src_tc3`) while:
+      1. Strictly preserving target_tc3 / target_tc2 paragraph layout (pPr) & font/size formatting (rPr) + RTL bidi/cs.
+      2. Stripping all non-comment OOXML troublemakers (bookmarks, footnotes, permissions, proofErr, smartTag,
+         customXml, sdt, hyperlinks, track changes ins/del, w14:paraId/textId).
+      3. Migrating Word comments from `src_comments_map` into `target_comments_root` with globally unique integer `w:id`s
+         and guaranteeing complete, properly ordered `(commentRangeStart, commentRangeEnd, commentReference)` triplets
+         auto-opened/closed at cell boundaries if a library comment spanned across cells/rows.
+    """
+    tpl_pPr = get_cell_template_ppr(target_tc3, fallback_tc=target_tc2)
+    tpl_rPr = get_first_run_rpr(target_tc3, fallback_tc=target_tc2)
+    src_cmap = src_comments_map if (src_comments_map and target_comments_root is not None and id_allocator is not None) else {}
+
+    paras = []
+    for p in src_tc3.findall("w:p", NS):
+        old_pPr = p.find("w:pPr", NS)
+        old_bidi = old_pPr.find("w:bidi", NS) if old_pPr is not None else None
+
+        cp = ET.Element(f"{W}p")
+        if tpl_pPr is not None:
+            new_pPr = copy.deepcopy(tpl_pPr)
+            _strip_unsafe_attrs_recursive(new_pPr)
+            if old_bidi is not None and new_pPr.find("w:bidi", NS) is None:
+                after_bidi = {
+                    "adjustRightInd", "snapToGrid", "spacing", "ind",
+                    "contextualSpacing", "jc", "textAlignment", "outlineLvl",
+                    "rPr", "sectPr", "pPrChange"
+                }
+                ins_pos = len(new_pPr)
+                for idx_c, ch_p in enumerate(new_pPr):
+                    if _local_name(ch_p.tag) in after_bidi:
+                        ins_pos = idx_c
+                        break
+                new_pPr.insert(ins_pos, ET.Element(f"{W}bidi", dict(old_bidi.attrib)))
+            remove_rpr_child(new_pPr, "pPrChange")
+            if new_pPr.find(f"{W}sectPr") is not None:
+                new_pPr.remove(new_pPr.find(f"{W}sectPr"))
+            cp.append(new_pPr)
+        elif old_bidi is not None:
+            new_pPr = ET.Element(f"{W}pPr")
+            new_pPr.append(ET.Element(f"{W}bidi", dict(old_bidi.attrib)))
+            cp.append(new_pPr)
+
+        cleaned_children = _clean_src_col3_p_children(p)
+        for ch in cleaned_children:
+            if _local_name(ch.tag) == "r":
+                cref = ch.find(f"{W}commentReference")
+                if cref is not None and ch.find(f"{W}t") is None:
+                    # Pure commentReference run: give clean base rPr without rStyle
+                    old_rPr = ch.find(f"{W}rPr")
+                    if old_rPr is not None:
+                        ch.remove(old_rPr)
+                    if tpl_rPr is not None and len(tpl_rPr) > 0:
+                        ch.insert(0, copy.deepcopy(tpl_rPr))
+                else:
+                    old_rPr = ch.find("w:rPr", NS)
+                    new_rPr = copy.deepcopy(tpl_rPr)
+                    if old_rPr is not None:
+                        old_rf = old_rPr.find("w:rFonts", NS)
+                        new_rf = new_rPr.find("w:rFonts", NS)
+                        if old_rf is not None and new_rf is not None:
+                            cs_font = old_rf.attrib.get(f"{W}cs")
+                            if cs_font and f"{W}cs" not in new_rf.attrib:
+                                new_rf.set(f"{W}cs", cs_font)
+                        for rch in old_rPr:
+                            local = _local_name(rch.tag)
+                            if local in INLINE_SEMANTIC_RPR_TAGS:
+                                insert_rpr_child_ordered(new_rPr, copy.deepcopy(rch))
+                        ch.remove(old_rPr)
+                    if len(new_rPr) > 0:
+                        ch.insert(0, new_rPr)
+            cp.append(ch)
+        paras.append(cp)
+
+    if not paras:
+        empty_p = ET.Element(f"{W}p")
+        if tpl_pPr is not None:
+            cp_ppr = copy.deepcopy(tpl_pPr)
+            _strip_unsafe_attrs_recursive(cp_ppr)
+            empty_p.append(cp_ppr)
+        paras.append(empty_p)
+
+    # Remap & repair Word comment markers across `paras`
+    _remap_and_repair_cell_comments(paras, src_cmap, target_comments_root, id_allocator)
+    return paras
+
+
+def _remap_and_repair_cell_comments(
+    paras: list,
+    src_cmap: dict,
+    target_comments_root: ET.Element,
+    id_allocator: CommentIdAllocator,
+) -> None:
+    """
+    Ensure every comment in `paras`:
+      - Drops markers whose old_cid is absent from `src_cmap` (or all markers if `src_cmap` is empty);
+      - Allocates a fresh globally unique integer `new_id` per comment instance and appends sanitized <w:comment> to `target_comments_root`;
+      - Auto-opens at start of `paras[0]` (after pPr) if half-open (ended in cell without Start);
+      - Auto-closes at end of `paras[-1]` if half-open (started in cell without End);
+      - Guarantees exact 1 Start -> 1 End -> 1 Reference order for every `new_id`.
+    """
+    open_inst = {}           # old_cid -> (new_id_str, saw_text_since_start)
+    waiting_ref = {}         # old_cid -> new_id_str
+    completed_old = set()    # old_cids that have completed at least one triplet in this cell
+    needs_ref_after_end = {} # new_id_str -> (p_el, end_el)
+
+    def _alloc_and_copy(old_cid: str) -> str:
+        nid = id_allocator.next_id()
+        nid_s = str(nid)
+        target_comments_root.append(sanitize_comment_element(src_cmap[old_cid], nid))
+        return nid_s
+
+    def _make_ref_with_rpr(nid_s: str, donor_p: ET.Element) -> ET.Element:
+        r_el = _make_comment_ref_run(nid_s)
+        for existing_r in donor_p.findall(f"{W}r"):
+            rpr = existing_r.find(f"{W}rPr")
+            if rpr is not None:
+                r_el.insert(0, copy.deepcopy(rpr))
+                break
+        return r_el
+
+    prepend_starts = []  # new_id_str list to insert at start of paras[0] (in order)
+
+    for p_el in paras:
+        new_children = []
+        for ch in list(p_el):
+            loc = _local_name(ch.tag)
+            if loc == "pPr":
+                new_children.append(ch)
+                continue
+            if loc == "commentRangeStart":
+                old_cid = ch.attrib.get(f"{W}id", "").strip()
+                if old_cid not in src_cmap:
+                    continue
+                if old_cid in open_inst:
+                    prev_nid, saw_txt = open_inst[old_cid]
+                    if not saw_txt:
+                        # Duplicate adjacent commentRangeStart with same ID -> ignore duplicate
+                        continue
+                    # Close previous unclosed instance before opening a new one
+                    end_el = ET.Element(f"{W}commentRangeEnd", {f"{W}id": prev_nid})
+                    new_children.append(end_el)
+                    new_children.append(_make_ref_with_rpr(prev_nid, p_el))
+                    needs_ref_after_end.pop(prev_nid, None)
+                    completed_old.add(old_cid)
+                nid_s = _alloc_and_copy(old_cid)
+                open_inst[old_cid] = (nid_s, False)
+                waiting_ref.pop(old_cid, None)
+                new_children.append(ET.Element(f"{W}commentRangeStart", {f"{W}id": nid_s}))
+                continue
+
+            if loc == "commentRangeEnd":
+                old_cid = ch.attrib.get(f"{W}id", "").strip()
+                if old_cid not in src_cmap:
+                    continue
+                if old_cid in open_inst:
+                    nid_s, _ = open_inst.pop(old_cid)
+                elif old_cid in waiting_ref or old_cid in completed_old:
+                    # Stray duplicate commentRangeEnd -> drop
+                    continue
+                else:
+                    # Half-open comment that started BEFORE this cell!
+                    nid_s = _alloc_and_copy(old_cid)
+                    prepend_starts.append(nid_s)
+                end_el = ET.Element(f"{W}commentRangeEnd", {f"{W}id": nid_s})
+                new_children.append(end_el)
+                waiting_ref[old_cid] = nid_s
+                needs_ref_after_end[nid_s] = (p_el, end_el)
+                continue
+
+            if loc == "r" and ch.find(f"{W}commentReference") is not None and ch.find(f"{W}t") is None:
+                cref = ch.find(f"{W}commentReference")
+                old_cid = cref.attrib.get(f"{W}id", "").strip()
+                if old_cid not in src_cmap:
+                    continue
+                if old_cid in waiting_ref:
+                    nid_s = waiting_ref.pop(old_cid)
+                    cref.set(f"{W}id", nid_s)
+                    needs_ref_after_end.pop(nid_s, None)
+                    completed_old.add(old_cid)
+                    new_children.append(ch)
+                elif old_cid in open_inst:
+                    nid_s, _ = open_inst.pop(old_cid)
+                    end_el = ET.Element(f"{W}commentRangeEnd", {f"{W}id": nid_s})
+                    new_children.append(end_el)
+                    cref.set(f"{W}id", nid_s)
+                    completed_old.add(old_cid)
+                    new_children.append(ch)
+                elif old_cid not in completed_old:
+                    nid_s = _alloc_and_copy(old_cid)
+                    prepend_starts.append(nid_s)
+                    end_el = ET.Element(f"{W}commentRangeEnd", {f"{W}id": nid_s})
+                    new_children.append(end_el)
+                    cref.set(f"{W}id", nid_s)
+                    completed_old.add(old_cid)
+                    new_children.append(ch)
+                # else: duplicate commentReference -> drop
+                continue
+
+            # Regular run / element -> mark open comments as having seen content
+            if open_inst:
+                for k_cid in list(open_inst.keys()):
+                    open_inst[k_cid] = (open_inst[k_cid][0], True)
+            new_children.append(ch)
+
+        for ch in list(p_el):
+            p_el.remove(ch)
+        for ch in new_children:
+            p_el.append(ch)
+
+    # Prepend auto-opened Start markers at beginning of paras[0] (immediately after pPr)
+    if prepend_starts and paras:
+        p0 = paras[0]
+        for nid_s in reversed(prepend_starts):
+            _insert_after_ppr(p0, ET.Element(f"{W}commentRangeStart", {f"{W}id": nid_s}))
+
+    # Insert missing commentReference runs for any End that didn't have a Reference
+    for nid_s, (p_owner, end_el) in list(needs_ref_after_end.items()):
+        children_list = list(p_owner)
+        if end_el in children_list:
+            idx_e = children_list.index(end_el)
+            p_owner.insert(idx_e + 1, _make_ref_with_rpr(nid_s, p_owner))
+
+    # Auto-close any still-open commentRangeStart at the end of paras[-1]
+    if open_inst and paras:
+        plast = paras[-1]
+        for _, (nid_s, _) in open_inst.items():
+            plast.append(ET.Element(f"{W}commentRangeEnd", {f"{W}id": nid_s}))
+            plast.append(_make_ref_with_rpr(nid_s, plast))
+
+
+def sanitize_document_ooxml(root: ET.Element, comments_root: ET.Element = None):
+    """
+    Whole-document OOXML integrity pass run before saving any .docx:
+      1. Strip invalid (>= 0x80000000 or <= 0) or duplicate w14:paraId / w14:textId attributes.
+      2. Remove orphaned, half-open, reversed, duplicate, or _GoBack w:bookmarkStart / w:bookmarkEnd elements.
+      3. Repair/clean w:commentRangeStart / w:commentRangeEnd / w:commentReference in `root` and prune
+         any unreferenced or duplicate <w:comment> elements in `comments_root`.
+    Returns sanitized `comments_root` (or None).
+    """
+    # 1. Clean w14:paraId / w14:textId across root and comments_root
+    seen_para_ids = set()
+    trees = [root] + ([comments_root] if comments_root is not None else [])
+    for tree in trees:
+        for elem in tree.iter():
+            for attr_k in list(elem.attrib.keys()):
+                aloc = _local_name(attr_k)
+                if aloc == "paraId":
+                    val = elem.attrib[attr_k].strip()
+                    try:
+                        iv = int(val, 16)
+                    except ValueError:
+                        iv = -1
+                    norm_hex = val.upper()
+                    if len(val) != 8 or iv <= 0 or iv >= 0x80000000 or norm_hex in seen_para_ids:
+                        del elem.attrib[attr_k]
+                    else:
+                        seen_para_ids.add(norm_hex)
+                elif aloc == "textId":
+                    val = elem.attrib[attr_k].strip()
+                    try:
+                        iv = int(val, 16)
+                    except ValueError:
+                        iv = -1
+                    if len(val) != 8 or iv <= 0 or iv >= 0x80000000:
+                        del elem.attrib[attr_k]
+
+    # Build parent map for root
+    parent_map = {child: parent for parent in root.iter() for child in parent}
+
+    def _remove_elem(el: ET.Element):
+        par = parent_map.get(el)
+        if par is not None and el in list(par):
+            par.remove(el)
+            if _local_name(par.tag) == "r" and len(par) == 0:
+                _remove_elem(par)
+            elif _local_name(par.tag) == "r" and all(_local_name(x.tag) == "rPr" for x in par):
+                _remove_elem(par)
+
+    # 2. Validate bookmarkStart / bookmarkEnd pairs across root in document order
+    bm_starts = {}   # id -> list[(order_idx, elem, name)]
+    bm_ends = {}     # id -> list[(order_idx, elem)]
+    order_counter = 0
+    for elem in list(root.iter()):
+        loc = _local_name(elem.tag)
+        if loc == "bookmarkStart":
+            bid = elem.attrib.get(f"{W}id", "").strip()
+            bname = elem.attrib.get(f"{W}name", "").strip()
+            bm_starts.setdefault(bid, []).append((order_counter, elem, bname))
+            order_counter += 1
+        elif loc == "bookmarkEnd":
+            bid = elem.attrib.get(f"{W}id", "").strip()
+            bm_ends.setdefault(bid, []).append((order_counter, elem))
+            order_counter += 1
+
+    used_bm_names = set()
+    valid_bm_ids = set()
+    for bid, s_list in bm_starts.items():
+        e_list = bm_ends.get(bid, [])
+        if not bid or len(s_list) != 1 or len(e_list) != 1:
+            continue
+        s_ord, _, bname = s_list[0]
+        e_ord, _ = e_list[0]
+        if not bname or bname == "_GoBack" or s_ord >= e_ord or bname in used_bm_names:
+            continue
+        try:
+            int(bid)
+        except ValueError:
+            continue
+        used_bm_names.add(bname)
+        valid_bm_ids.add(bid)
+
+    for bid, s_list in bm_starts.items():
+        if bid not in valid_bm_ids:
+            for _, el, _ in s_list:
+                _remove_elem(el)
+    for bid, e_list in bm_ends.items():
+        if bid not in valid_bm_ids:
+            for _, el in e_list:
+                _remove_elem(el)
+
+    # 3. Validate & synchronize comments between root and comments_root
+    available_comments = {}
+    if comments_root is not None:
+        for c_el in list(comments_root.findall(f"{W}comment")):
+            cid = c_el.attrib.get(f"{W}id", "").strip()
+            try:
+                cid_int = int(cid)
+            except ValueError:
+                comments_root.remove(c_el)
+                continue
+            cid_norm = str(cid_int)
+            if cid_norm in available_comments:
+                comments_root.remove(c_el)
+            else:
+                available_comments[cid_norm] = sanitize_comment_element(c_el, cid_int)
+
+    # Refresh parent_map after bookmark cleanup
+    parent_map = {child: parent for parent in root.iter() for child in parent}
+
+    c_starts = {}  # cid -> list[(ord, elem)]
+    c_ends = {}    # cid -> list[(ord, elem)]
+    c_refs = {}    # cid -> list[(ord, elem)]
+    ord_c = 0
+    for elem in list(root.iter()):
+        loc = _local_name(elem.tag)
+        if loc in ("commentRangeStart", "commentRangeEnd", "commentReference"):
+            cid = elem.attrib.get(f"{W}id", "").strip()
+            if cid not in available_comments:
+                _remove_elem(elem)
+                continue
+            if loc == "commentRangeStart":
+                c_starts.setdefault(cid, []).append((ord_c, elem))
+            elif loc == "commentRangeEnd":
+                c_ends.setdefault(cid, []).append((ord_c, elem))
+            else:
+                c_refs.setdefault(cid, []).append((ord_c, elem))
+            ord_c += 1
+
+    all_doc_cids = set(c_starts.keys()) | set(c_ends.keys()) | set(c_refs.keys())
+    referenced_cids = set()
+
+    for cid in all_doc_cids:
+        s_list = c_starts.get(cid, [])
+        e_list = c_ends.get(cid, [])
+        r_list = c_refs.get(cid, [])
+
+        # Deduplicate extra markers keeping first valid occurrence
+        for _, dup_el in s_list[1:]:
+            _remove_elem(dup_el)
+        s_list = s_list[:1]
+        for _, dup_el in e_list[1:]:
+            _remove_elem(dup_el)
+        e_list = e_list[:1]
+        for _, dup_el in r_list[1:]:
+            _remove_elem(dup_el)
+        r_list = r_list[:1]
+
+        # Find an anchor <w:p> if repair is needed
+        def _enclosing_p(el: ET.Element):
+            cur = el
+            while cur is not None:
+                if _local_name(cur.tag) == "p":
+                    return cur
+                cur = parent_map.get(cur)
+            return None
+
+        if len(s_list) == 1 and len(e_list) == 1 and s_list[0][0] < e_list[0][0]:
+            if len(r_list) == 0:
+                p_end = _enclosing_p(e_list[0][1])
+                if p_end is not None and e_list[0][1] in list(p_end):
+                    idx_e = list(p_end).index(e_list[0][1])
+                    p_end.insert(idx_e + 1, _make_comment_ref_run(cid))
+                    referenced_cids.add(cid)
+                    continue
+            else:
+                referenced_cids.add(cid)
+                continue
+
+        # Half-open or out-of-order comment remaining in root (e.g. cross-row comment after row deletion)
+        anchor_el = (s_list[0][1] if s_list else (e_list[0][1] if e_list else (r_list[0][1] if r_list else None)))
+        anchor_p = _enclosing_p(anchor_el) if anchor_el is not None else None
+        for _, el in s_list + e_list + r_list:
+            _remove_elem(el)
+        if anchor_p is not None:
+            _insert_after_ppr(anchor_p, ET.Element(f"{W}commentRangeStart", {f"{W}id": cid}))
+            anchor_p.append(ET.Element(f"{W}commentRangeEnd", {f"{W}id": cid}))
+            anchor_p.append(_make_comment_ref_run(cid))
+            referenced_cids.add(cid)
+
+    if comments_root is not None:
+        for ch in list(comments_root):
+            comments_root.remove(ch)
+        for cid in sorted(referenced_cids, key=lambda x: int(x)):
+            comments_root.append(available_comments[cid])
+
+    return comments_root
+
+
+def _patch_document_rels_xml(rels_bytes: bytes, ensure_comments_rel: bool) -> bytes:
+    """Update word/_rels/document.xml.rels: strip extended comment rels and ensure/remove comments.xml rel."""
+    _assert_safe_openxml_bytes(rels_bytes)
+    rels_root = ET.fromstring(rels_bytes)
+    kept = []
+    used_ids = set()
+    has_comments = False
+
+    for rel in list(rels_root):
+        if _local_name(rel.tag) != "Relationship":
+            continue
+        rid = rel.attrib.get("Id", "").strip()
+        rtype = rel.attrib.get("Type", "").strip()
+        target = rel.attrib.get("Target", "").strip()
+        target_low = target.replace("\\", "/").lower()
+
+        if any(target_low.endswith(sfx) for sfx in _STRIPPED_COMMENT_PART_SUFFIXES):
+            continue
+        if any(rtype.endswith(rt_sfx) for rt_sfx in _STRIPPED_COMMENT_REL_TYPES):
+            continue
+
+        is_cmt = (rtype == COMMENTS_REL_TYPE or target_low.endswith("comments.xml"))
+        if is_cmt:
+            if not ensure_comments_rel or has_comments:
+                continue
+            has_comments = True
+            rel.set("Type", COMMENTS_REL_TYPE)
+            rel.set("Target", "comments.xml")
+
+        if rid:
+            used_ids.add(rid)
+        kept.append(rel)
+
+    if ensure_comments_rel and not has_comments:
+        n = 1
+        while f"rId{n}" in used_ids:
+            n += 1
+        new_rel = ET.Element(f"{{{PKG_REL_URI}}}Relationship", {
+            "Id": f"rId{n}",
+            "Type": COMMENTS_REL_TYPE,
+            "Target": "comments.xml",
+        })
+        kept.append(new_rel)
+
+    parts = [
+        '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>\r\n',
+        f'<Relationships xmlns="{PKG_REL_URI}">',
+    ]
+    for rel in kept:
+        attr_str = " ".join(f"{_local_name(k)}={quoteattr(v)}" for k, v in rel.attrib.items())
+        parts.append(f"<Relationship {attr_str}/>")
+    parts.append("</Relationships>")
+    return "".join(parts).encode("utf-8")
+
+
+def _patch_content_types_xml(ct_bytes: bytes, ensure_comments_ct: bool) -> bytes:
+    """Update [Content_Types].xml: strip extended comment overrides and ensure/remove /word/comments.xml Override."""
+    _assert_safe_openxml_bytes(ct_bytes)
+    ct_root = ET.fromstring(ct_bytes)
+    defaults = []
+    overrides = []
+    has_comments_ov = False
+
+    for ch in list(ct_root):
+        loc = _local_name(ch.tag)
+        if loc == "Default":
+            defaults.append(ch)
+        elif loc == "Override":
+            pname = ch.attrib.get("PartName", "").strip()
+            pname_low = pname.replace("\\", "/").lower()
+            if any(pname_low.endswith(sfx) for sfx in _STRIPPED_COMMENT_PART_SUFFIXES):
+                continue
+            if pname_low == "/word/comments.xml":
+                if not ensure_comments_ct or has_comments_ov:
+                    continue
+                has_comments_ov = True
+                ch.set("PartName", "/word/comments.xml")
+                ch.set("ContentType", COMMENTS_CONTENT_TYPE)
+            overrides.append(ch)
+
+    if ensure_comments_ct and not has_comments_ov:
+        overrides.append(ET.Element(f"{{{CONTENT_TYPES_URI}}}Override", {
+            "PartName": "/word/comments.xml",
+            "ContentType": COMMENTS_CONTENT_TYPE,
+        }))
+
+    parts = [
+        '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>\r\n',
+        f'<Types xmlns="{CONTENT_TYPES_URI}">',
+    ]
+    for d_el in defaults:
+        attr_str = " ".join(f"{_local_name(k)}={quoteattr(v)}" for k, v in d_el.attrib.items())
+        parts.append(f"<Default {attr_str}/>")
+    for o_el in overrides:
+        attr_str = " ".join(f"{_local_name(k)}={quoteattr(v)}" for k, v in o_el.attrib.items())
+        parts.append(f"<Override {attr_str}/>")
+    parts.append("</Types>")
+    return "".join(parts).encode("utf-8")
+
+
+def _serialize_comments_xml(comments_root: ET.Element) -> bytes:
+    with _ET_NS_LOCK:
+        ET.register_namespace("w", W_URI)
+        ET.register_namespace("r", R_URI)
+        xml_str = ET.tostring(comments_root, encoding="unicode")
+    m = re.match(r"<w:comments\b[^>]*>", xml_str)
+    if m:
+        cur_open = m.group(0)
+        if f'xmlns:w="{W_URI}"' not in cur_open:
+            if cur_open.endswith("/>"):
+                xml_str = cur_open[:-2] + f' xmlns:w="{W_URI}"/>'
+            else:
+                xml_str = cur_open[:-1] + f' xmlns:w="{W_URI}">' + xml_str[m.end():]
+    return ('<?xml version="1.0" encoding="UTF-8" standalone="yes"?>\r\n' + xml_str).encode("utf-8")
+
+
+def save_docx_xml(
+    src_docx_path: Path,
+    dst_docx_path: Path,
+    root: ET.Element,
+    ns_pairs,
+    comments_root: ET.Element = None,
+):
+    if comments_root is None:
+        comments_root = load_docx_comments_xml(src_docx_path)
+
+    comments_root = sanitize_document_ooxml(root, comments_root)
+    has_active_comments = comments_root is not None
+
+    with _ET_NS_LOCK:
+        for prefix, uri in ns_pairs:
+            if prefix != "xml":
+                ET.register_namespace(prefix, uri)
+        ET.register_namespace("w", W_URI)
+        ET.register_namespace("r", R_URI)
+        xml_str = ET.tostring(root, encoding="unicode")
+
     # Re-inject any namespace declarations dropped by ElementTree so mc:Ignorable stays valid in Word
     m = re.match(r"<w:document\b[^>]*>", xml_str)
     if m:
@@ -245,20 +1136,68 @@ def save_docx_xml(src_docx_path: Path, dst_docx_path: Path, root: ET.Element, ns
             patched_open = cur_open[:-1] + " " + " ".join(missing) + ">"
             xml_str = patched_open + xml_str[m.end():]
 
-    full_bytes = ('<?xml version="1.0" encoding="UTF-8" standalone="yes"?>\r\n' + xml_str).encode("utf-8")
+    full_doc_bytes = ('<?xml version="1.0" encoding="UTF-8" standalone="yes"?>\r\n' + xml_str).encode("utf-8")
+    comments_bytes = _serialize_comments_xml(comments_root) if has_active_comments else None
+
+    # Support saving when src_docx_path == dst_docx_path safely by buffering if needed
+    same_file = src_docx_path.resolve() == dst_docx_path.resolve()
+    tmp_dst = dst_docx_path.with_suffix(".docx.tmp_save") if same_file else dst_docx_path
     dst_docx_path.parent.mkdir(parents=True, exist_ok=True)
+
+    wrote_comments = False
+    wrote_rels = False
+    wrote_ct = False
+
     with zipfile.ZipFile(src_docx_path, "r") as zin:
         _validate_docx_zip(zin)
-        with zipfile.ZipFile(dst_docx_path, "w", zipfile.ZIP_DEFLATED) as zout:
+        with zipfile.ZipFile(tmp_dst, "w", zipfile.ZIP_DEFLATED) as zout:
             for item in zin.infolist():
-                if item.filename == "word/document.xml":
-                    zout.writestr(item, full_bytes)
+                norm_name = item.filename.replace("\\", "/")
+                if norm_name in _STRIPPED_COMMENT_ZIP_NAMES or any(
+                    norm_name.lower().endswith(sfx) for sfx in _STRIPPED_COMMENT_PART_SUFFIXES
+                ):
+                    continue
+                if norm_name == "word/document.xml":
+                    zout.writestr(item, full_doc_bytes)
+                elif norm_name == "word/comments.xml":
+                    if has_active_comments and comments_bytes is not None:
+                        zout.writestr(item, comments_bytes)
+                        wrote_comments = True
+                elif norm_name == "word/_rels/document.xml.rels":
+                    with zin.open(item, "r") as mfp:
+                        raw_rels = mfp.read(MAX_DOCX_MEMBER_BYTES + 1)
+                    zout.writestr(item, _patch_document_rels_xml(raw_rels, ensure_comments_rel=has_active_comments))
+                    wrote_rels = True
+                elif norm_name == "[Content_Types].xml":
+                    with zin.open(item, "r") as mfp:
+                        raw_ct = mfp.read(MAX_DOCX_MEMBER_BYTES + 1)
+                    zout.writestr(item, _patch_content_types_xml(raw_ct, ensure_comments_ct=has_active_comments))
+                    wrote_ct = True
                 else:
                     with zin.open(item, "r") as mfp:
                         data = mfp.read(MAX_DOCX_MEMBER_BYTES + 1)
                     if len(data) > MAX_DOCX_MEMBER_BYTES:
                         raise ValueError(f"Member {item.filename!r} exceeded actual read byte limit.")
                     zout.writestr(item, data)
+
+            if has_active_comments and not wrote_comments and comments_bytes is not None:
+                zout.writestr("word/comments.xml", comments_bytes)
+            if has_active_comments and not wrote_rels:
+                empty_rels = f'<?xml version="1.0" encoding="UTF-8" standalone="yes"?>\r\n<Relationships xmlns="{PKG_REL_URI}"/>'.encode("utf-8")
+                zout.writestr("word/_rels/document.xml.rels", _patch_document_rels_xml(empty_rels, ensure_comments_rel=True))
+            if has_active_comments and not wrote_ct:
+                empty_ct = (
+                    f'<?xml version="1.0" encoding="UTF-8" standalone="yes"?>\r\n'
+                    f'<Types xmlns="{CONTENT_TYPES_URI}">'
+                    f'<Default Extension="rels" ContentType="application/vnd.openxmlformats-package.relationships+xml"/>'
+                    f'<Default Extension="xml" ContentType="application/xml"/>'
+                    f'<Override PartName="/word/document.xml" ContentType="application/vnd.openxmlformats-officedocument.wordprocessingml.document.main+xml"/>'
+                    f'</Types>'
+                ).encode("utf-8")
+                zout.writestr("[Content_Types].xml", _patch_content_types_xml(empty_ct, ensure_comments_ct=True))
+
+    if same_file:
+        tmp_dst.replace(dst_docx_path)
 
 
 def insert_rpr_child_ordered(rPr: ET.Element, new_child: ET.Element):
@@ -962,7 +1901,6 @@ def apply_clause_yellow_highlights(sent_ops: list) -> list:
     and mark only clauses containing edits with highlight='yellow' (trimming outer spaces).
     Returns list of (kind, text, highlight_or_None).
     """
-    # Group into clauses split AFTER eq clause delimiters (including trailing quote if any)
     clauses = []
     cur = []
     n = len(sent_ops)
@@ -1033,7 +1971,7 @@ _WORD_COUNT_SKIP_TAGS = frozenset({
 def compute_col2_up_rv_words(root: ET.Element, up_color: str = "yellow", rv_color: str = "cyan") -> tuple[int, int]:
     """
     Count English words (punctuation excluded; words, not characters) in Column 2 (index 1)
-    across all tables in `root`:
+    across all tables in `root` (excluding skipped rows marked in Column 3):
       - UP = yellow highlight (`up_color`)
       - RV = cyan highlight (`rv_color` / cyan / blue / darkCyan)
     Deleted track-change runs (<w:del>) are strictly ignored.
@@ -1075,6 +2013,8 @@ def compute_col2_up_rv_words(root: ET.Element, up_color: str = "yellow", rv_colo
         for tr in tbl.findall("w:tr", NS):
             tcs = tr.findall("w:tc", NS)
             if len(tcs) < 2:
+                continue
+            if len(tcs) >= 3 and get_cell_plain_text(tcs[2]).strip() == SKIPPED_ROW_MARKER:
                 continue
             tc2 = tcs[1]
             for p in tc2.findall("w:p", NS):
@@ -1155,11 +2095,11 @@ def find_fuzzy_substring_span(haystack: str, needle: str, search_from: int = 0):
 def apply_highlights_to_col3_cell(tc: ET.Element, char_spans: list):
     """
     Apply character-offset highlights [(start, end, hl_color), ...] onto existing runs of tc
-    WITHOUT adding extra line breaks/paragraph splits, preserving original run rPr formatting.
+    WITHOUT adding extra line breaks/paragraph splits, preserving original run rPr formatting
+    and any Word comment markers (<w:commentRangeStart>, <w:commentRangeEnd>, <w:commentReference>).
     """
     if not char_spans:
         return
-    # Sort spans and resolve any overlap (later or higher-priority RV wins if overlapping, though normally disjoint)
     total_text = get_cell_plain_text(tc)
     char_hl = [None] * len(total_text)
     for s, e, color in char_spans:
@@ -1184,6 +2124,11 @@ def apply_highlights_to_col3_cell(tc: ET.Element, char_spans: list):
                 new_children.append(ch)
                 continue
             base_rPr = ch.find("w:rPr", NS)
+            extra_crefs = [
+                sub.attrib.get(f"{W}id", "").strip()
+                for sub in ch.findall("w:commentReference", NS)
+                if sub.attrib.get(f"{W}id", "").strip()
+            ]
             r_len = len(r_text)
             r_hls = char_hl[global_offset: global_offset + r_len]
             global_offset += r_len
@@ -1207,6 +2152,11 @@ def apply_highlights_to_col3_cell(tc: ET.Element, char_spans: list):
             if shd_fill in ("auto", "FFFFFF", "ffffff"):
                 shd_fill = None
             new_children.append(make_run(seg_txt, base_rPr=base_rPr, highlight=cur_hl, shd_fill=shd_fill))
+            for cid in extra_crefs:
+                cref_r = _make_comment_ref_run(cid)
+                if base_rPr is not None:
+                    cref_r.insert(0, build_rpr(base_rPr, highlight=None, shd_fill=None))
+                new_children.append(cref_r)
 
         for ch in list(p):
             p.remove(ch)

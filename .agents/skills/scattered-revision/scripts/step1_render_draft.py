@@ -6,26 +6,29 @@ from pathlib import Path
 import xml.etree.ElementTree as ET
 
 from docx_xml_utils import (
+    INLINE_SEMANTIC_RPR_TAGS,
     NS,
+    SKIPPED_ROW_MARKER,
     W,
+    CommentIdAllocator,
     apply_full_sentence_highlight,
+    build_rpr,
+    clean_and_migrate_col3_paragraphs,
     compute_precision_yellow,
     count_msword_en_words,
     get_cell_template_ppr,
     get_first_run_rpr,
     insert_rpr_child_ordered,
     load_config,
+    load_docx_comments_map,
+    load_docx_comments_xml,
     load_docx_xml,
     make_run,
     make_track_el,
+    new_comments_root,
     remove_rpr_child,
     save_docx_xml,
 )
-
-
-INLINE_SEMANTIC_RPR_TAGS = {
-    "b", "bCs", "i", "iCs", "u", "strike", "dstrike", "vertAlign", "caps", "smallCaps", "rtl", "cs"
-}
 
 
 def merge_styled_ops(styled_ops: list) -> list:
@@ -41,57 +44,51 @@ def merge_styled_ops(styled_ops: list) -> list:
     return merged
 
 
-def clean_col3_paragraphs(src_tc3: ET.Element, target_tc3: ET.Element, target_tc2: ET.Element) -> list:
+def clean_col3_paragraphs(
+    src_tc3: ET.Element,
+    target_tc3: ET.Element,
+    target_tc2: ET.Element,
+    src_comments_map: dict = None,
+    target_comments_root: ET.Element = None,
+    id_allocator: CommentIdAllocator = None,
+) -> list:
     """
-    Clone text/inline-emphasis from library Col 3 while strictly preserving the input document's
-    original paragraph layout (pPr) and font/size formatting (rPr) from target_tc3 / target_tc2,
-    as well as RTL directionality (bidi/rtl) and complex-script fonts for non-Latin scripts.
+    Clone text, inline emphasis, and Word comments from library Col 3 while strictly preserving
+    target_tc3 / target_tc2 layout & font formatting and stripping invalid OOXML artifacts.
     """
-    tpl_pPr = get_cell_template_ppr(target_tc3, fallback_tc=target_tc2)
-    tpl_rPr = get_first_run_rpr(target_tc3, fallback_tc=target_tc2)
+    return clean_and_migrate_col3_paragraphs(
+        src_tc3=src_tc3,
+        target_tc3=target_tc3,
+        target_tc2=target_tc2,
+        src_comments_map=src_comments_map,
+        target_comments_root=target_comments_root,
+        id_allocator=id_allocator,
+    )
 
-    paras = []
-    for p in src_tc3.findall("w:p", NS):
-        cp = copy.deepcopy(p)
-        old_pPr = cp.find("w:pPr", NS)
-        old_bidi = old_pPr.find("w:bidi", NS) if old_pPr is not None else None
-        if old_pPr is not None:
-            cp.remove(old_pPr)
-        if tpl_pPr is not None:
-            new_pPr = copy.deepcopy(tpl_pPr)
-            if old_bidi is not None and new_pPr.find("w:bidi", NS) is None:
-                after_bidi = {"adjustRightInd", "snapToGrid", "spacing", "ind", "contextualSpacing", "jc", "textAlignment", "outlineLvl", "rPr", "sectPr", "pPrChange"}
-                ins_pos = len(new_pPr)
-                for idx_c, ch_p in enumerate(new_pPr):
-                    if ch_p.tag.split("}")[-1] in after_bidi:
-                        ins_pos = idx_c
-                        break
-                new_pPr.insert(ins_pos, copy.deepcopy(old_bidi))
-            cp.insert(0, new_pPr)
-        elif old_bidi is not None:
-            new_pPr = ET.Element(f"{W}pPr")
-            new_pPr.append(copy.deepcopy(old_bidi))
-            cp.insert(0, new_pPr)
 
-        for r in cp.findall(".//w:r", NS):
-            old_rPr = r.find("w:rPr", NS)
-            new_rPr = copy.deepcopy(tpl_rPr)
-            if old_rPr is not None:
-                old_rf = old_rPr.find("w:rFonts", NS)
-                new_rf = new_rPr.find("w:rFonts", NS)
-                if old_rf is not None and new_rf is not None:
-                    cs_font = old_rf.attrib.get(f"{W}cs")
-                    if cs_font and f"{W}cs" not in new_rf.attrib:
-                        new_rf.set(f"{W}cs", cs_font)
-                for ch in old_rPr:
-                    local = ch.tag.split("}")[-1]
-                    if local in INLINE_SEMANTIC_RPR_TAGS:
-                        insert_rpr_child_ordered(new_rPr, copy.deepcopy(ch))
-                r.remove(old_rPr)
-            if len(new_rPr) > 0:
-                r.insert(0, new_rPr)
-        paras.append(cp)
-    return paras
+def populate_skipped_col3_cell(tc3: ET.Element, fallback_tc: ET.Element = None) -> None:
+    """Write a single red (`C00000`) paragraph `【未在总库匹配到原文，已跳过】` into Col 3 while keeping Col 1 & Col 2 intact."""
+    tpl_pPr = get_cell_template_ppr(tc3, fallback_tc=fallback_tc)
+    tpl_rPr = get_first_run_rpr(tc3, fallback_tc=fallback_tc)
+
+    tc3_Pr = tc3.find("w:tcPr", NS)
+    for ch in list(tc3):
+        if ch is not tc3_Pr:
+            tc3.remove(ch)
+
+    p_el = ET.Element(f"{W}p")
+    if tpl_pPr is not None:
+        p_el.append(copy.deepcopy(tpl_pPr))
+
+    r_el = ET.Element(f"{W}r")
+    rPr = build_rpr(tpl_rPr, highlight=None, shd_fill=None)
+    insert_rpr_child_ordered(rPr, ET.Element(f"{W}color", {f"{W}val": "C00000"}))
+    r_el.append(rPr)
+    t_el = ET.Element(f"{W}t")
+    t_el.text = SKIPPED_ROW_MARKER
+    r_el.append(t_el)
+    p_el.append(r_el)
+    tc3.append(p_el)
 
 
 def main():
@@ -117,14 +114,19 @@ def main():
 
     inp_path = Path(manifest["input_docx"])
     root, _, ns_pairs = load_docx_xml(inp_path)
+    orig_comments_root = load_docx_comments_xml(inp_path)
+    inp_had_comments = orig_comments_root is not None
+    working_comments_root = orig_comments_root if orig_comments_root is not None else new_comments_root()
+    id_allocator = CommentIdAllocator(doc_root=root, comments_root=working_comments_root)
+
     body = root.find("w:body", NS)
 
-    src_cache = {}
+    src_cache = {}  # Path -> (list_of_trs, comments_map_dict)
     rev_id = 1
     up_texts = []
     rv_texts = []
 
-    for rm in manifest["rows"]:
+    for rm in manifest.get("rows", []):
         body_el = body[rm["body_idx"]]
         tr = body_el.findall("w:tr", NS)[rm["row_idx"]]
         tcs = tr.findall("w:tc", NS)
@@ -133,12 +135,21 @@ def main():
         src_file = Path(rm["source_file"])
         if src_file not in src_cache:
             s_root, _, _ = load_docx_xml(src_file)
-            src_cache[src_file] = s_root.findall(".//w:tbl/w:tr", NS)
-        s_tr = src_cache[src_file][rm["source_row_idx"]]
+            s_cmap = load_docx_comments_map(src_file)
+            src_cache[src_file] = (s_root.findall(".//w:tbl/w:tr", NS), s_cmap)
+        s_trs, s_cmap = src_cache[src_file]
+        s_tr = s_trs[rm["source_row_idx"]]
         s_tcs = s_tr.findall("w:tc", NS)
 
-        # 1. Populate Col 3 from library Col 3 while preserving target_tc3/tc2 original font & size
-        col3_paras = clean_col3_paragraphs(s_tcs[2], tc3, tc2)
+        # 1. Populate Col 3 from library Col 3 while preserving font/size AND migrating Word comments cleanly
+        col3_paras = clean_col3_paragraphs(
+            src_tc3=s_tcs[2],
+            target_tc3=tc3,
+            target_tc2=tc2,
+            src_comments_map=s_cmap,
+            target_comments_root=working_comments_root,
+            id_allocator=id_allocator,
+        )
         tc3_Pr = tc3.find("w:tcPr", NS)
         for ch in list(tc3):
             if ch is not tc3_Pr:
@@ -250,13 +261,31 @@ def main():
                     rev_id += 1
             tc2.append(p_el)
 
+    # 3. Populate skipped rows: keep Col 1 & Col 2 intact, write red `【未在总库匹配到原文，已跳过】` into Col 3
+    skipped_list = manifest.get("skipped_rows", [])
+    for sr in skipped_list:
+        body_el = body[sr["body_idx"]]
+        trs = body_el.findall("w:tr", NS)
+        if 0 <= sr["row_idx"] < len(trs):
+            tcs = trs[sr["row_idx"]].findall("w:tc", NS)
+            if len(tcs) >= 3:
+                populate_skipped_col3_cell(tcs[2], fallback_tc=tcs[1])
+
+    final_comments_root = (
+        working_comments_root
+        if (inp_had_comments or len(working_comments_root.findall(f"{W}comment")) > 0)
+        else None
+    )
+
     out_path = Path(args.output).resolve()
-    save_docx_xml(inp_path, out_path, root, ns_pairs)
+    save_docx_xml(inp_path, out_path, root, ns_pairs, comments_root=final_comments_root)
 
     up_words = count_msword_en_words(" ".join(up_texts))
     rv_words = count_msword_en_words(" ".join(rv_texts))
     print(f"Step 1 Draft saved to: {out_path}")
     print(f"Provisional counts (pending human review): UP = {up_words} words, RV = {rv_words} words")
+    if skipped_list:
+        print(f"Skipped unmatched rows marked in Col 3: {len(skipped_list)}")
 
 
 if __name__ == "__main__":

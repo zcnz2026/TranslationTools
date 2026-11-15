@@ -4,9 +4,9 @@ from pathlib import Path
 
 from docx_xml_utils import (
     NS,
+    SKIPPED_ROW_MARKER,
     W,
     get_cell_plain_text,
-    load_config,
     load_docx_xml,
 )
 
@@ -88,16 +88,41 @@ def main():
                 tcs = tr.findall("w:tc", NS)
                 if len(tcs) < 3:
                     continue
+                col3_text = get_cell_plain_text(tcs[2])
+                if not col3_text.strip() or col3_text.strip() == SKIPPED_ROW_MARKER:
+                    global_row_idx += 1
+                    continue
+
                 segments = extract_col2_spans(tcs[1])
+                old_en_full = "".join(seg["old_en"] for seg in segments)
                 spans_to_align = []
-                for s_i, seg in enumerate(segments):
+                char_cursor = 0
+
+                for seg in segments:
+                    raw_old = seg["old_en"]
+                    raw_start = char_cursor
+                    raw_end = char_cursor + len(raw_old)
+                    char_cursor = raw_end
+
                     if seg["hl_group"] in ("up", "rv"):
-                        left_ctx = segments[s_i - 1]["old_en"][-45:] if s_i > 0 else ""
-                        right_ctx = segments[s_i + 1]["old_en"][:45] if s_i + 1 < len(segments) else ""
+                        stripped_old = raw_old.strip()
+                        if stripped_old:
+                            lead_ws = len(raw_old) - len(raw_old.lstrip())
+                            trail_ws = len(raw_old) - len(raw_old.rstrip())
+                            c_start = raw_start + lead_ws
+                            c_end = raw_end - trail_ws
+                        else:
+                            c_start = raw_start
+                            c_end = raw_end
+
+                        left_ctx = old_en_full[max(0, c_start - 45) : c_start]
+                        right_ctx = old_en_full[c_end : c_end + 45]
                         spans_to_align.append({
                             "span_id": f"R{global_row_idx}_S{len(spans_to_align)}",
                             "type": seg["hl_group"],  # 'up' -> Col3 yellow, 'rv' -> Col3 lightGray
-                            "old_en_in_col3": seg["old_en"].strip(),
+                            "old_en_in_col3": stripped_old,
+                            "old_en_char_start": c_start,
+                            "old_en_char_end": c_end,
                             "new_en": seg["new_en"].strip(),
                             "left_old_context": left_ctx,
                             "right_old_context": right_ctx,
@@ -109,7 +134,8 @@ def main():
                         "body_idx": body_idx,
                         "row_idx": r_idx,
                         "article_title": cur_title,
-                        "col3_text": get_cell_plain_text(tcs[2]),
+                        "col3_text": col3_text,
+                        "old_en_full": old_en_full,
                         "spans": spans_to_align,
                     })
                 global_row_idx += 1
