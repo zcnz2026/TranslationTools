@@ -139,3 +139,45 @@ def find_lang_display_name(code: str, entries: List[Dict]) -> str:
         if e["code"] == c:
             return f"{e['name']} ({c})"
     return c or "auto"
+
+
+def detect_lang_code_from_hint(hint_text: str, entries: List[Dict]) -> str:
+    """Detect language code from folder name, filename, or title text using configured keywords."""
+    s = (hint_text or "").strip()
+    if not s:
+        return ""
+    for e in entries:
+        for kw in e.get("keywords", []):
+            if kw and kw in s:
+                return e["code"]
+    # Also check leading code prefix like "ES_..." or "[ES]"
+    m = re.match(r"^\[?([A-Za-z]{2,4})\]?[_\-\s]", s)
+    if m:
+        cand = m.group(1).upper()
+        for e in entries:
+            if e["code"] == cand:
+                return cand
+    return ""
+
+
+def get_tri_prefix(code: str, entries: List[Dict]) -> str:
+    """Return '中英X' trilingual prefix for a language code (e.g. GR -> '中英腊', MY -> '中英缅', ES -> '中英西')."""
+    c = (code or "").strip().upper()
+    if not c or c == "AUTO":
+        return "中英外"
+    for e in entries:
+        if e["code"] == c:
+            explicit = str(e.get("tri_prefix", "")).strip()
+            if explicit:
+                return explicit
+            tri_kws = [kw.strip() for kw in e.get("keywords", []) if kw.strip().startswith("中英")]
+            if tri_kws:
+                # Prefer concise 3-char '中英X' (e.g. '中英腊', '中英缅', '中英马') when available
+                tri_kws.sort(key=len)
+                return tri_kws[0]
+            nm = e.get("name", "").strip()
+            if nm.endswith("语") and len(nm) >= 2:
+                core = nm[:-1]
+                return f"中英{core}" if len(core) <= 2 else f"中英{core[0]}"
+            return f"中英{c}"
+    return f"中英{c}"

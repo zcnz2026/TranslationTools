@@ -23,6 +23,7 @@ TranslationTools/
     ├── pipeline.py                      # 两步走人工复核与一键直出流水线封装
     ├── lang_registry.py                 # 多语种自由扩展注册表（预置 35 种语言，支持自定义新增）
     ├── word_counter.py                  # 第2列英文单词统计(UP黄/RV青)与标准文件名新增/更新模块
+    ├── fellowship_processor.py          # 场景四：弟兄交通拆框清痕、蓝粗还原、四号/小四/五号排版与合并引擎
     ├── win_dnd.py                       # 原生 Win32 文件与文件夹全局拖拽引擎（纯标准库 ctypes）
     ├── security_utils.py                # Windows DPAPI 加密存储、脱敏日志、ZipBomb/XXE/SSRF 防护
     ├── languages.json                   # 外置多语种配置文件
@@ -42,7 +43,8 @@ TranslationTools/
    - 支持 **均衡轮换** 与 **顺序主备** 两种策略，遇到额度耗尽 / 超速（`HTTP 429`）、密钥失效（`401/403`）或网络波动时毫秒级自动切换下一个可用 Key，不中断批处理任务；
    - 支持一键批量测活与剔除失效 Key；本机勾选记住时采用 **Windows DPAPI** 系统级加密存储，磁盘与日志零明文泄露。
 3. **支持多语种自由扩展**：内置 35 种常见语言，支持在界面点击「➕ 管理 / 新增语种」随时新增任意语种（实时同步至 `languages.json`）。
-4. **双工作流支持**：支持「第一步生成初筛稿人工复核 → 第二步生成定稿」或「⚡ 一键全自动直出全部定稿」，可同时导出**完整留底版**与**发译者版（自动剔除无改点表）**。
+4. **双工作流支持**：支持「第一步生成初筛稿人工复核 → 第二步生成定稿」或「⚡ 一键全自动直出全部定稿」，可同时导出**发译者版**、**完整留底版**与**无改点内容版**。
+5. **新增「📚 弟兄交通整理」板块**：支持直接拖入分篇文件夹或多个 `.docx`，自动无损拆解 `<w:sdt>` 内容控件、关闭修订状态（`修订: 关闭`）并清除全部批注/修订、将 `Part 1` 统一转为 `-01`、同步第 3 列蓝字 `#0000FF` 与引文加粗、主标题保留四号（`14pt`）/ 正文小四（`12pt`）/ 引文后出处五号（`10.5pt`）、固定值 `20 磅` 行距、按内容长度动态均衡三列宽度，并支持**仅单篇 / 仅合并总文档 / 单篇+合并同时输出**三种模式。
 
 ---
 
@@ -82,6 +84,7 @@ python -m PyInstaller --noconfirm --clean --onefile --windowed `
   --hidden-import security_utils `
   --hidden-import word_counter `
   --hidden-import win_dnd `
+  --hidden-import fellowship_processor `
   --hidden-import pipeline `
   ".\零散改点工具\app_gui.py"
 ```

@@ -20,14 +20,26 @@ from ai_client import (
     test_all_api_keys,
     test_api_connection,
 )
+from fellowship_processor import (
+    OUTPUT_MODES,
+    QUOTE_MODES,
+    build_fellowship_output_name,
+    find_post_quote_citation_spans,
+    inspect_fellowship_docx_quick,
+    natural_sort_docx_paths,
+    parse_title_and_part,
+    run_fellowship_pipeline,
+)
 from lang_registry import (
     AUTO_COMBO_LABEL,
     DEFAULT_LANGUAGES,
     build_keywords_list,
+    detect_lang_code_from_hint,
     find_lang_display_name,
     format_combo_label,
     get_combo_values,
     get_languages_file,
+    get_tri_prefix,
     load_languages,
     resolve_combo_to_code,
     save_languages,
@@ -515,8 +527,8 @@ class LanguageManagerDialog(tk.Toplevel):
 class ScatteredRevisionApp:
     def __init__(self, root: tk.Tk):
         self.root = root
-        self.root.title("零散改点自动整理工具 v1.4.1  (支持文件/文件夹直接拖拽 + 左侧导航 + 三版输出 + 字数统计)")
-        self.root.geometry("1100x800")
+        self.root.title("零散改点自动整理工具 v1.5.0  (零散改点 · 字数统计 · 弟兄交通整理 · 支持文件/文件夹直接拖拽)")
+        self.root.geometry("1120x820")
         self.root.minsize(980, 700)
 
         self.log_queue: queue.Queue = queue.Queue()
@@ -528,6 +540,8 @@ class ScatteredRevisionApp:
         self._pool_multiline_text: str = ""
         self._syncing_key_var: bool = False
         self.wc_files: list[str] = []
+        self.fel_files: list[str] = []
+        self._fel_inspect_cache: dict[str, dict] = {}
         self.active_tab_key: str = "main"
         self._nav_items: dict = {}
         self.dnd = WinFileDropManager(self.root, fallback_cb=self._on_drop_fallback)
@@ -595,6 +609,20 @@ class ScatteredRevisionApp:
             value="当前共 0 份文档  |  第 2 列英文合计：UP 0 words, RV 0 words"
         )
 
+        # Tab 3 (Scenario 4: Brother Fellowship Manuscript Processor) vars
+        self.fel_output_dir_var = tk.StringVar(value="")
+        self.fel_lang_var = tk.StringVar(value=AUTO_COMBO_LABEL)
+        self.fel_tri_prefix_var = tk.StringVar(value="")
+        self.fel_date_var = tk.StringVar(value=datetime.now().strftime("%Y%m%d"))
+        self.fel_quote_label_var = tk.StringVar(value=QUOTE_MODES[0][0])
+        self.fel_output_mode_var = tk.StringVar(value="single_only")  # "single_only", "merged_only", "both"
+        self.fel_summary_var = tk.StringVar(
+            value="当前共 0 份分篇文档  |  支持直接拖入整个分篇文件夹或多个 .docx 自动排序"
+        )
+        self.fel_progress_var = tk.DoubleVar(value=0.0)
+        self.fel_stage_var = tk.StringVar(value="状态：就绪（拖入文件夹或多个 .docx 稿件后点击右侧按钮执行整理）")
+        self.fel_pct_timer_var = tk.StringVar(value="0%")
+
         self.api_key_var.trace_add("write", self._on_key_entry_changed)
 
     def _on_key_entry_changed(self, *_args):
@@ -652,6 +680,16 @@ class ScatteredRevisionApp:
     def _get_wc_lang_code(self) -> str:
         return resolve_combo_to_code(self.wc_lang_var.get(), self.languages)
 
+    def _get_fel_lang_code(self) -> str:
+        return resolve_combo_to_code(self.fel_lang_var.get(), self.languages)
+
+    def _get_fel_quote_mode_code(self) -> str:
+        lbl = self.fel_quote_label_var.get().strip()
+        for disp, code in QUOTE_MODES:
+            if lbl == disp or lbl == code:
+                return code
+        return "auto"
+
     def _code_to_combo_display(self, code: str) -> str:
         c = (code or "").strip().upper()
         if not c or c == "AUTO":
@@ -694,6 +732,15 @@ class ScatteredRevisionApp:
                 saved_wc_lang = cfg.get("wc_lang", saved_lang)
                 self.wc_lang_var.set(self._code_to_combo_display(saved_wc_lang))
                 self.dual_outputs_var.set(bool(cfg.get("dual_outputs", True)))
+                self.fel_output_dir_var.set(cfg.get("fel_output_dir", ""))
+                saved_fel_lang = cfg.get("fel_lang", "AUTO")
+                self.fel_lang_var.set(self._code_to_combo_display(saved_fel_lang))
+                saved_fel_mode = cfg.get("fel_output_mode", "single_only")
+                if saved_fel_mode in {m[1] for m in OUTPUT_MODES}:
+                    self.fel_output_mode_var.set(saved_fel_mode)
+                saved_fel_quote = cfg.get("fel_quote_label", "")
+                if saved_fel_quote in {q[0] for q in QUOTE_MODES}:
+                    self.fel_quote_label_var.set(saved_fel_quote)
             except Exception:
                 pass
 
@@ -724,6 +771,10 @@ class ScatteredRevisionApp:
             "lang": self._get_selected_lang_code(),
             "wc_lang": self._get_wc_lang_code(),
             "dual_outputs": self.dual_outputs_var.get(),
+            "fel_output_dir": self.fel_output_dir_var.get().strip(),
+            "fel_lang": self._get_fel_lang_code(),
+            "fel_output_mode": self.fel_output_mode_var.get(),
+            "fel_quote_label": self.fel_quote_label_var.get(),
         }
         try:
             with open(SETTINGS_FILE, "w", encoding="utf-8") as f:
@@ -758,7 +809,7 @@ class ScatteredRevisionApp:
         ).pack(fill=tk.X)
         tk.Label(
             brand_box,
-            text="v1.4.1 · 支持拖拽文件/文件夹",
+            text="v1.5.0 · 支持拖拽文件/文件夹",
             font=("Microsoft YaHei UI", 8),
             fg="#64748b",
             bg="#ffffff",
@@ -786,6 +837,11 @@ class ScatteredRevisionApp:
             key="wc",
             title="📊 计算文档字数",
             subtitle="算英文词数 · 改文件名",
+        )
+        self.nav_btn_fel = self._create_sidebar_tab(
+            key="fel",
+            title="📚 弟兄交通整理",
+            subtitle="拆框清痕 · 蓝粗还原 · 可选合并",
         )
 
         # Bottom Drag & Drop quick tip inside left sidebar
@@ -830,12 +886,15 @@ class ScatteredRevisionApp:
 
         self.tab_main = ttk.Frame(self.content_area)
         self.tab_wc = ttk.Frame(self.content_area)
+        self.tab_fel = ttk.Frame(self.content_area)
 
         self.tab_main.grid(row=0, column=0, sticky=tk.NSEW)
         self.tab_wc.grid(row=0, column=0, sticky=tk.NSEW)
+        self.tab_fel.grid(row=0, column=0, sticky=tk.NSEW)
 
         self._build_tab1_pipeline(self.tab_main)
         self._build_tab2_word_counter(self.tab_wc)
+        self._build_tab3_fellowship(self.tab_fel)
 
         self._switch_tab("main")
 
@@ -908,12 +967,16 @@ class ScatteredRevisionApp:
 
     def _switch_tab(self, key: str):
         self.active_tab_key = key
-        if key == "main":
-            self.tab_wc.grid_remove()
-            self.tab_main.grid(row=0, column=0, sticky=tk.NSEW)
-        else:
-            self.tab_main.grid_remove()
-            self.tab_wc.grid(row=0, column=0, sticky=tk.NSEW)
+        tab_map = {
+            "main": self.tab_main,
+            "wc": self.tab_wc,
+            "fel": self.tab_fel,
+        }
+        for k, frame in tab_map.items():
+            if k == key:
+                frame.grid(row=0, column=0, sticky=tk.NSEW)
+            else:
+                frame.grid_remove()
 
         for k, parts in self._nav_items.items():
             is_act = k == key
@@ -1169,7 +1232,7 @@ class ScatteredRevisionApp:
 
         key_cnt = len(self._get_all_keys_list())
         self._append_log(
-            f"欢迎使用零散改点自动整理工具 v1.4.1！已载入 {key_cnt} 个 API Key、{len(self.languages)} 种语言；支持直接拖拽文件与文件夹。"
+            f"欢迎使用零散改点自动整理工具 v1.5.0！已载入 {key_cnt} 个 API Key、{len(self.languages)} 种语言；支持零散改点、字数统计与弟兄交通整理。"
         )
 
     def _build_tab2_word_counter(self, parent: ttk.Frame):
@@ -1353,12 +1416,226 @@ class ScatteredRevisionApp:
             command=self._wc_refresh_previews,
         ).pack(side=tk.RIGHT, padx=(0, 8))
 
+    def _build_tab3_fellowship(self, parent: ttk.Frame):
+        # 1. File / Folder Drop & Parameters Frame
+        cfg_frame = ttk.LabelFrame(
+            parent,
+            text=" 1. 弟兄交通稿件载入与排版输出设置（拆内容控件 · 关修订清批注 · 第3列蓝粗还原 · 固定值20磅 · 均衡列宽） ",
+            padding=10,
+        )
+        cfg_frame.pack(fill=tk.X, pady=(0, 7))
+
+        drop_zone = tk.Frame(
+            cfg_frame,
+            bg="#eff6ff",
+            highlightbackground="#93c5fd",
+            highlightthickness=1,
+            padx=12,
+            pady=6,
+            cursor="hand2",
+        )
+        drop_zone.pack(fill=tk.X, pady=(0, 7))
+        dz_lbl = tk.Label(
+            drop_zone,
+            text="📥 直接拖入整个分篇文件夹或多个 .docx 稿件即可自动按序号排序载入（点击此处可选择文件夹）",
+            font=("Microsoft YaHei UI", 9, "bold"),
+            fg="#1d4ed8",
+            bg="#eff6ff",
+            cursor="hand2",
+        )
+        dz_lbl.pack(fill=tk.X)
+        drop_zone.bind("<Button-1>", lambda _e: self._fel_add_folder())
+        dz_lbl.bind("<Button-1>", lambda _e: self._fel_add_folder())
+
+        btn_bar = ttk.Frame(cfg_frame)
+        btn_bar.pack(fill=tk.X, pady=(0, 7))
+
+        ttk.Button(
+            btn_bar,
+            text="📁 选择文件夹批量载入...",
+            style="Action.TButton",
+            command=self._fel_add_folder,
+        ).pack(side=tk.LEFT, padx=(0, 6))
+        ttk.Button(
+            btn_bar,
+            text="📄 选择多个 Word 文档...",
+            style="Action.TButton",
+            command=self._fel_add_files,
+        ).pack(side=tk.LEFT, padx=(0, 6))
+        ttk.Button(btn_bar, text="🗑️ 移除选中", command=self._fel_remove_selected).pack(side=tk.LEFT, padx=(0, 6))
+        ttk.Button(btn_bar, text="🧹 清空列表", command=self._fel_clear_all).pack(side=tk.LEFT)
+
+        self.fel_pool_btn = ttk.Button(
+            btn_bar,
+            textvariable=self.pool_btn_text_var,
+            command=self._open_key_pool_dialog,
+        )
+        self.fel_pool_btn.pack(side=tk.RIGHT)
+
+        out_row = ttk.Frame(cfg_frame)
+        out_row.pack(fill=tk.X, pady=3)
+        self.lbl_fel_output_dir = ttk.Label(out_row, text="输出保存目录：")
+        self.lbl_fel_output_dir.pack(side=tk.LEFT)
+        self.ent_fel_output_dir = ttk.Entry(out_row, textvariable=self.fel_output_dir_var)
+        self.ent_fel_output_dir.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=4)
+        ttk.Button(out_row, text="浏览...", width=9, command=self._fel_browse_output).pack(side=tk.LEFT, padx=2)
+        ttk.Button(out_row, text="打开目录", width=9, command=self._fel_open_output_dir).pack(side=tk.LEFT, padx=(2, 0))
+
+        opt_row = ttk.Frame(cfg_frame)
+        opt_row.pack(fill=tk.X, pady=3)
+
+        ttk.Label(opt_row, text="目标语种：").pack(side=tk.LEFT)
+        self.fel_lang_cb = ttk.Combobox(
+            opt_row,
+            textvariable=self.fel_lang_var,
+            values=get_combo_values(self.languages),
+            width=22,
+        )
+        self.fel_lang_cb.pack(side=tk.LEFT, padx=(4, 4))
+        self.fel_lang_cb.bind("<<ComboboxSelected>>", self._fel_on_lang_changed)
+
+        ttk.Button(opt_row, text="➕ 管理语种", command=self._open_lang_manager).pack(side=tk.LEFT, padx=(0, 10))
+
+        ttk.Label(opt_row, text="三语前缀(可改)：").pack(side=tk.LEFT)
+        fel_pfx_ent = ttk.Entry(opt_row, textvariable=self.fel_tri_prefix_var, width=10)
+        fel_pfx_ent.pack(side=tk.LEFT, padx=(3, 10))
+        fel_pfx_ent.bind("<KeyRelease>", lambda _e: self._fel_refresh_previews())
+
+        ttk.Label(opt_row, text="日期：").pack(side=tk.LEFT)
+        fel_dt_ent = ttk.Entry(opt_row, textvariable=self.fel_date_var, width=10)
+        fel_dt_ent.pack(side=tk.LEFT, padx=(3, 10))
+        fel_dt_ent.bind("<KeyRelease>", lambda _e: self._fel_refresh_previews())
+
+        ttk.Label(opt_row, text="引号规则：").pack(side=tk.LEFT)
+        ttk.Combobox(
+            opt_row,
+            textvariable=self.fel_quote_label_var,
+            values=[q[0] for q in QUOTE_MODES],
+            state="readonly",
+            width=26,
+        ).pack(side=tk.LEFT, padx=(3, 0), fill=tk.X, expand=True)
+
+        mode_row = ttk.Frame(cfg_frame)
+        mode_row.pack(fill=tk.X, pady=(4, 0))
+        ttk.Label(mode_row, text="输出方式：", font=("Microsoft YaHei UI", 9, "bold")).pack(side=tk.LEFT)
+        for disp_txt, mode_val in OUTPUT_MODES:
+            ttk.Radiobutton(
+                mode_row,
+                text=disp_txt,
+                value=mode_val,
+                variable=self.fel_output_mode_var,
+                command=self._fel_refresh_previews,
+            ).pack(side=tk.LEFT, padx=(6, 10))
+
+        # 2. Sorted Part List & Output Filename Preview Treeview
+        tbl_box = ttk.LabelFrame(
+            parent,
+            text=" 2. 分篇顺序与输出定稿命名预览（Part 1 自动统一转为 -01；主标题保留四号、正文小四、引文出处五号） ",
+            padding=7,
+        )
+        tbl_box.pack(fill=tk.BOTH, expand=True, pady=(0, 7))
+
+        cols = ("seq", "old_name", "part_tag", "rows", "preview_name")
+        self.fel_tree = ttk.Treeview(tbl_box, columns=cols, show="headings", selectmode="extended", height=7)
+        self.fel_tree.heading("seq", text="排序")
+        self.fel_tree.heading("old_name", text="原文档名")
+        self.fel_tree.heading("part_tag", text="分篇号")
+        self.fel_tree.heading("rows", text="表格行数")
+        self.fel_tree.heading("preview_name", text="预计输出文件名")
+
+        self.fel_tree.column("seq", width=52, anchor=tk.CENTER)
+        self.fel_tree.column("old_name", width=265, anchor=tk.W)
+        self.fel_tree.column("part_tag", width=68, anchor=tk.CENTER)
+        self.fel_tree.column("rows", width=72, anchor=tk.CENTER)
+        self.fel_tree.column("preview_name", width=385, anchor=tk.W)
+
+        fel_vsb = ttk.Scrollbar(tbl_box, orient=tk.VERTICAL, command=self.fel_tree.yview)
+        self.fel_tree.configure(yscrollcommand=fel_vsb.set)
+        self.fel_tree.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+        fel_vsb.pack(side=tk.RIGHT, fill=tk.Y)
+        self.fel_tree.bind("<Double-1>", self._fel_open_selected_folder)
+
+        # 3. Execute & Progress Frame
+        act_box = ttk.LabelFrame(parent, text=" 3. 一键执行与实时日志 ", padding=8)
+        act_box.pack(fill=tk.BOTH, expand=True)
+
+        run_row = ttk.Frame(act_box)
+        run_row.pack(fill=tk.X)
+
+        ttk.Label(
+            run_row,
+            textvariable=self.fel_summary_var,
+            font=("Microsoft YaHei UI", 9, "bold"),
+            foreground="#1e293b",
+        ).pack(side=tk.LEFT, fill=tk.X, expand=True)
+
+        self.btn_fel_run = ttk.Button(
+            run_row,
+            text="⚡ 开始整理弟兄交通稿件",
+            style="Primary.TButton",
+            command=self._on_run_fellowship,
+        )
+        self.btn_fel_run.pack(side=tk.RIGHT)
+
+        p_info = ttk.Frame(act_box)
+        p_info.pack(fill=tk.X, pady=(6, 2))
+        self.fel_stage_lbl = ttk.Label(
+            p_info,
+            textvariable=self.fel_stage_var,
+            font=("Microsoft YaHei UI", 9, "bold"),
+            foreground="#1d4ed8",
+        )
+        self.fel_stage_lbl.pack(side=tk.LEFT, fill=tk.X, expand=True)
+        ttk.Label(
+            p_info,
+            textvariable=self.fel_pct_timer_var,
+            font=("Consolas", 9, "bold"),
+            foreground="#0f172a",
+        ).pack(side=tk.RIGHT)
+
+        ttk.Progressbar(
+            act_box,
+            mode="determinate",
+            maximum=100.0,
+            variable=self.fel_progress_var,
+        ).pack(fill=tk.X, pady=(0, 6))
+
+        log_wrap = ttk.Frame(act_box)
+        log_wrap.pack(fill=tk.BOTH, expand=True)
+        self.fel_log_text = tk.Text(
+            log_wrap,
+            height=6,
+            wrap=tk.WORD,
+            font=("Microsoft YaHei UI", 9),
+            bg="#f8fafc",
+            fg="#0f172a",
+            relief=tk.SOLID,
+            borderwidth=1,
+            padx=8,
+            pady=5,
+        )
+        self.fel_log_text.tag_configure("header", foreground="#1d4ed8", font=("Microsoft YaHei UI", 9, "bold"))
+        self.fel_log_text.tag_configure("ok", foreground="#15803d", font=("Microsoft YaHei UI", 9, "bold"))
+        self.fel_log_text.tag_configure("err", foreground="#b91c1c", font=("Microsoft YaHei UI", 9, "bold"))
+        self.fel_log_text.tag_configure("retry", foreground="#b45309")
+        self.fel_log_text.tag_configure("dim", foreground="#64748b")
+        fel_log_sb = ttk.Scrollbar(log_wrap, orient=tk.VERTICAL, command=self.fel_log_text.yview)
+        self.fel_log_text.configure(yscrollcommand=fel_log_sb.set)
+        self.fel_log_text.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+        fel_log_sb.pack(side=tk.RIGHT, fill=tk.Y)
+        self.fel_log_text.insert(
+            tk.END,
+            "提示：直接将分篇文件夹或多个 .docx 拖入本页即可自动识别语种（如 中英西/中英缅/中英腊）并按 -01..-0N 排序。\n",
+            "dim",
+        )
+
     # ---------------- Drag & Drop Integration ----------------
 
     def _setup_drag_and_drop(self):
         # Left sidebar tab buttons: dropping onto a tab switches to it and applies the drop
         self.dnd.register_target(self.nav_btn_main, lambda ps: (self._switch_tab("main"), self._on_drop_tab1_general(ps)))
         self.dnd.register_target(self.nav_btn_wc, lambda ps: (self._switch_tab("wc"), self._wc_ingest_paths(ps)))
+        self.dnd.register_target(self.nav_btn_fel, lambda ps: (self._switch_tab("fel"), self._fel_ingest_paths(ps)))
 
         # Tab 1 specific input rows
         for w in (self.lbl_input_docx, self.ent_input_docx):
@@ -1374,11 +1651,17 @@ class ScatteredRevisionApp:
         for w in (self.wc_copy_radio, self.wc_copy_dir_entry):
             self.dnd.register_target(w, self._on_drop_wc_copy_dir)
 
+        # Tab 3 specific output-folder target
+        for w in (self.lbl_fel_output_dir, self.ent_fel_output_dir):
+            self.dnd.register_target(w, self._on_drop_fel_output_dir)
+
         self.dnd.install()
 
     def _on_drop_fallback(self, paths: list[Path]):
         if self.active_tab_key == "wc":
             self._wc_ingest_paths(paths)
+        elif self.active_tab_key == "fel":
+            self._fel_ingest_paths(paths)
         else:
             self._on_drop_tab1_general(paths)
 
@@ -1502,6 +1785,269 @@ class ScatteredRevisionApp:
         if target_dir.is_dir():
             self.wc_copy_dir_var.set(str(target_dir))
             self.wc_save_mode_var.set("copy")
+
+    def _on_drop_fel_output_dir(self, paths: list[Path]):
+        p = paths[0].resolve()
+        target_dir = p if p.is_dir() else p.parent
+        if target_dir.is_dir():
+            self.fel_output_dir_var.set(str(target_dir))
+            self._save_settings()
+            self._append_log(f"📥 已设定【弟兄交通输出目录】：{target_dir}")
+            self.fel_stage_var.set(f"📥 已设定输出目录：{target_dir.name}")
+
+    # ---------------- Tab 3 Brother Fellowship Manuscript Methods ----------------
+
+    def _fel_ingest_paths(self, paths: list[Path]):
+        found_docx = self._extract_docx_from_paths(paths)
+        if not found_docx:
+            messagebox.showinfo("提示", "拖入或选择的项目中未找到任何有效的 .docx 文档。")
+            return
+        existing_norm = {os.path.normcase(str(Path(x).resolve())) for x in self.fel_files}
+        for rp in found_docx:
+            key = os.path.normcase(str(rp))
+            if key not in existing_norm:
+                existing_norm.add(key)
+                self.fel_files.append(str(rp))
+
+        sorted_ps = natural_sort_docx_paths([Path(x) for x in self.fel_files])
+        self.fel_files = [str(p) for p in sorted_ps]
+
+        if not self.fel_output_dir_var.get().strip() and sorted_ps:
+            self.fel_output_dir_var.set(str(sorted_ps[0].parent))
+
+        # Auto-sync trilingual prefix if empty or in AUTO mode
+        self._fel_auto_sync_prefix()
+        self._fel_refresh_previews()
+        self._append_log(f"📥 【弟兄交通整理】已载入并按序号排序共 {len(self.fel_files)} 份文档。")
+        self.fel_stage_var.set(f"📥 已就绪：共载入 {len(self.fel_files)} 份分篇文档")
+
+    def _fel_auto_sync_prefix(self, force: bool = False):
+        if not force and self.fel_tri_prefix_var.get().strip():
+            return
+        sel_code = self._get_fel_lang_code()
+        if sel_code == "AUTO" and self.fel_files:
+            p0 = Path(self.fel_files[0])
+            hint_blob = " ".join([p0.parent.name] + [Path(x).name for x in self.fel_files[:3]])
+            det = detect_lang_code_from_hint(hint_blob, self.languages)
+            if det:
+                sel_code = det
+        if sel_code and sel_code != "AUTO":
+            self.fel_tri_prefix_var.set(get_tri_prefix(sel_code, self.languages))
+
+    def _fel_on_lang_changed(self, _event=None):
+        self._fel_auto_sync_prefix(force=True)
+        self._fel_refresh_previews()
+
+    def _fel_resolve_effective_prefix(self) -> str:
+        manual = self.fel_tri_prefix_var.get().strip().rstrip("_")
+        if manual:
+            return manual
+        sel_code = self._get_fel_lang_code()
+        if sel_code == "AUTO" and self.fel_files:
+            p0 = Path(self.fel_files[0])
+            hint_blob = " ".join([p0.parent.name] + [Path(x).name for x in self.fel_files[:3]])
+            det = detect_lang_code_from_hint(hint_blob, self.languages)
+            if det:
+                sel_code = det
+        return get_tri_prefix(sel_code, self.languages)
+
+    def _fel_add_files(self):
+        paths = filedialog.askopenfilenames(
+            title="选择待整理的弟兄交通 Word 文档（支持多选分篇）",
+            filetypes=[("Word 文档", "*.docx")],
+        )
+        if paths:
+            self._fel_ingest_paths([Path(x) for x in paths])
+
+    def _fel_add_folder(self):
+        d = filedialog.askdirectory(title="选择包含弟兄交通各分篇 (.docx) 的文件夹")
+        if d:
+            self._fel_ingest_paths([Path(d)])
+
+    def _fel_remove_selected(self):
+        sel = self.fel_tree.selection()
+        if not sel:
+            return
+        indices = sorted((int(iid) for iid in sel), reverse=True)
+        for idx in indices:
+            if 0 <= idx < len(self.fel_files):
+                removed = self.fel_files.pop(idx)
+                self._fel_inspect_cache.pop(removed, None)
+        self._fel_refresh_previews()
+
+    def _fel_clear_all(self):
+        self.fel_files.clear()
+        self._fel_inspect_cache.clear()
+        self._fel_refresh_previews()
+
+    def _fel_browse_output(self):
+        d = filedialog.askdirectory(title="选择弟兄交通定稿输出保存目录")
+        if d:
+            self.fel_output_dir_var.set(d)
+            self._save_settings()
+
+    def _fel_open_output_dir(self):
+        d = self.fel_output_dir_var.get().strip()
+        p = Path(d).resolve() if d else None
+        if p and p.exists() and p.is_dir():
+            os.startfile(str(p))
+        else:
+            messagebox.showinfo("提示", "请先选择真实存在的输出保存目录。")
+
+    def _fel_open_selected_folder(self, _event=None):
+        sel = self.fel_tree.selection()
+        if not sel:
+            return
+        idx = int(sel[0])
+        if 0 <= idx < len(self.fel_files):
+            p = Path(self.fel_files[idx])
+            if p.parent.exists():
+                os.startfile(str(p.parent))
+
+    def _fel_inspect_cached(self, fp_str: str) -> dict:
+        cached = self._fel_inspect_cache.get(fp_str)
+        if cached is not None:
+            return cached
+        info = inspect_fellowship_docx_quick(Path(fp_str))
+        self._fel_inspect_cache[fp_str] = info
+        return info
+
+    def _fel_refresh_previews(self):
+        self._save_settings()
+        for item in self.fel_tree.get_children():
+            self.fel_tree.delete(item)
+
+        pfx = self._fel_resolve_effective_prefix()
+        dt = self.fel_date_var.get().strip() or datetime.now().strftime("%Y%m%d")
+        mode = self.fel_output_mode_var.get()
+        total_files = len(self.fel_files)
+        first_base_title = ""
+        total_rows = 0
+
+        for idx, fp_str in enumerate(self.fel_files):
+            p = Path(fp_str)
+            try:
+                info = self._fel_inspect_cached(fp_str)
+                base_title = info["base_title"]
+                if idx == 0:
+                    first_base_title = base_title
+                pnum = info["part_num"]
+                if pnum is None and total_files > 1:
+                    pnum = idx + 1
+                part_disp = f"-{pnum:02d}" if pnum is not None else "单篇"
+                total_rows += info["row_count"]
+                single_preview = build_fellowship_output_name(pfx, base_title, dt, part_num=pnum)
+                if mode == "merged_only":
+                    shown_preview = f"[合并源 #{idx + 1}] → 汇总至总文档"
+                else:
+                    shown_preview = single_preview
+                self.fel_tree.insert(
+                    "",
+                    tk.END,
+                    iid=str(idx),
+                    values=(
+                        f"#{idx + 1}",
+                        p.name,
+                        part_disp,
+                        f"{info['row_count']} 行",
+                        shown_preview,
+                    ),
+                )
+            except Exception as ex:
+                self.fel_tree.insert(
+                    "",
+                    tk.END,
+                    iid=str(idx),
+                    values=(f"#{idx + 1}", p.name, "-", "-", f"解析失败：{ex}"),
+                )
+
+        if not self.fel_files:
+            self.fel_summary_var.set("当前共 0 份分篇文档  |  支持直接拖入整个分篇文件夹或多个 .docx 自动排序")
+        elif mode == "single_only":
+            self.fel_summary_var.set(f"共 {total_files} 份文档（合计 {total_rows} 行） | 模式：仅输出各单篇（{pfx}_*-01-三语稿-{dt}.docx）")
+        elif mode == "merged_only":
+            merged_fn = build_fellowship_output_name(pfx, first_base_title or "弟兄交通", dt, part_num=None)
+            self.fel_summary_var.set(f"共 {total_files} 份分篇 → 合并输出 1 份总文档：{merged_fn}")
+        else:
+            merged_fn = build_fellowship_output_name(pfx, first_base_title or "弟兄交通", dt, part_num=None)
+            self.fel_summary_var.set(f"共 {total_files} 份单篇 + 1 份合并总文档（{merged_fn}）")
+
+    def _on_run_fellowship(self):
+        self._save_settings()
+        if not self.fel_files:
+            messagebox.showwarning("提示", "请先拖入或选择需要整理的弟兄交通 .docx 文档或分篇文件夹。")
+            return
+        out_dir = self.fel_output_dir_var.get().strip()
+        if not out_dir:
+            messagebox.showwarning("提示", "请先指定【输出保存目录】。")
+            return
+
+        keys = self._get_all_keys_list()
+        if not keys:
+            proceed = messagebox.askyesno(
+                "未配置 API Key 提醒",
+                "当前尚未填写 API Key。\n\n"
+                "• 拆内容控件、关闭修订模式、清批注、弯引号替换、四号/小四/五号字、固定值20磅行距、动态列宽均衡及整格蓝粗标题/问答均可【本地直接完成】。\n"
+                "• 但段落内部的局部跨语种神话/经文引文蓝粗定位需要调用 AI 模型。\n\n"
+                "是否仍在无 API Key 模式下继续执行？",
+            )
+            if not proceed:
+                return
+
+        model = self._get_model_id()
+        api_mode = self._get_api_mode_code()
+        rot_mode = self._get_rotation_mode_code()
+        lang_code = self._get_fel_lang_code()
+        tri_pfx = self.fel_tri_prefix_var.get().strip()
+        quote_mode = self._get_fel_quote_mode_code()
+        out_mode = self.fel_output_mode_var.get()
+        dt_str = self.fel_date_var.get().strip()
+        pool = ApiKeyPool(keys, rotation_mode=rot_mode) if keys else None
+        files_snapshot = list(self.fel_files)
+
+        self._set_running(True, final_stage=f"正在启动【弟兄交通整理】（共 {len(files_snapshot)} 份文档）...")
+        self._log("=" * 64)
+        self._log(
+            f"⚡ 启动【弟兄交通稿件整理】 | 文档数：{len(files_snapshot)} | 输出模式：{out_mode} | 语种：{lang_code}"
+        )
+
+        def worker():
+            try:
+                res = run_fellowship_pipeline(
+                    input_files=files_snapshot,
+                    output_dir=out_dir,
+                    output_mode=out_mode,
+                    lang_code=lang_code,
+                    tri_prefix_override=tri_pfx,
+                    quote_mode=quote_mode,
+                    date_yyyymmdd=dt_str,
+                    api_key=pool,
+                    model=model,
+                    api_mode=api_mode,
+                    rotation_mode=rot_mode,
+                    log_fn=self._log,
+                    progress_fn=self._progress,
+                )
+                saved = res["saved_files"]
+                files_str = "\n".join(saved)
+                self._log(f"🎉 弟兄交通整理全部完成！共输出 {len(saved)} 份文档（修订状态：关闭）：\n{files_str}")
+                self.log_queue.put(("done", (True, f"整理完成！共输出 {len(saved)} 份文档（修订: 关闭）")))
+                self.log_queue.put(
+                    (
+                        "popup_info",
+                        (
+                            "弟兄交通整理完成",
+                            f"前缀：{res['tri_prefix']}\n已输出 {len(saved)} 份定稿文档（修订模式已关闭）：\n\n{files_str}",
+                        ),
+                    )
+                )
+            except Exception as ex:
+                tb = traceback.format_exc()
+                self._log(f"❌ 弟兄交通整理出错：{ex}\n{tb}")
+                self.log_queue.put(("done", (False, f"整理出错：{ex}")))
+                self.log_queue.put(("popup_error", ("弟兄交通整理出错", str(ex))))
+
+        threading.Thread(target=worker, daemon=True).start()
 
     # ---------------- Tab 2 Word Counter Methods ----------------
 
@@ -1752,11 +2298,15 @@ class ScatteredRevisionApp:
             combo_vals = get_combo_values(self.languages)
             self.lang_cb.configure(values=combo_vals)
             self.wc_lang_cb.configure(values=combo_vals)
+            self.fel_lang_cb.configure(values=combo_vals)
             if selected_code:
                 disp = self._code_to_combo_display(selected_code)
                 self.lang_var.set(disp)
                 self.wc_lang_var.set(disp)
+                self.fel_lang_var.set(disp)
+                self._fel_auto_sync_prefix(force=True)
             self._wc_refresh_previews()
+            self._fel_refresh_previews()
             self._append_log(f"✅ 语种库已更新，当前共 {len(self.languages)} 个语种。")
 
         LanguageManagerDialog(self.root, self.languages, _on_saved)
@@ -1830,7 +2380,9 @@ class ScatteredRevisionApp:
     def _tick_elapsed_timer(self):
         try:
             if self.is_running and self.task_start_ts > 0:
-                self.pct_timer_var.set(self._format_pct_timer())
+                fmt = self._format_pct_timer()
+                self.pct_timer_var.set(fmt)
+                self.fel_pct_timer_var.set(fmt)
         except Exception:
             pass
         finally:
@@ -1841,9 +2393,11 @@ class ScatteredRevisionApp:
             return
         safe_msg = redact_secrets(msg, extra_secret=self._get_all_keys_list())
         stripped = safe_msg.lstrip("\n")
+        widgets = [w for w in (getattr(self, "log_text", None), getattr(self, "fel_log_text", None)) if w is not None]
         if stripped.startswith("=" * 10):
-            self.log_text.insert(tk.END, "\n" + stripped + "\n", "dim")
-            self.log_text.see(tk.END)
+            for tw in widgets:
+                tw.insert(tk.END, "\n" + stripped + "\n", "dim")
+                tw.see(tk.END)
             return
 
         ts = datetime.now().strftime("%H:%M:%S")
@@ -1854,15 +2408,16 @@ class ScatteredRevisionApp:
             tag = "ok"
         elif any(k in stripped for k in ("❌", "ERROR", "失败", "出错", "中止")):
             tag = "err"
-        elif any(k in stripped for k in ("↻", "⚠️", "⏳", "提示")):
+        elif any(k in stripped for k in ("↻", "⚠️", "⏳", "提示", "提醒")):
             tag = "retry"
 
         line = f"[{ts}] {stripped}\n"
-        if tag:
-            self.log_text.insert(tk.END, line, tag)
-        else:
-            self.log_text.insert(tk.END, line)
-        self.log_text.see(tk.END)
+        for tw in widgets:
+            if tag:
+                tw.insert(tk.END, line, tag)
+            else:
+                tw.insert(tk.END, line)
+            tw.see(tk.END)
 
     def _poll_log_queue(self):
         try:
@@ -1883,10 +2438,15 @@ class ScatteredRevisionApp:
                         pct, stage_text = payload
                         self.current_pct = max(0.0, min(100.0, float(pct)))
                         self.progress_var.set(self.current_pct)
-                        self.stage_var.set(
+                        self.fel_progress_var.set(self.current_pct)
+                        disp_stage = (
                             f"⏳ {stage_text}" if self.is_running and self.current_pct < 100 else f"✅ {stage_text}"
                         )
-                        self.pct_timer_var.set(self._format_pct_timer())
+                        self.stage_var.set(disp_stage)
+                        self.fel_stage_var.set(disp_stage)
+                        fmt_t = self._format_pct_timer()
+                        self.pct_timer_var.set(fmt_t)
+                        self.fel_pct_timer_var.set(fmt_t)
                     elif kind == "draft_ready":
                         self.draft_docx_var.set(str(payload))
                     elif kind == "done":
@@ -1906,29 +2466,49 @@ class ScatteredRevisionApp:
     def _set_running(self, running: bool, ok: bool = True, final_stage: str = ""):
         self.is_running = running
         state = tk.DISABLED if running else tk.NORMAL
-        for b in (self.btn_step1, self.btn_step2, self.btn_all, self.test_btn, self.pool_btn):
+        for b in (
+            self.btn_step1,
+            self.btn_step2,
+            self.btn_all,
+            self.test_btn,
+            self.pool_btn,
+            self.btn_fel_run,
+            self.fel_pool_btn,
+        ):
             b.configure(state=state)
 
         if running:
             self.task_start_ts = time.time()
             self.current_pct = 2.0
             self.progress_var.set(2.0)
+            self.fel_progress_var.set(2.0)
             self.stage_lbl.configure(foreground="#1d4ed8")
+            self.fel_stage_lbl.configure(foreground="#1d4ed8")
             if final_stage:
                 self.stage_var.set(f"⏳ {final_stage}")
-            self.pct_timer_var.set(self._format_pct_timer())
+                self.fel_stage_var.set(f"⏳ {final_stage}")
+            fmt = self._format_pct_timer()
+            self.pct_timer_var.set(fmt)
+            self.fel_pct_timer_var.set(fmt)
         else:
             if ok:
                 self.current_pct = 100.0
                 self.progress_var.set(100.0)
+                self.fel_progress_var.set(100.0)
                 self.stage_lbl.configure(foreground="#15803d")
+                self.fel_stage_lbl.configure(foreground="#15803d")
                 if final_stage:
                     self.stage_var.set(f"✅ {final_stage}")
+                    self.fel_stage_var.set(f"✅ {final_stage}")
             else:
                 self.stage_lbl.configure(foreground="#b91c1c")
+                self.fel_stage_lbl.configure(foreground="#b91c1c")
                 if final_stage:
                     self.stage_var.set(f"❌ {final_stage}")
-            self.pct_timer_var.set(self._format_pct_timer())
+                    self.fel_stage_var.set(f"❌ {final_stage}")
+            fmt = self._format_pct_timer()
+            self.pct_timer_var.set(fmt)
+            self.fel_pct_timer_var.set(fmt)
 
     def _on_test_api(self):
         self._save_settings()
@@ -2203,6 +2783,21 @@ def _run_frozen_self_test() -> int:
     fn = format_counted_docx_name("GR", "God’s Words", 128, 64, "20261115")
     if fn != "GR_God’s Words_(UP 128 words, RV 64 words)_20261115.docx":
         raise RuntimeError(f"Filename formatter self-test failed: {fn}")
+
+    # Verify Scenario 4 fellowship_processor self-test
+    import fellowship_processor  # noqa: F401
+
+    bt, pn = parse_title_and_part("怎样分辨各种人（二）Part 1")
+    if bt != "怎样分辨各种人（二）" or pn != 1:
+        raise RuntimeError(f"Fellowship title parser self-test failed: {(bt, pn)}")
+    fel_fn = build_fellowship_output_name("中英缅", "《怎样实行真理（二）》-上面的交通 2026年11月2日", "20261115", part_num=1)
+    if fel_fn != "中英缅_《怎样实行真理（二）》-上面的交通 2026年11月2日-01-三语稿-20261115.docx":
+        raise RuntimeError(f"Fellowship filename self-test failed: {fel_fn}")
+    cit_s = find_post_quote_citation_spans("„Защото който не е против нас“ (Лука 9:50).")
+    if cit_s != [(31, 42)]:
+        raise RuntimeError(f"Fellowship citation self-test failed: {cit_s}")
+    if find_post_quote_citation_spans("到现在《话在肉身显现》已经有七卷书了") != []:
+        raise RuntimeError("Fellowship narrative exclusion self-test failed")
     return 0
 
 

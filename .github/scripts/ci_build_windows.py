@@ -113,6 +113,8 @@ def main() -> None:
         "--hidden-import",
         "win_dnd",
         "--hidden-import",
+        "fellowship_processor",
+        "--hidden-import",
         "pipeline",
         str(tool_dir / "app_gui.py"),
     ]
@@ -146,12 +148,12 @@ def main() -> None:
     (art_dir / "SHA256SUMS.txt").write_text(sums_txt, encoding="utf-8")
 
     notes_md = (
-        "## 零散改点自动整理工具 (Windows x64 免安装便携版)\n\n"
+        "## 零散改点与弟兄交通自动整理工具 v1.5.0 (Windows x64 免安装便携版)\n\n"
         "- 解压 `ScatteredRevisionTool-Windows-x64.zip` 后直接双击 `零散改点整理工具.exe` 即可运行（无需安装 Python 或任何第三方库）。\n"
-        "- **三份定稿同时输出**：发译者版（仅改点）+ 完整留底版 + 无改点内容单独成档；命名统一为 `GR_God’s Words_(UP X words, RV Y words)_YYYYMMDD.docx`。\n"
-        "- **新增「📊 计算文档字数 & 更新文件名」独立标签页**：离线毫秒级统计第 2 列英文单词数（排除标点，黄=UP / 青=RV）并自动新增或更新文件名中的字数统计。\n"
-        "- 支持 **无限多 API Key 自动轮换 & 超额/报错秒切**（兼容混填 Vertex AI Key 与 Gemini Key）。\n"
-        "- 支持 **35+ 多语种自由新增扩展**（外置 `languages.json`），密钥采用 **Windows DPAPI** 加密存储。\n"
+        "- **新增「📚 弟兄交通整理」独立工作台**：支持拖入分篇文件夹或多个 `.docx`，自动安全拆解 `<w:sdt>` 内容控件、关闭 Word 修订模式（`修订: 关闭`）并清除全部批注/修订、统一 `Part 1` 为 `-01`、转换弯引号、同步第 3 列蓝字 `#0000FF` 与引文加粗（外层引号与出处括号不加粗，句内标点保留加粗）、保留主标题四号（`14pt`）/ 正文小四（`12pt`）/ 引文后出处括号五号（`10.5pt`，括号外句号保持小四）、设置固定值 `20 磅` 行距、按三列视觉字长动态均衡列宽，并提供 **仅输出各单篇 / 仅输出汇总合并总文档 / 单篇+合并同时输出** 3 种输出方式。\n"
+        "- **全局原生拖拽 + 左侧功能导航**：支持直接把文件或文件夹拖入右侧输入框、预览表或左侧对应标签页。\n"
+        "- **零散改点三份定稿同时输出 + 独立「📊 计算文档字数」标签页**：命名统一为 `GR_God’s Words_(UP X words, RV Y words)_YYYYMMDD.docx`。\n"
+        "- 支持 **无限多 API Key 自动轮换 & 超额/报错秒切**（兼容混填 Vertex AI Key 与 Gemini Key），本机采用 **Windows DPAPI** 加密存储。\n"
     )
     (art_dir / "RELEASE_NOTES.md").write_text(notes_md, encoding="utf-8")
     print(sums_txt.strip())
