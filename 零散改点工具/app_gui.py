@@ -1428,7 +1428,7 @@ def _run_frozen_self_test() -> int:
     langs = load_languages()
     if not langs:
         raise RuntimeError("Empty language registry in self-test")
-    pool = ApiKeyPool(["AQ.SelfTestDummyKey12345678", "AIzaSelfTestDummyKey87654321"])
+    pool = ApiKeyPool(["self_test_placeholder_1", "self_test_placeholder_2"])
     if len(pool) != 2:
         raise RuntimeError("ApiKeyPool self-test failed")
     return 0
