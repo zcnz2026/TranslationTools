@@ -1,5 +1,5 @@
-# 运行时依赖：无（项目运行时 100% 基于 Python 3 标准库，零第三方依赖）
-# 仅打包独立 Windows .exe 时需要以下构建期依赖（经 OSV.dev / GitHub Advisory 核验无已知漏洞）：
+# Runtime dependencies: NONE (100% Python 3 standard library at runtime).
+# Build-only dependencies for packaging standalone Windows .exe (verified clean via OSV.dev / GitHub Advisory):
 pyinstaller==6.22.3
 pyinstaller-hooks-contrib==2026.10
 altgraph==0.17.5
