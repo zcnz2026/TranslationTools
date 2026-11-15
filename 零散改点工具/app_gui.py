@@ -40,6 +40,12 @@ from security_utils import (
     parse_api_keys,
     redact_secrets,
 )
+from word_counter import (
+    analyze_docx_word_count,
+    apply_word_count_filename,
+    format_counted_docx_name,
+    parse_doc_filename,
+)
 
 
 def _enable_high_dpi():
@@ -113,7 +119,6 @@ class ApiKeyPoolDialog(tk.Toplevel):
         )
         tip.pack(fill=tk.X, pady=(0, 8))
 
-        # Multiline key editor
         ed_frame = ttk.LabelFrame(wrap, text=" 密钥列表（每行 1 个 Key，支持 # 账号备注，数量无上限） ", padding=8)
         ed_frame.pack(fill=tk.BOTH, expand=True, pady=(0, 8))
 
@@ -144,7 +149,6 @@ class ApiKeyPoolDialog(tk.Toplevel):
         self.editor.bind("<KeyRelease>", lambda _e: self._update_count())
         self.editor.bind("<<Paste>>", lambda _e: self.after(20, self._update_count))
 
-        # Count & Rotation Mode Row
         mid_row = ttk.Frame(wrap)
         mid_row.pack(fill=tk.X, pady=(0, 8))
 
@@ -166,7 +170,6 @@ class ApiKeyPoolDialog(tk.Toplevel):
             width=38,
         ).pack(side=tk.LEFT, padx=(4, 0))
 
-        # Batch Health Check Output Box
         chk_frame = ttk.LabelFrame(wrap, text=f" 批量可用性检测结果（当前检测模型：{self.model_id}） ", padding=6)
         chk_frame.pack(fill=tk.BOTH, expand=False, pady=(0, 8))
 
@@ -191,7 +194,6 @@ class ApiKeyPoolDialog(tk.Toplevel):
         chk_vsb.pack(side=tk.RIGHT, fill=tk.Y)
         self.chk_text.insert(tk.END, "点击下方「🧪 批量检测全部 Key」可逐一验证所有密钥可用性，并支持一键剔除失效 Key。\n")
 
-        # Bottom Action Bar
         btns = ttk.Frame(wrap)
         btns.pack(fill=tk.X)
 
@@ -377,7 +379,6 @@ class LanguageManagerDialog(tk.Toplevel):
         )
         tip.pack(fill=tk.X, pady=(0, 8))
 
-        # Treeview table
         tbl_frame = ttk.Frame(wrap)
         tbl_frame.pack(fill=tk.BOTH, expand=True, pady=(0, 10))
 
@@ -397,7 +398,6 @@ class LanguageManagerDialog(tk.Toplevel):
         vsb.pack(side=tk.RIGHT, fill=tk.Y)
         self.tree.bind("<<TreeviewSelect>>", self._on_select_row)
 
-        # Edit / Add form
         form = ttk.LabelFrame(wrap, text=" 新增 / 修改语种（点击上方列表行可直接载入编辑） ", padding=10)
         form.pack(fill=tk.X, pady=(0, 8))
         form.columnconfigure(3, weight=1)
@@ -416,7 +416,6 @@ class LanguageManagerDialog(tk.Toplevel):
             foreground="#64748b",
         ).grid(row=2, column=1, columnspan=3, sticky=tk.W, padx=4)
 
-        # Buttons bar
         btns = ttk.Frame(wrap)
         btns.pack(fill=tk.X)
 
@@ -515,9 +514,9 @@ class LanguageManagerDialog(tk.Toplevel):
 class ScatteredRevisionApp:
     def __init__(self, root: tk.Tk):
         self.root = root
-        self.root.title("零散改点自动整理工具 v1.3  (多 Key 无限轮换防限流 + 多语种自由扩展)")
-        self.root.geometry("950x780")
-        self.root.minsize(870, 700)
+        self.root.title("零散改点自动整理工具 v1.4  (三版输出 + 独立字数统计重命名 + 多 Key 无限轮换)")
+        self.root.geometry("980x810")
+        self.root.minsize(890, 720)
 
         self.log_queue: queue.Queue = queue.Queue()
         self.is_running = False
@@ -527,6 +526,7 @@ class ScatteredRevisionApp:
 
         self._pool_multiline_text: str = ""
         self._syncing_key_var: bool = False
+        self.wc_files: list[str] = []
 
         self._setup_styles()
         self._init_vars()
@@ -547,13 +547,16 @@ class ScatteredRevisionApp:
         default_font = ("Microsoft YaHei UI", 9)
         bold_font = ("Microsoft YaHei UI", 9, "bold")
         btn_font = ("Microsoft YaHei UI", 10, "bold")
+        tab_font = ("Microsoft YaHei UI", 10, "bold")
 
         self.root.option_add("*Font", default_font)
         style.configure("TLabelframe.Label", font=bold_font, foreground="#1a56db")
         style.configure("Primary.TButton", font=btn_font, padding=(12, 7))
         style.configure("Action.TButton", font=default_font, padding=(10, 6))
+        style.configure("TNotebook.Tab", font=tab_font, padding=(16, 7))
 
     def _init_vars(self):
+        # Tab 1 vars
         self.api_mode_label = tk.StringVar(value=API_MODES[0][0])
         self.rotation_label = tk.StringVar(value=ROTATION_MODES[0][0])
         self.api_key_var = tk.StringVar(value="")
@@ -574,6 +577,18 @@ class ScatteredRevisionApp:
         self.progress_var = tk.DoubleVar(value=0.0)
         self.stage_var = tk.StringVar(value="状态：就绪（请选择文档与目录后点击上方按钮执行）")
         self.pct_timer_var = tk.StringVar(value="0%")
+
+        # Tab 2 (Word Count & Filename Updater) vars
+        self.wc_lang_var = tk.StringVar(value=AUTO_COMBO_LABEL)
+        self.wc_keep_existing_lang_var = tk.BooleanVar(value=True)
+        self.wc_date_var = tk.StringVar(value=datetime.now().strftime("%Y%m%d"))
+        self.wc_keep_existing_date_var = tk.BooleanVar(value=False)
+        self.wc_strip_draft_var = tk.BooleanVar(value=True)
+        self.wc_save_mode_var = tk.StringVar(value="inplace")  # "inplace" or "copy"
+        self.wc_copy_dir_var = tk.StringVar(value="")
+        self.wc_summary_var = tk.StringVar(
+            value="当前共 0 份文档  |  第 2 列英文合计：UP 0 words, RV 0 words"
+        )
 
         self.api_key_var.trace_add("write", self._on_key_entry_changed)
 
@@ -629,6 +644,9 @@ class ScatteredRevisionApp:
     def _get_selected_lang_code(self) -> str:
         return resolve_combo_to_code(self.lang_var.get(), self.languages)
 
+    def _get_wc_lang_code(self) -> str:
+        return resolve_combo_to_code(self.wc_lang_var.get(), self.languages)
+
     def _code_to_combo_display(self, code: str) -> str:
         c = (code or "").strip().upper()
         if not c or c == "AUTO":
@@ -649,7 +667,6 @@ class ScatteredRevisionApp:
                 enc_token = str(cfg.get("api_key_dpapi", "")).strip()
                 if enc_token:
                     loaded_key_raw = dpapi_decrypt_str(enc_token)
-                # Auto-migrate legacy plaintext api_key to Windows DPAPI and purge plaintext from disk
                 legacy_plain = str(cfg.get("api_key", "")).strip()
                 if legacy_plain:
                     if not loaded_key_raw:
@@ -669,6 +686,8 @@ class ScatteredRevisionApp:
                 self.output_dir_var.set(cfg.get("output_dir", ""))
                 saved_lang = cfg.get("lang", "AUTO")
                 self.lang_var.set(self._code_to_combo_display(saved_lang))
+                saved_wc_lang = cfg.get("wc_lang", saved_lang)
+                self.wc_lang_var.set(self._code_to_combo_display(saved_wc_lang))
                 self.dual_outputs_var.set(bool(cfg.get("dual_outputs", True)))
             except Exception:
                 pass
@@ -698,6 +717,7 @@ class ScatteredRevisionApp:
             "library_dir": self.library_dir_var.get().strip(),
             "output_dir": self.output_dir_var.get().strip(),
             "lang": self._get_selected_lang_code(),
+            "wc_lang": self._get_wc_lang_code(),
             "dual_outputs": self.dual_outputs_var.get(),
         }
         try:
@@ -707,9 +727,22 @@ class ScatteredRevisionApp:
             pass
 
     def _build_ui(self):
-        main = ttk.Frame(self.root, padding=12)
-        main.pack(fill=tk.BOTH, expand=True)
+        outer = ttk.Frame(self.root, padding=8)
+        outer.pack(fill=tk.BOTH, expand=True)
 
+        self.notebook = ttk.Notebook(outer)
+        self.notebook.pack(fill=tk.BOTH, expand=True)
+
+        self.tab_main = ttk.Frame(self.notebook, padding=8)
+        self.tab_wc = ttk.Frame(self.notebook, padding=10)
+
+        self.notebook.add(self.tab_main, text="  📝 零散改点自动整理  ")
+        self.notebook.add(self.tab_wc, text="  📊 计算文档字数 & 更新文件名  ")
+
+        self._build_tab1_pipeline(self.tab_main)
+        self._build_tab2_word_counter(self.tab_wc)
+
+    def _build_tab1_pipeline(self, main: ttk.Frame):
         # 1. API & Model Frame
         api_frame = ttk.LabelFrame(main, text=" 1. API 密钥池与模型设置（支持无限个 Key 轮换 + 超额/报错秒切） ", padding=10)
         api_frame.pack(fill=tk.X, pady=(0, 8))
@@ -775,7 +808,7 @@ class ScatteredRevisionApp:
         ).pack(side=tk.LEFT)
 
         # 2. Paths & Multi-Language Options Frame
-        path_frame = ttk.LabelFrame(main, text=" 2. 文档、总库路径与多语种设置 ", padding=10)
+        path_frame = ttk.LabelFrame(main, text=" 2. 文档、总库路径与多语种输出设置 ", padding=10)
         path_frame.pack(fill=tk.X, pady=(0, 8))
         path_frame.columnconfigure(1, weight=1)
 
@@ -801,7 +834,6 @@ class ScatteredRevisionApp:
         ttk.Button(draft_btns, text="浏览...", width=10, command=self._browse_draft).pack(side=tk.LEFT, padx=2)
         ttk.Button(draft_btns, text="打开初筛稿", width=10, command=self._open_draft_file).pack(side=tk.LEFT, padx=2)
 
-        # Multi-language selector + Manager button + Title prefix
         opt_row1 = ttk.Frame(path_frame)
         opt_row1.grid(row=4, column=0, columnspan=4, sticky=tk.EW, pady=(6, 2))
 
@@ -820,15 +852,20 @@ class ScatteredRevisionApp:
             command=self._open_lang_manager,
         ).pack(side=tk.LEFT, padx=(0, 18))
 
-        ttk.Label(opt_row1, text="定稿标题前缀(选填)：").pack(side=tk.LEFT)
+        ttk.Label(opt_row1, text="自定义原文档名(选填，留空自动取原文档名)：").pack(side=tk.LEFT)
         ttk.Entry(opt_row1, textvariable=self.doc_name_var, width=22).pack(side=tk.LEFT, padx=(4, 0))
 
         opt_row2 = ttk.Frame(path_frame)
         opt_row2.grid(row=5, column=0, columnspan=4, sticky=tk.EW, pady=(4, 0))
         ttk.Checkbutton(
             opt_row2,
-            text="同时输出【完整留底版】+【发译者版（自动剔除无改点表）】",
+            text="同时输出三份定稿：【发译者版(仅改点)】+【完整留底版】+【无改点内容版】",
             variable=self.dual_outputs_var,
+        ).pack(side=tk.LEFT)
+        ttk.Label(
+            opt_row2,
+            text="  命名格式：GR_God’s Words_(UP X words, RV Y words)_YYYYMMDD.docx",
+            foreground="#64748b",
         ).pack(side=tk.LEFT)
 
         # 3. Action Buttons & Determinate Progress Frame
@@ -859,7 +896,7 @@ class ScatteredRevisionApp:
 
         self.btn_all = ttk.Button(
             btn_row,
-            text="⚡ 一键直出全部定稿 (初筛 + 定稿)",
+            text="⚡ 一键直出全部定稿 (初筛 + 三份定稿)",
             style="Primary.TButton",
             command=self._on_run_all,
         )
@@ -910,7 +947,7 @@ class ScatteredRevisionApp:
 
         self.log_text = tk.Text(
             log_body,
-            height=11,
+            height=9,
             wrap=tk.WORD,
             font=("Microsoft YaHei UI", 9),
             bg="#f8fafc",
@@ -933,11 +970,361 @@ class ScatteredRevisionApp:
 
         key_cnt = len(self._get_all_keys_list())
         self._append_log(
-            f"欢迎使用零散改点自动整理工具 v1.3！当前已载入 {key_cnt} 个 API Key、{len(self.languages)} 种语言（支持多 Key 无限轮换与报错自动切换）。"
+            f"欢迎使用零散改点自动整理工具 v1.4！已载入 {key_cnt} 个 API Key、{len(self.languages)} 种语言；支持导出无改点版文档与独立字数统计标签页。"
         )
 
+    def _build_tab2_word_counter(self, parent: ttk.Frame):
+        # 1. Rules banner
+        banner = ttk.LabelFrame(parent, text=" 统计与文件重命名规则说明（本地毫秒级精准解析，无需消耗 API） ", padding=10)
+        banner.pack(fill=tk.X, pady=(0, 8))
+
+        ttk.Label(
+            banner,
+            text=(
+                "• 统计口径：仅统计表格【第 2 列（英文列）】修订后正文的英文单词数（标点符号不算字数，算单词数而非字母数；已删除修订自动排除）。\n"
+                "• 颜色定义：UP = 黄色高亮 (Yellow)  |  RV = 青色高亮 (Cyan)\n"
+                "• 命名格式：语言代号_原文档名字_(UP X words, RV Y words)_日期.docx  （例：GR_God’s Words_(UP 128 words, RV 64 words)_20261115.docx）\n"
+                "• 智能更新：若原文档名中已有字数统计会自动替换为最新统计结果；若没有则自动按规范新增！"
+            ),
+            foreground="#334155",
+        ).pack(fill=tk.X)
+
+        # 2. File picker & naming parameters
+        cfg_frame = ttk.LabelFrame(parent, text=" 1. 选择文档与命名参数 ", padding=10)
+        cfg_frame.pack(fill=tk.X, pady=(0, 8))
+
+        file_btns = ttk.Frame(cfg_frame)
+        file_btns.pack(fill=tk.X, pady=(0, 8))
+
+        ttk.Button(
+            file_btns,
+            text="📄 选择 Word 文档 (支持单选/多选)...",
+            style="Action.TButton",
+            command=self._wc_add_files,
+        ).pack(side=tk.LEFT, padx=(0, 8))
+        ttk.Button(
+            file_btns,
+            text="📁 选择文件夹批量载入...",
+            style="Action.TButton",
+            command=self._wc_add_folder,
+        ).pack(side=tk.LEFT, padx=(0, 8))
+        ttk.Button(file_btns, text="🗑️ 移除选中行", command=self._wc_remove_selected).pack(side=tk.LEFT, padx=(0, 8))
+        ttk.Button(file_btns, text="🧹 清空列表", command=self._wc_clear_all).pack(side=tk.LEFT)
+
+        row_lang = ttk.Frame(cfg_frame)
+        row_lang.pack(fill=tk.X, pady=4)
+
+        ttk.Label(row_lang, text="语言代号：").pack(side=tk.LEFT)
+        self.wc_lang_cb = ttk.Combobox(
+            row_lang,
+            textvariable=self.wc_lang_var,
+            values=get_combo_values(self.languages),
+            width=28,
+        )
+        self.wc_lang_cb.pack(side=tk.LEFT, padx=(4, 6))
+        self.wc_lang_cb.bind("<<ComboboxSelected>>", lambda _e: self._wc_refresh_previews())
+
+        ttk.Button(row_lang, text="➕ 管理语种...", command=self._open_lang_manager).pack(side=tk.LEFT, padx=(0, 14))
+
+        ttk.Checkbutton(
+            row_lang,
+            text="原文件名已有语言代号（如 GR_）时优先保留",
+            variable=self.wc_keep_existing_lang_var,
+            command=self._wc_refresh_previews,
+        ).pack(side=tk.LEFT)
+
+        row_date = ttk.Frame(cfg_frame)
+        row_date.pack(fill=tk.X, pady=4)
+
+        ttk.Label(row_date, text="日期 (YYYYMMDD)：").pack(side=tk.LEFT)
+        date_ent = ttk.Entry(row_date, textvariable=self.wc_date_var, width=12)
+        date_ent.pack(side=tk.LEFT, padx=(4, 14))
+        date_ent.bind("<KeyRelease>", lambda _e: self._wc_refresh_previews())
+
+        ttk.Checkbutton(
+            row_date,
+            text="原文件名已有 8 位日期时保留原日期",
+            variable=self.wc_keep_existing_date_var,
+            command=self._wc_refresh_previews,
+        ).pack(side=tk.LEFT, padx=(0, 16))
+
+        ttk.Checkbutton(
+            row_date,
+            text="自动去除开头的“初筛_”前缀",
+            variable=self.wc_strip_draft_var,
+            command=self._wc_refresh_previews,
+        ).pack(side=tk.LEFT)
+
+        row_mode = ttk.Frame(cfg_frame)
+        row_mode.pack(fill=tk.X, pady=(4, 0))
+
+        ttk.Label(row_mode, text="保存方式：").pack(side=tk.LEFT)
+        ttk.Radiobutton(
+            row_mode,
+            text="直接就地更新原文档文件名（推荐）",
+            value="inplace",
+            variable=self.wc_save_mode_var,
+        ).pack(side=tk.LEFT, padx=(4, 16))
+        ttk.Radiobutton(
+            row_mode,
+            text="另存副本到指定文件夹：",
+            value="copy",
+            variable=self.wc_save_mode_var,
+        ).pack(side=tk.LEFT)
+        ttk.Entry(row_mode, textvariable=self.wc_copy_dir_var, width=30).pack(side=tk.LEFT, padx=4, fill=tk.X, expand=True)
+        ttk.Button(row_mode, text="浏览...", width=8, command=self._wc_browse_copy_dir).pack(side=tk.LEFT)
+
+        # 3. Preview & Results Treeview
+        tbl_box = ttk.LabelFrame(parent, text=" 2. 第 2 列英文字数统计与新文件名预览（双击任意行可打开所在目录） ", padding=8)
+        tbl_box.pack(fill=tk.BOTH, expand=True, pady=(0, 8))
+
+        cols = ("old_name", "lang", "up_words", "rv_words", "new_name", "status")
+        self.wc_tree = ttk.Treeview(tbl_box, columns=cols, show="headings", selectmode="extended", height=12)
+        self.wc_tree.heading("old_name", text="原文件名")
+        self.wc_tree.heading("lang", text="语言代号")
+        self.wc_tree.heading("up_words", text="UP 单词数 (黄色)")
+        self.wc_tree.heading("rv_words", text="RV 单词数 (青色)")
+        self.wc_tree.heading("new_name", text="计算后目标文件名")
+        self.wc_tree.heading("status", text="状态")
+
+        self.wc_tree.column("old_name", width=220, anchor=tk.W)
+        self.wc_tree.column("lang", width=70, anchor=tk.CENTER)
+        self.wc_tree.column("up_words", width=110, anchor=tk.CENTER)
+        self.wc_tree.column("rv_words", width=110, anchor=tk.CENTER)
+        self.wc_tree.column("new_name", width=310, anchor=tk.W)
+        self.wc_tree.column("status", width=115, anchor=tk.CENTER)
+
+        vsb = ttk.Scrollbar(tbl_box, orient=tk.VERTICAL, command=self.wc_tree.yview)
+        hsb = ttk.Scrollbar(tbl_box, orient=tk.HORIZONTAL, command=self.wc_tree.xview)
+        self.wc_tree.configure(yscrollcommand=vsb.set, xscrollcommand=hsb.set)
+
+        self.wc_tree.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+        vsb.pack(side=tk.RIGHT, fill=tk.Y)
+        self.wc_tree.bind("<Double-1>", self._wc_open_selected_folder)
+
+        # 4. Bottom Action Bar
+        bot = ttk.Frame(parent)
+        bot.pack(fill=tk.X)
+
+        ttk.Label(
+            bot,
+            textvariable=self.wc_summary_var,
+            font=("Microsoft YaHei UI", 9, "bold"),
+            foreground="#1d4ed8",
+        ).pack(side=tk.LEFT)
+
+        ttk.Button(
+            bot,
+            text="⚡ 计算字数并立即更新文件名",
+            style="Primary.TButton",
+            command=self._wc_execute_rename,
+        ).pack(side=tk.RIGHT)
+        ttk.Button(
+            bot,
+            text="🔄 重新计算并刷新预览",
+            style="Action.TButton",
+            command=self._wc_refresh_previews,
+        ).pack(side=tk.RIGHT, padx=(0, 8))
+
+    # ---------------- Tab 2 Word Counter Methods ----------------
+
+    def _wc_add_files(self):
+        paths = filedialog.askopenfilenames(
+            title="选择要统计英文字数的 Word 文档（可多选）",
+            filetypes=[("Word 文档", "*.docx")],
+        )
+        if not paths:
+            return
+        existing_norm = {os.path.normcase(str(Path(x).resolve())) for x in self.wc_files}
+        for raw_p in paths:
+            rp = Path(raw_p).resolve()
+            if rp.name.startswith("~$"):
+                continue
+            key = os.path.normcase(str(rp))
+            if key not in existing_norm:
+                existing_norm.add(key)
+                self.wc_files.append(str(rp))
+        self._wc_refresh_previews()
+
+    def _wc_add_folder(self):
+        d = filedialog.askdirectory(title="选择包含 Word 文档的文件夹")
+        if not d:
+            return
+        dp = Path(d).resolve()
+        docx_list = sorted(p for p in dp.glob("*.docx") if not p.name.startswith("~$"))
+        if not docx_list:
+            messagebox.showinfo("提示", "该文件夹下未找到任何 .docx 文档。")
+            return
+        existing_norm = {os.path.normcase(str(Path(x).resolve())) for x in self.wc_files}
+        for rp in docx_list:
+            key = os.path.normcase(str(rp))
+            if key not in existing_norm:
+                existing_norm.add(key)
+                self.wc_files.append(str(rp))
+        self._wc_refresh_previews()
+
+    def _wc_remove_selected(self):
+        sel = self.wc_tree.selection()
+        if not sel:
+            return
+        indices = sorted((int(iid) for iid in sel), reverse=True)
+        for idx in indices:
+            if 0 <= idx < len(self.wc_files):
+                self.wc_files.pop(idx)
+        self._wc_refresh_previews()
+
+    def _wc_clear_all(self):
+        self.wc_files.clear()
+        self._wc_refresh_previews()
+
+    def _wc_browse_copy_dir(self):
+        d = filedialog.askdirectory(title="选择另存副本的目标文件夹")
+        if d:
+            self.wc_copy_dir_var.set(d)
+            self.wc_save_mode_var.set("copy")
+
+    def _wc_open_selected_folder(self, _event=None):
+        sel = self.wc_tree.selection()
+        if not sel:
+            return
+        idx = int(sel[0])
+        if 0 <= idx < len(self.wc_files):
+            p = Path(self.wc_files[idx])
+            target_dir = p.parent if p.parent.exists() else None
+            if target_dir:
+                os.startfile(str(target_dir))
+
+    def _wc_analyze_one(self, file_path: str) -> dict:
+        return analyze_docx_word_count(
+            docx_path=Path(file_path),
+            default_lang_code=self._get_wc_lang_code(),
+            keep_existing_lang=self.wc_keep_existing_lang_var.get(),
+            date_yyyymmdd=self.wc_date_var.get().strip(),
+            keep_existing_date=self.wc_keep_existing_date_var.get(),
+            strip_draft_prefix=self.wc_strip_draft_var.get(),
+            lang_entries=self.languages,
+        )
+
+    def _wc_refresh_previews(self):
+        self._save_settings()
+        for item in self.wc_tree.get_children():
+            self.wc_tree.delete(item)
+
+        sum_up = 0
+        sum_rv = 0
+        for idx, fp in enumerate(self.wc_files):
+            p = Path(fp)
+            try:
+                info = self._wc_analyze_one(fp)
+                sum_up += info["up_words"]
+                sum_rv += info["rv_words"]
+                if info["old_name"] == info["new_name"]:
+                    st = "✅ 已是最新"
+                elif info["had_word_count"]:
+                    st = "🔄 待更新字数"
+                else:
+                    st = "➕ 待新增字数"
+                self.wc_tree.insert(
+                    "",
+                    tk.END,
+                    iid=str(idx),
+                    values=(
+                        info["old_name"],
+                        info["lang_code"],
+                        f"{info['up_words']} words",
+                        f"{info['rv_words']} words",
+                        info["new_name"],
+                        st,
+                    ),
+                )
+            except Exception as ex:
+                self.wc_tree.insert(
+                    "",
+                    tk.END,
+                    iid=str(idx),
+                    values=(p.name, "-", "-", "-", f"解析失败：{ex}", "❌ 错误"),
+                )
+
+        self.wc_summary_var.set(
+            f"当前共 {len(self.wc_files)} 份文档  |  第 2 列英文合计：UP {sum_up} words, RV {sum_rv} words"
+        )
+
+    def _wc_execute_rename(self):
+        self._save_settings()
+        if not self.wc_files:
+            messagebox.showwarning("提示", "请先点击「📄 选择 Word 文档」添加需要计算字数的 .docx 文件。")
+            return
+
+        copy_dir = None
+        if self.wc_save_mode_var.get() == "copy":
+            raw_cd = self.wc_copy_dir_var.get().strip()
+            if not raw_cd:
+                messagebox.showwarning("提示", "已选择“另存副本”，请先指定目标文件夹路径。")
+                return
+            copy_dir = Path(raw_cd).resolve()
+
+        for item in self.wc_tree.get_children():
+            self.wc_tree.delete(item)
+
+        ok_cnt = 0
+        err_msgs = []
+        sum_up = 0
+        sum_rv = 0
+
+        for idx, fp in enumerate(list(self.wc_files)):
+            p = Path(fp)
+            try:
+                info = self._wc_analyze_one(fp)
+                sum_up += info["up_words"]
+                sum_rv += info["rv_words"]
+                final_p, status_txt = apply_word_count_filename(
+                    docx_path=p,
+                    new_filename=info["new_name"],
+                    copy_to_dir=copy_dir,
+                )
+                if copy_dir is None:
+                    self.wc_files[idx] = str(final_p)
+                ok_cnt += 1
+                self.wc_tree.insert(
+                    "",
+                    tk.END,
+                    iid=str(idx),
+                    values=(
+                        info["old_name"],
+                        info["lang_code"],
+                        f"{info['up_words']} words",
+                        f"{info['rv_words']} words",
+                        final_p.name,
+                        status_txt,
+                    ),
+                )
+            except Exception as ex:
+                err_msgs.append(f"• {p.name}：{ex}")
+                self.wc_tree.insert(
+                    "",
+                    tk.END,
+                    iid=str(idx),
+                    values=(p.name, "-", "-", "-", str(ex), "❌ 失败"),
+                )
+
+        self.wc_summary_var.set(
+            f"处理完成：成功 {ok_cnt}/{len(self.wc_files)} 份  |  合计：UP {sum_up} words, RV {sum_rv} words"
+        )
+        if err_msgs:
+            messagebox.showwarning(
+                "部分文档未能重命名",
+                f"成功处理 {ok_cnt} 份，失败 {len(err_msgs)} 份：\n\n" + "\n".join(err_msgs[:10]),
+            )
+        else:
+            messagebox.showinfo(
+                "字数统计与重命名完成",
+                f"已全部处理完成（共 {ok_cnt} 份文档）！\n"
+                f"第 2 列英文总计：UP {sum_up} words, RV {sum_rv} words。",
+            )
+
+    # ---------------- Tab 1 Shared & Pipeline Methods ----------------
+
     def _on_paste_into_key_entry(self, _event=None):
-        """Gracefully accept multi-line clipboard pastes directly in the single-line Entry without dropping lines."""
         try:
             clip = self.root.clipboard_get()
         except Exception:
@@ -945,7 +1332,6 @@ class ScatteredRevisionApp:
         if "\n" not in clip and "\r" not in clip:
             return None
 
-        # Merge existing keys (unless entire field is selected) with pasted multi-line keys
         pasted_keys = parse_api_keys(clip)
         if not pasted_keys:
             return "break"
@@ -961,7 +1347,6 @@ class ScatteredRevisionApp:
             existing_keys = parse_api_keys(self.api_key_var.get())
 
         merged = parse_api_keys(existing_keys + pasted_keys)
-        # Preserve comments from clipboard if replacing entire field
         if not existing_keys:
             self._set_pool_multiline_and_sync_entry(clip)
         else:
@@ -994,9 +1379,14 @@ class ScatteredRevisionApp:
 
         def _on_saved(updated_list: list, selected_code=None):
             self.languages = [dict(x) for x in updated_list]
-            self.lang_cb.configure(values=get_combo_values(self.languages))
+            combo_vals = get_combo_values(self.languages)
+            self.lang_cb.configure(values=combo_vals)
+            self.wc_lang_cb.configure(values=combo_vals)
             if selected_code:
-                self.lang_var.set(self._code_to_combo_display(selected_code))
+                disp = self._code_to_combo_display(selected_code)
+                self.lang_var.set(disp)
+                self.wc_lang_var.set(disp)
+            self._wc_refresh_previews()
             self._append_log(f"✅ 语种库已更新，当前共 {len(self.languages)} 个语种。")
 
         LanguageManagerDialog(self.root, self.languages, _on_saved)
@@ -1340,13 +1730,12 @@ class ScatteredRevisionApp:
         lang = self._get_selected_lang_code()
         doc_name = self.doc_name_var.get().strip()
         dual = self.dual_outputs_var.get()
-        # Shared pool across Step 1 + Step 2 so dead/rate-limited keys stay remembered seamlessly
         pool = ApiKeyPool(keys, rotation_mode=rot_mode)
 
         self._set_running(True, final_stage="正在启动一键全自动直出（第一步 + 第二步）...")
         self._log("=" * 64)
         self._log(
-            f"⚡ 启动【一键全自动直出】（初筛评估 + 外文同步高亮定稿） | 模型：{model} | 密钥池：{len(pool)} 个 Key | 语种设定：{lang}"
+            f"⚡ 启动【一键全自动直出】（初筛评估 + 三份定稿导出） | 模型：{model} | 密钥池：{len(pool)} 个 Key | 语种设定：{lang}"
         )
 
         def _prog_s1(p: float, msg: str):
@@ -1431,6 +1820,14 @@ def _run_frozen_self_test() -> int:
     pool = ApiKeyPool(["self_test_placeholder_1", "self_test_placeholder_2"])
     if len(pool) != 2:
         raise RuntimeError("ApiKeyPool self-test failed")
+
+    # Verify word_counter filename parser & formatter
+    p1 = parse_doc_filename("GR_God’s Words_(UP 10 words, RV 20 words)_20261114", known_codes={"GR"})
+    if p1["orig_name"] != "God’s Words" or p1["existing_lang"] != "GR" or not p1["had_word_count"]:
+        raise RuntimeError(f"Filename parser self-test failed: {p1}")
+    fn = format_counted_docx_name("GR", "God’s Words", 128, 64, "20261115")
+    if fn != "GR_God’s Words_(UP 128 words, RV 64 words)_20261115.docx":
+        raise RuntimeError(f"Filename formatter self-test failed: {fn}")
     return 0
 
 

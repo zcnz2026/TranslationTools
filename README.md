@@ -22,6 +22,7 @@ TranslationTools/
     ├── ai_client.py                     # Gemini / Vertex AI 客户端与多 Key 自动轮换秒切引擎
     ├── pipeline.py                      # 两步走人工复核与一键直出流水线封装
     ├── lang_registry.py                 # 多语种自由扩展注册表（预置 35 种语言，支持自定义新增）
+    ├── word_counter.py                  # 第2列英文单词统计(UP黄/RV青)与标准文件名新增/更新模块
     ├── security_utils.py                # Windows DPAPI 加密存储、脱敏日志、ZipBomb/XXE/SSRF 防护
     ├── languages.json                   # 外置多语种配置文件
     ├── .env.example                     # 环境变量配置示例
@@ -78,6 +79,7 @@ python -m PyInstaller --noconfirm --clean --onefile --windowed `
   --hidden-import ai_client `
   --hidden-import lang_registry `
   --hidden-import security_utils `
+  --hidden-import word_counter `
   --hidden-import pipeline `
   ".\零散改点工具\app_gui.py"
 ```

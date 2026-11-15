@@ -109,6 +109,8 @@ def main() -> None:
         "--hidden-import",
         "security_utils",
         "--hidden-import",
+        "word_counter",
+        "--hidden-import",
         "pipeline",
         str(tool_dir / "app_gui.py"),
     ]
@@ -144,10 +146,10 @@ def main() -> None:
     notes_md = (
         "## 零散改点自动整理工具 (Windows x64 免安装便携版)\n\n"
         "- 解压 `ScatteredRevisionTool-Windows-x64.zip` 后直接双击 `零散改点整理工具.exe` 即可运行（无需安装 Python 或任何第三方库）。\n"
+        "- **三份定稿同时输出**：发译者版（仅改点）+ 完整留底版 + 无改点内容单独成档；命名统一为 `GR_God’s Words_(UP X words, RV Y words)_YYYYMMDD.docx`。\n"
+        "- **新增「📊 计算文档字数 & 更新文件名」独立标签页**：离线毫秒级统计第 2 列英文单词数（排除标点，黄=UP / 青=RV）并自动新增或更新文件名中的字数统计。\n"
         "- 支持 **无限多 API Key 自动轮换 & 超额/报错秒切**（兼容混填 Vertex AI Key 与 Gemini Key）。\n"
-        "- 支持 **35+ 多语种自由新增扩展**（外置 `languages.json`）。\n"
-        "- 本机保存密钥采用 **Windows DPAPI** 系统级加密，磁盘与日志零明文泄露。\n"
-        "- 附带 `SHA256SUMS.txt` 文件完整性校验值。\n"
+        "- 支持 **35+ 多语种自由新增扩展**（外置 `languages.json`），密钥采用 **Windows DPAPI** 加密存储。\n"
     )
     (art_dir / "RELEASE_NOTES.md").write_text(notes_md, encoding="utf-8")
     print(sums_txt.strip())

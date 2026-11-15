@@ -33,6 +33,7 @@ import step2_render_final  # noqa: E402
 from ai_client import ApiKeyPool, align_step2_spans, evaluate_step1_decisions  # noqa: E402
 from lang_registry import find_lang_display_name, get_languages_file, load_languages  # noqa: E402
 from security_utils import get_secure_user_workdir  # noqa: E402
+from word_counter import parse_doc_filename  # noqa: E402
 
 # Ensure SCATTERED_REV_LANGUAGES_JSON env var points to external languages.json
 get_languages_file()
@@ -82,11 +83,9 @@ def _get_work_dir(stem: str) -> Path:
 
 
 def clean_doc_label(stem: str) -> str:
-    s = stem.strip()
-    if s.startswith("初筛_"):
-        s = s[len("初筛_") :]
-    s = re.sub(r"_[0-9]{4,8}$", "", s)
-    return docx_xml_utils.sanitize_filename_part(s.strip() or stem.strip(), fallback="定稿")
+    known_codes = {e["code"].upper() for e in load_languages() if e.get("code")}
+    parsed = parse_doc_filename(stem, known_codes=known_codes, strip_draft_prefix=True)
+    return docx_xml_utils.sanitize_filename_part(parsed["orig_name"], fallback="Document", max_len=140)
 
 
 def run_step1_pipeline(
@@ -227,7 +226,7 @@ def run_step2_pipeline(
             clean_lang = "XX"
 
     base_label = (doc_name or "").strip() or clean_doc_label(draft_p.stem)
-    mmdd = (date_mmdd or "").strip() or datetime.now().strftime("%m%d")
+    date_yyyymmdd = (date_mmdd or "").strip() or datetime.now().strftime("%Y%m%d")
 
     if progress_fn:
         progress_fn(5.0, "第二步 (1/3)：正在解析确认后的初筛稿高亮区间...")
@@ -275,12 +274,17 @@ def run_step2_pipeline(
     saved_files = []
     if dual_outputs:
         if progress_fn:
-            progress_fn(90.0, "第二步 (3/3)：正在写入双版本定稿（完整留底版 + 发译者版）...")
+            progress_fn(89.0, "第二步 (3/3)：正在写入三份定稿（发译者版 + 完整留底版 + 无改点版）...")
         if log_fn:
-            log_fn("▶ [第二步 3/3] 生成双版本定稿（1. 完整留底版  2. 剔除无改点表的发译者版）...")
-        for idx, (label_suffix, rm_unchanged) in enumerate([("_完整留底版", False), ("_发译者版", True)]):
+            log_fn("▶ [第二步 3/3] 生成三份定稿（1. 发译者版[仅改点]  2. 完整留底版[全量]  3. 无改点版[仅无改点内容]）...")
+        variants = [
+            ("", "--remove-unchanged-tables", "发译者版(仅改点)"),
+            ("_完整留底版", None, "完整留底版"),
+            ("_无改点版", "--only-unchanged-tables", "无改点内容版"),
+        ]
+        for idx, (label_suffix, filter_flag, desc_lbl) in enumerate(variants):
             if progress_fn:
-                progress_fn(90.0 + idx * 5.0, f"第二步 (3/3)：正在写出 {base_label}{label_suffix} ...")
+                progress_fn(89.0 + idx * 3.5, f"第二步 (3/3)：正在写出 {desc_lbl} ...")
             argv2b = [
                 "step2_render_final.py",
                 "--tasks", str(tasks_path),
@@ -288,10 +292,10 @@ def run_step2_pipeline(
                 "--outdir", str(out_d),
                 "--lang", clean_lang,
                 "--doc-name", f"{base_label}{label_suffix}",
-                "--date", mmdd,
+                "--date", date_yyyymmdd,
             ]
-            if rm_unchanged:
-                argv2b.append("--remove-unchanged-tables")
+            if filter_flag:
+                argv2b.append(filter_flag)
             out_txt = _run_module_main(step2_render_final.main, argv2b, log_fn=log_fn)
             m = re.search(r"Final Document Saved:\s*(.+)", out_txt)
             if m:
@@ -308,7 +312,7 @@ def run_step2_pipeline(
             "--outdir", str(out_d),
             "--lang", clean_lang,
             "--doc-name", base_label,
-            "--date", mmdd,
+            "--date", date_yyyymmdd,
         ]
         out_txt = _run_module_main(step2_render_final.main, argv2b, log_fn=log_fn)
         m = re.search(r"Final Document Saved:\s*(.+)", out_txt)

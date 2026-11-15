@@ -1019,9 +1019,74 @@ def apply_full_sentence_highlight(sent_ops: list, color: str) -> list:
 
 
 def count_msword_en_words(text: str) -> int:
-    """Exact MS Word word count formula verified against test ground truth (RV 609 / UP 452)."""
+    """Exact MS Word word count formula verified against test ground truth (RV 609 / UP 452). Punctuation excluded."""
     tokens = re.split(r"[\s—–]+", text.strip())
     return sum(1 for tok in tokens if re.search(r"[A-Za-z0-9]", tok))
+
+
+RV_HIGHLIGHT_ALIASES = frozenset({"cyan", "blue", "darkCyan"})
+_WORD_COUNT_SKIP_TAGS = frozenset({
+    "del", "moveFrom", "rPrChange", "pPrChange", "tblPrChange", "trPrChange", "tcPrChange"
+})
+
+
+def compute_col2_up_rv_words(root: ET.Element, up_color: str = "yellow", rv_color: str = "cyan") -> tuple[int, int]:
+    """
+    Count English words (punctuation excluded; words, not characters) in Column 2 (index 1)
+    across all tables in `root`:
+      - UP = yellow highlight (`up_color`)
+      - RV = cyan highlight (`rv_color` / cyan / blue / darkCyan)
+    Deleted track-change runs (<w:del>) are strictly ignored.
+    """
+    rv_vals = {rv_color} | RV_HIGHLIGHT_ALIASES
+    up_chunks: list[str] = []
+    rv_chunks: list[str] = []
+
+    def _walk_runs(node: ET.Element, u_buf: list[str], r_buf: list[str]) -> None:
+        for ch in node:
+            local = ch.tag.split("}")[-1]
+            if local in _WORD_COUNT_SKIP_TAGS:
+                continue
+            if local == "r":
+                hl = ch.find("./w:rPr/w:highlight", NS)
+                hval = hl.attrib.get(f"{W}val") if hl is not None else None
+                parts = []
+                for sub in ch:
+                    slocal = sub.tag.split("}")[-1]
+                    if slocal == "t" and sub.text:
+                        parts.append(sub.text)
+                    elif slocal in ("tab", "br", "cr"):
+                        parts.append(" ")
+                wt = "".join(parts)
+                if not wt:
+                    continue
+                if hval == up_color:
+                    u_buf.append(wt)
+                elif u_buf:
+                    u_buf.append(" ")
+                if hval in rv_vals:
+                    r_buf.append(wt)
+                elif r_buf:
+                    r_buf.append(" ")
+            else:
+                _walk_runs(ch, u_buf, r_buf)
+
+    for tbl in root.findall(".//w:tbl", NS):
+        for tr in tbl.findall("w:tr", NS):
+            tcs = tr.findall("w:tc", NS)
+            if len(tcs) < 2:
+                continue
+            tc2 = tcs[1]
+            for p in tc2.findall("w:p", NS):
+                u_buf: list[str] = []
+                r_buf: list[str] = []
+                _walk_runs(p, u_buf, r_buf)
+                if u_buf:
+                    up_chunks.append("".join(u_buf))
+                if r_buf:
+                    rv_chunks.append("".join(r_buf))
+
+    return count_msword_en_words(" ".join(up_chunks)), count_msword_en_words(" ".join(rv_chunks))
 
 
 def find_fuzzy_substring_span(haystack: str, needle: str, search_from: int = 0):

@@ -8,7 +8,7 @@ from docx_xml_utils import (
     NS,
     W,
     apply_highlights_to_col3_cell,
-    count_msword_en_words,
+    compute_col2_up_rv_words,
     find_fuzzy_substring_span,
     get_cell_plain_text,
     insert_rpr_child_ordered,
@@ -63,7 +63,6 @@ def accept_rv_revisions_in_col2(tc2: ET.Element, target_rv_color: str = "cyan"):
                         ch.append(r)
                     new_children.append(ch)
             elif local == "ins":
-                # Split runs: RV runs get unwrapped into p, non-RV runs stay inside w:ins
                 pending_non_rv = []
                 for r in list(ch):
                     if r.tag.split("}")[-1] != "r":
@@ -102,17 +101,33 @@ def accept_rv_revisions_in_col2(tc2: ET.Element, target_rv_color: str = "cyan"):
             p.append(ch)
 
 
-def remove_unchanged_tables_from_body(body: ET.Element, up_color: str, rv_color: str) -> int:
+def table_has_col2_changes(tbl_el: ET.Element, active_hl_vals: set) -> bool:
+    for tr in tbl_el.findall("w:tr", NS):
+        tcs = tr.findall("w:tc", NS)
+        if len(tcs) < 2:
+            continue
+        tc2 = tcs[1]
+        if tc2.find(".//w:del", NS) is not None or tc2.find(".//w:ins", NS) is not None:
+            return True
+        for hl in tc2.findall(".//w:rPr/w:highlight", NS):
+            if hl.attrib.get(f"{W}val") in active_hl_vals:
+                return True
+    return False
+
+
+def filter_tables_in_body(body: ET.Element, up_color: str, rv_color: str, keep_changed: bool) -> tuple[int, int]:
     """
-    Remove tables whose Col 2 has zero UP/RV highlights and zero track changes,
-    along with each removed table's immediately preceding title paragraph(s) and trailing blank separator paragraphs.
-    Returns number of removed tables.
+    Filter tables in `body` along with each removed table's preceding title paragraph(s) and trailing blank separator(s).
+    - keep_changed=True  -> keep ONLY tables with Col 2 changes/highlights (translator version)
+    - keep_changed=False -> keep ONLY tables with ZERO Col 2 changes/highlights (unchanged-only version)
+    Returns (kept_tables, removed_tables).
     """
     active_hl_vals = {up_color, rv_color} | RV_HIGHLIGHT_VALS
     children = list(body)
     n = len(children)
     to_remove = set()
     removed_tables = 0
+    kept_tables = 0
 
     def _is_blank_p(el: ET.Element) -> bool:
         if el.tag.split("}")[-1] != "p":
@@ -127,90 +142,54 @@ def remove_unchanged_tables_from_body(body: ET.Element, up_color: str, rv_color:
     for idx, ch in enumerate(children):
         if ch.tag.split("}")[-1] != "tbl":
             continue
-        has_change = False
-        for tr in ch.findall("w:tr", NS):
-            tcs = tr.findall("w:tc", NS)
-            if len(tcs) < 2:
-                continue
-            tc2 = tcs[1]
-            if tc2.find(".//w:del", NS) is not None or tc2.find(".//w:ins", NS) is not None:
-                has_change = True
-                break
-            for hl in tc2.findall(".//w:rPr/w:highlight", NS):
-                if hl.attrib.get(f"{W}val") in active_hl_vals:
-                    has_change = True
-                    break
-            if has_change:
-                break
-
-        if not has_change:
+        has_change = table_has_col2_changes(ch, active_hl_vals)
+        should_remove = (not has_change) if keep_changed else has_change
+        if should_remove:
             removed_tables += 1
             to_remove.add(idx)
-            # Preceding non-empty title paragraph(s)
             b_idx = idx - 1
             while b_idx >= 0 and _is_nonempty_p(children[b_idx]):
                 to_remove.add(b_idx)
                 b_idx -= 1
-            # Trailing blank separator paragraph(s)
             f_idx = idx + 1
             while f_idx < n and _is_blank_p(children[f_idx]):
                 to_remove.add(f_idx)
                 f_idx += 1
+        else:
+            kept_tables += 1
 
     if to_remove:
         for idx in sorted(to_remove, reverse=True):
             body.remove(children[idx])
-        # Keep at most 1 trailing blank paragraph immediately before sectPr
-        rem_children = list(body)
-        if rem_children and rem_children[-1].tag.split("}")[-1] == "sectPr":
-            while len(rem_children) >= 3 and _is_blank_p(rem_children[-2]) and _is_blank_p(rem_children[-3]):
-                body.remove(rem_children[-2])
-                rem_children = list(body)
 
-    return removed_tables
+    rem_children = list(body)
+    if rem_children and rem_children[-1].tag.split("}")[-1] == "sectPr":
+        while len(rem_children) >= 3 and _is_blank_p(rem_children[-2]) and _is_blank_p(rem_children[-3]):
+            body.remove(rem_children[-2])
+            rem_children = list(body)
+
+    # ECMA-376 safety: ensure at least one <w:p> exists before <w:sectPr> if all tables were removed
+    non_sect = [c for c in list(body) if c.tag.split("}")[-1] != "sectPr"]
+    if not non_sect:
+        body.insert(0, ET.Element(f"{W}p"))
+
+    return kept_tables, removed_tables
 
 
 def compute_final_col2_word_counts(root: ET.Element, up_color: str, rv_color: str):
-    up_chunks = []
-    rv_chunks = []
-    for tbl in root.findall(".//w:tbl", NS):
-        for tr in tbl.findall("w:tr", NS):
-            tcs = tr.findall("w:tc", NS)
-            if len(tcs) < 2:
-                continue
-            tc2 = tcs[1]
-            for p in tc2.findall("w:p", NS):
-                u_buf = []
-                r_buf = []
-                for elem in p.iter():
-                    if elem.tag.split("}")[-1] == "r":
-                        hl = elem.find("./w:rPr/w:highlight", NS)
-                        hval = hl.attrib.get(f"{W}val") if hl is not None else None
-                        wt = "".join(t.text or "" for t in elem.findall("w:t", NS))
-                        if not wt:
-                            continue
-                        if hval == up_color:
-                            u_buf.append(wt)
-                        elif u_buf:
-                            u_buf.append(" ")
-                        if hval == rv_color:
-                            r_buf.append(wt)
-                        elif r_buf:
-                            r_buf.append(" ")
-                up_chunks.append("".join(u_buf))
-                rv_chunks.append("".join(r_buf))
-    return count_msword_en_words(" ".join(up_chunks)), count_msword_en_words(" ".join(rv_chunks))
+    return compute_col2_up_rv_words(root, up_color=up_color, rv_color=rv_color)
 
 
 def main():
-    parser = argparse.ArgumentParser(description="Step 2b: Accept RV revisions, highlight Col 3 (UP+RV), count words & output final docx.")
+    parser = argparse.ArgumentParser(description="Step 2b: Highlight Col 3 (UP+RV), count Col 2 English words & output final docx.")
     parser.add_argument("--tasks", required=True, help="Path to step2_align_tasks.json")
     parser.add_argument("--alignments", required=True, help="Path to step2_alignments.json (span_id -> target Col 3 text)")
     parser.add_argument("--outdir", required=True, help="Output directory for final .docx")
-    parser.add_argument("--lang", required=True, help="Language code, e.g. FR, PT")
-    parser.add_argument("--doc-name", required=True, help="Document type/title label for filename")
-    parser.add_argument("--date", default="", help="Optional MMDD string, defaults to current local MMDD")
-    parser.add_argument("--remove-unchanged-tables", action="store_true", help="Remove tables that have 0 Col 2 highlights/revisions")
+    parser.add_argument("--lang", required=True, help="Language code, e.g. GR, FR, PT")
+    parser.add_argument("--doc-name", required=True, help="Original document name for filename")
+    parser.add_argument("--date", default="", help="Optional YYYYMMDD string, defaults to current local YYYYMMDD")
+    parser.add_argument("--remove-unchanged-tables", action="store_true", help="Keep only tables that have Col 2 highlights/revisions")
+    parser.add_argument("--only-unchanged-tables", action="store_true", help="Keep only tables that have ZERO Col 2 highlights/revisions")
     args = parser.parse_args()
 
     cfg = load_config()
@@ -278,10 +257,13 @@ def main():
             print(f"  - {sid}: target={tstr!r} (from old_en={oen!r})")
         raise SystemExit(2)
 
-    # 2.5 Optional: remove completely unchanged tables (and their titles) for translator-facing version
-    if args.remove_unchanged_tables:
-        removed_cnt = remove_unchanged_tables_from_body(body, col2_up, col2_rv)
-        print(f"Removed {removed_cnt} unchanged tables (with 0 Col 2 revisions/highlights).")
+    # 2.5 Optional table filtering
+    if args.only_unchanged_tables:
+        kept_cnt, removed_cnt = filter_tables_in_body(body, col2_up, col2_rv, keep_changed=False)
+        print(f"Kept {kept_cnt} unchanged tables (removed {removed_cnt} changed tables).")
+    elif args.remove_unchanged_tables:
+        kept_cnt, removed_cnt = filter_tables_in_body(body, col2_up, col2_rv, keep_changed=True)
+        print(f"Kept {kept_cnt} changed tables (removed {removed_cnt} unchanged tables).")
 
     # 3. Optional top header paragraphs (if configured in config.json; empty by default)
     header_paras = cfg.get("header_paragraphs", [])
@@ -291,18 +273,17 @@ def main():
             p_el.append(make_run(hp_text))
             body.insert(idx, p_el)
 
-    # 4. Compute exact UP & RV word counts from Col 2 only
+    # 4. Compute exact UP & RV English word counts from Col 2 (punctuation excluded)
     up_words, rv_words = compute_final_col2_word_counts(root, col2_up, col2_rv)
-    parts = []
-    if up_words > 0:
-        parts.append(f"up{up_words}")
-    if rv_words > 0:
-        parts.append(f"rv{rv_words}")
-    count_tag = f"({' '.join(parts)})" if parts else "(up0)"
+    count_tag = f"(UP {up_words} words, RV {rv_words} words)"
 
-    date_str = sanitize_filename_part(args.date.strip() or datetime.now().strftime("%m%d"), fallback="0101", max_len=16)
+    date_str = sanitize_filename_part(
+        args.date.strip() or datetime.now().strftime("%Y%m%d"),
+        fallback=datetime.now().strftime("%Y%m%d"),
+        max_len=16,
+    )
     lang_str = sanitize_filename_part(args.lang.strip().upper(), fallback="XX", max_len=16)
-    doc_label = sanitize_filename_part(args.doc_name.strip(), fallback="定稿", max_len=120)
+    doc_label = sanitize_filename_part(args.doc_name.strip(), fallback="Document", max_len=140)
     out_filename = f"{lang_str}_{doc_label}_{count_tag}_{date_str}.docx"
 
     outdir = Path(args.outdir).resolve()
@@ -311,7 +292,7 @@ def main():
 
     save_docx_xml(draft_path, out_path, root, ns_pairs)
     print(f"Successfully aligned {matched_count}/{matched_count} Col 3 spans (0 unmatched).")
-    print(f"Final Col 2 Word Counts: UP = {up_words}, RV = {rv_words}")
+    print(f"Final Col 2 Word Counts: UP = {up_words} words, RV = {rv_words} words")
     print(f"Final Document Saved: {out_path}")
 
 
