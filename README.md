@@ -46,6 +46,10 @@ TranslationTools/
 
 ## 快速运行与打包
 
+### 0. 免安装直接下载（GitHub 自动构建 Windows 版）
+
+直接前往本仓库 [**Releases 页面**](https://github.com/zcnz2026/TranslationTools/releases)（或 [**Actions 构建页**](https://github.com/zcnz2026/TranslationTools/actions)）下载 `ScatteredRevisionTool-Windows-x64.zip`，解压后双击 `零散改点整理工具.exe` 即可运行，无需安装 Python。
+
 ### 1. 直接源码运行（仅需 Python 3.10+ 标准库，无需 `pip install` 任何运行时依赖）
 
 双击 `零散改点工具/启动工具.bat`，或在终端执行：
