@@ -1113,7 +1113,7 @@ def save_docx_xml(
         comments_root = load_docx_comments_xml(src_docx_path)
 
     comments_root = sanitize_document_ooxml(root, comments_root)
-    has_active_comments = comments_root is not None
+    has_active_comments = comments_root is not None and len(comments_root.findall(f"{W}comment")) > 0
 
     with _ET_NS_LOCK:
         for prefix, uri in ns_pairs:
