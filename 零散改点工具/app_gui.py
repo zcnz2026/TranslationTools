@@ -305,27 +305,288 @@ def _app_base_dir() -> Path:
 SETTINGS_FILE = _app_base_dir() / "app_settings.json"
 
 
+class _WinRect(ctypes.Structure):
+    _fields_ = [
+        ("left", ctypes.c_long),
+        ("top", ctypes.c_long),
+        ("right", ctypes.c_long),
+        ("bottom", ctypes.c_long),
+    ]
+
+
+def _get_work_area(win: tk.Misc) -> tuple[int, int, int, int]:
+    """Return (left, top, width, height) of the usable desktop work area excluding the Windows taskbar."""
+    if sys.platform == "win32":
+        try:
+            rect = _WinRect()
+            ok = ctypes.windll.user32.SystemParametersInfoW(0x0030, 0, ctypes.byref(rect), 0)
+            if ok and rect.right > rect.left and rect.bottom > rect.top:
+                return (
+                    int(rect.left),
+                    int(rect.top),
+                    int(rect.right - rect.left),
+                    int(rect.bottom - rect.top),
+                )
+        except Exception:
+            pass
+    sw = max(800, int(win.winfo_screenwidth()))
+    sh = max(600, int(win.winfo_screenheight()) - 48)
+    return (0, 0, sw, sh)
+
+
+def _fit_and_center_window(
+    win: tk.Wm,
+    base_w: int,
+    base_h: int,
+    min_w: int,
+    min_h: int,
+    parent: tk.Misc | None = None,
+) -> tuple[int, int]:
+    """Size `win` adaptively for DPI + required widget metrics and center within the usable work area."""
+    win.update_idletasks()
+    try:
+        dpi = float(win.winfo_fpixels("1i"))
+    except Exception:
+        dpi = 96.0
+    scale = max(1.0, dpi / 96.0)
+
+    work_left, work_top, work_w, work_h = _get_work_area(win)
+    avail_w = max(480, work_w - 32)
+    avail_h = max(360, work_h - 48)
+
+    req_w = int(win.winfo_reqwidth())
+    req_h = int(win.winfo_reqheight())
+
+    w = min(avail_w, max(int(round(base_w * scale)), req_w + 24))
+    h = min(avail_h, max(int(round(base_h * scale)), req_h + 20))
+
+    eff_min_w = min(w, min(avail_w, max(int(round(min_w * scale)), min(avail_w, req_w))))
+    eff_min_h = min(h, min(avail_h, int(round(min_h * scale))))
+    win.minsize(eff_min_w, eff_min_h)
+
+    if parent is not None and parent.winfo_exists():
+        try:
+            parent.update_idletasks()
+            pw = int(parent.winfo_width())
+            ph = int(parent.winfo_height())
+            if pw > 120 and ph > 120:
+                px = int(parent.winfo_rootx()) + (pw - w) // 2
+                py = int(parent.winfo_rooty()) + (ph - h) // 2
+            else:
+                px = work_left + (work_w - w) // 2
+                py = work_top + max(8, (avail_h - h) // 2)
+        except Exception:
+            px = work_left + (work_w - w) // 2
+            py = work_top + max(8, (avail_h - h) // 2)
+    else:
+        px = work_left + (work_w - w) // 2
+        py = work_top + max(8, (avail_h - h) // 2)
+
+    max_x = max(work_left + 8, work_left + work_w - w - 16)
+    max_y = max(work_top + 8, work_top + work_h - h - 44)
+    px = max(work_left + 8, min(px, max_x))
+    py = max(work_top + 8, min(py, max_y))
+
+    win.geometry(f"{w}x{h}+{px}+{py}")
+    win.update_idletasks()
+    return w, h
+
+
+class PrimaryButton(tk.Button):
+    """Consistent primary CTA button with crisp CJK width metrics and full hover/focus/active/disabled states."""
+
+    _BG_NORMAL = "#2563eb"
+    _BG_HOVER = "#1d4ed8"
+    _BG_ACTIVE = "#1e40af"
+    _BG_DISABLED = "#94a3b8"
+    _FG_NORMAL = "#ffffff"
+    _FG_DISABLED = "#f1f5f9"
+
+    def __init__(
+        self,
+        master: tk.Misc,
+        text: str = "",
+        command=None,
+        padx: int = 18,
+        pady: int = 6,
+        font=("Microsoft YaHei UI", 9, "bold"),
+        state: str = tk.NORMAL,
+        **kwargs,
+    ):
+        is_disabled = str(state).lower() == "disabled"
+        init_bg = self._BG_DISABLED if is_disabled else self._BG_NORMAL
+        init_cursor = "arrow" if is_disabled else "hand2"
+        super().__init__(
+            master,
+            text=text,
+            command=command,
+            font=font,
+            bg=init_bg,
+            fg=self._FG_NORMAL,
+            activebackground=self._BG_ACTIVE,
+            activeforeground=self._FG_NORMAL,
+            disabledforeground=self._FG_DISABLED,
+            relief=tk.FLAT,
+            bd=0,
+            padx=padx,
+            pady=pady,
+            cursor=init_cursor,
+            highlightthickness=1,
+            highlightbackground=init_bg,
+            highlightcolor="#93c5fd",
+            state=state,
+            **kwargs,
+        )
+        self._hovered = False
+        self.bind("<Enter>", self._on_enter, add="+")
+        self.bind("<Leave>", self._on_leave, add="+")
+
+    def _is_disabled(self) -> bool:
+        try:
+            return str(self.cget("state")).lower() == "disabled"
+        except Exception:
+            return False
+
+    def _sync_visual_state(self):
+        if self._is_disabled():
+            super().configure(
+                bg=self._BG_DISABLED,
+                highlightbackground=self._BG_DISABLED,
+                cursor="arrow",
+            )
+        else:
+            target_bg = self._BG_HOVER if self._hovered else self._BG_NORMAL
+            super().configure(
+                bg=target_bg,
+                highlightbackground=target_bg,
+                cursor="hand2",
+            )
+
+    def _on_enter(self, _event=None):
+        self._hovered = True
+        if not self._is_disabled():
+            super().configure(bg=self._BG_HOVER, highlightbackground=self._BG_HOVER)
+
+    def _on_leave(self, _event=None):
+        self._hovered = False
+        if not self._is_disabled():
+            super().configure(bg=self._BG_NORMAL, highlightbackground=self._BG_NORMAL)
+
+    def configure(self, cnf=None, **kw):
+        res = super().configure(cnf, **kw)
+        if (isinstance(cnf, dict) and "state" in cnf) or "state" in kw:
+            self._sync_visual_state()
+        return res
+
+    config = configure
+
+    def __setitem__(self, key: str, value):
+        super().__setitem__(key, value)
+        if key == "state":
+            self._sync_visual_state()
+
+
+def _make_primary_btn(
+    parent: tk.Misc,
+    text: str,
+    command=None,
+    padx: int = 18,
+    pady: int = 6,
+    font=("Microsoft YaHei UI", 9, "bold"),
+    state: str = tk.NORMAL,
+    **kwargs,
+) -> PrimaryButton:
+    return PrimaryButton(
+        parent,
+        text=text,
+        command=command,
+        padx=padx,
+        pady=pady,
+        font=font,
+        state=state,
+        **kwargs,
+    )
+
+
+def _make_vertical_paned(
+    parent: tk.Misc,
+    upper_weight: int = 0,
+    lower_weight: int = 1,
+    min_top: int = 140,
+    min_bottom: int = 120,
+) -> tuple[ttk.PanedWindow, ttk.Frame, ttk.Frame]:
+    """Create a vertical `ttk.PanedWindow` with DPI-aware minimum top/bottom drag clamping."""
+    try:
+        scale = max(1.0, float(parent.winfo_fpixels("1i")) / 96.0)
+    except Exception:
+        scale = 1.0
+    eff_min_top = int(round(min_top * scale))
+    eff_min_bot = int(round(min_bottom * scale))
+
+    pw = ttk.PanedWindow(parent, orient=tk.VERTICAL)
+    pw.pack(side=tk.TOP, fill=tk.BOTH, expand=True)
+    upper = ttk.Frame(pw)
+    lower = ttk.Frame(pw)
+    pw.add(upper, weight=upper_weight)
+    pw.add(lower, weight=lower_weight)
+
+    def _clamp_sash(_event=None):
+        try:
+            total_h = int(pw.winfo_height())
+            if total_h <= (eff_min_top + eff_min_bot + 12):
+                return
+            pos = int(pw.sashpos(0))
+            max_pos = total_h - eff_min_bot
+            if pos < eff_min_top:
+                pw.sashpos(0, eff_min_top)
+            elif pos > max_pos:
+                pw.sashpos(0, max_pos)
+        except Exception:
+            pass
+
+    pw.bind("<B1-Motion>", lambda _e: pw.after_idle(_clamp_sash), add="+")
+    pw.bind("<ButtonRelease-1>", lambda _e: pw.after_idle(_clamp_sash), add="+")
+    return pw, upper, lower
+
+
 class ApiKeyPoolDialog(tk.Toplevel):
-    """Modal dialog for managing an unlimited pool of API keys, batch health testing, and dead-key pruning."""
+    """Modal dialog for managing an unlimited pool of API keys, channel/encryption settings, and health testing."""
 
     def __init__(
         self,
         parent: tk.Tk,
-        initial_raw_text: str,
-        rotation_label_var: tk.StringVar,
-        model_id: str,
-        api_mode: str,
-        on_save_cb,
+        initial_raw_text: str = "",
+        rotation_label_var: tk.StringVar | None = None,
+        model_id: str = "gemini-3.5-flash-lite",
+        api_mode: str = "auto",
+        on_save_cb=None,
+        api_mode_label_var: tk.StringVar | None = None,
+        remember_key_var: tk.BooleanVar | None = None,
     ):
         super().__init__(parent)
-        self.title("API 密钥池批量管理（支持无限个 Key 轮换 + 超额/报错自动秒切）")
-        self.geometry("760x580")
-        self.minsize(680, 500)
+        self.withdraw()
+        self.title("API 密钥池管理（支持无限个 Key 轮换与报错自动切换）")
         self.transient(parent)
-        self.grab_set()
 
         self.initial_raw_text = initial_raw_text or ""
-        self.rotation_var = tk.StringVar(value=rotation_label_var.get())
+        init_rot = rotation_label_var.get() if rotation_label_var is not None else ROTATION_MODES[0][0]
+        self.rotation_var = tk.StringVar(value=init_rot)
+        self._ext_api_mode_var = api_mode_label_var
+        self._ext_remember_var = remember_key_var
+
+        init_mode_lbl = API_MODES[0][0]
+        if api_mode_label_var is not None and api_mode_label_var.get().strip():
+            init_mode_lbl = api_mode_label_var.get().strip()
+        else:
+            for disp, code in API_MODES:
+                if api_mode == code or api_mode == disp:
+                    init_mode_lbl = disp
+                    break
+        self.api_mode_var = tk.StringVar(value=init_mode_lbl)
+        self.remember_var = tk.BooleanVar(
+            value=bool(remember_key_var.get()) if remember_key_var is not None else True
+        )
+
         self.model_id = model_id
         self.api_mode = api_mode
         self.on_save_cb = on_save_cb
@@ -339,80 +600,63 @@ class ApiKeyPoolDialog(tk.Toplevel):
         if self.initial_raw_text.strip():
             self.editor.insert("1.0", self.initial_raw_text.strip() + "\n")
         self._update_count()
+        _fit_and_center_window(self, base_w=780, base_h=580, min_w=680, min_h=480, parent=parent)
+        self.deiconify()
+        try:
+            self.grab_set()
+        except tk.TclError:
+            pass
         self._poll_ui_queue()
 
+    def _resolve_current_api_mode(self) -> str:
+        lbl = self.api_mode_var.get().strip()
+        for disp, code in API_MODES:
+            if lbl == disp or lbl == code:
+                return code
+        return self.api_mode or "auto"
+
     def _build_ui(self):
-        wrap = ttk.Frame(self, padding=12)
+        wrap = ttk.Frame(self, padding=14)
         wrap.pack(fill=tk.BOTH, expand=True)
 
         tip = ttk.Label(
             wrap,
             text=(
-                "说明：支持填入【无限个 API Key】（推荐每行 1 个，也支持逗号/分号/竖线分隔；可在 Key 后加 # 备注，自动去重）。\n"
-                "• 支持混填 Vertex AI Key (AQ.开头) 与 Gemini Key (AIza开头)；本机勾选记住时全程采用 Windows DPAPI 系统级加密存储。\n"
-                "• 运行时若任一 Key 额度耗尽、超速 (HTTP 429)、失效报错 (401/403) 或超时，将毫秒级自动切换下一个 Key，绝不中断任务！"
+                "支持填入无限个 API Key（推荐每行 1 个，支持逗号/分号/竖线分隔及 # 备注，自动去重）。\n"
+                "可混填 Vertex AI Key (AQ.开头) 与 Gemini Key (AIza开头)；运行中遇超额 (429) 或异常将自动切换下一个 Key。"
             ),
             foreground="#475569",
         )
-        tip.pack(fill=tk.X, pady=(0, 8))
+        tip.pack(side=tk.TOP, fill=tk.X, pady=(0, 8))
 
-        ed_frame = ttk.LabelFrame(wrap, text=" 密钥列表（每行 1 个 Key，支持 # 账号备注，数量无上限） ", padding=8)
-        ed_frame.pack(fill=tk.BOTH, expand=True, pady=(0, 8))
+        # Pack bottom action bar FIRST so bottom buttons NEVER clip at any window height
+        btns = ttk.Frame(wrap)
+        btns.pack(side=tk.BOTTOM, fill=tk.X)
 
-        ed_inner = ttk.Frame(ed_frame)
-        ed_inner.pack(fill=tk.BOTH, expand=True)
+        self.btn_cancel = ttk.Button(btns, text="取消", command=self.destroy)
+        self.btn_cancel.pack(side=tk.RIGHT)
+        self.btn_save = _make_primary_btn(btns, text="保存并应用密钥池", command=self._on_save)
+        self.btn_save.pack(side=tk.RIGHT, padx=(0, 8))
 
-        self.editor = tk.Text(
-            ed_inner,
-            height=10,
-            wrap=tk.NONE,
-            font=("Consolas", 9),
-            bg="#ffffff",
-            fg="#0f172a",
-            relief=tk.SOLID,
-            borderwidth=1,
-            padx=8,
-            pady=6,
-            undo=True,
+        self.btn_test_all = ttk.Button(btns, text="批量检测全部 Key", command=self._on_test_all)
+        self.btn_test_all.pack(side=tk.LEFT, padx=(0, 8))
+
+        self.btn_prune = ttk.Button(
+            btns, text="一键剔除失效 Key", state=tk.DISABLED, command=self._on_prune_failed
         )
-        vsb = ttk.Scrollbar(ed_inner, orient=tk.VERTICAL, command=self.editor.yview)
-        hsb = ttk.Scrollbar(ed_frame, orient=tk.HORIZONTAL, command=self.editor.xview)
-        self.editor.configure(yscrollcommand=vsb.set, xscrollcommand=hsb.set)
+        self.btn_prune.pack(side=tk.LEFT, padx=(0, 8))
 
-        self.editor.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
-        vsb.pack(side=tk.RIGHT, fill=tk.Y)
-        hsb.pack(fill=tk.X)
+        self.btn_clear = ttk.Button(btns, text="清空输入", command=self._on_clear)
+        self.btn_clear.pack(side=tk.LEFT)
 
-        self.editor.bind("<KeyRelease>", lambda _e: self._update_count())
-        self.editor.bind("<<Paste>>", lambda _e: self.after(20, self._update_count))
+        tk.Frame(wrap, bg="#e2e8f0", height=1).pack(side=tk.BOTTOM, fill=tk.X, pady=(10, 10))
 
-        mid_row = ttk.Frame(wrap)
-        mid_row.pack(fill=tk.X, pady=(0, 8))
-
-        ttk.Label(
-            mid_row,
-            textvariable=self.count_var,
-            font=("Microsoft YaHei UI", 9, "bold"),
-            foreground="#1d4ed8",
-        ).pack(side=tk.LEFT)
-
-        rot_box = ttk.Frame(mid_row)
-        rot_box.pack(side=tk.RIGHT)
-        ttk.Label(rot_box, text="多 Key 调度策略：").pack(side=tk.LEFT)
-        ttk.Combobox(
-            rot_box,
-            textvariable=self.rotation_var,
-            values=[m[0] for m in ROTATION_MODES],
-            state="readonly",
-            width=38,
-        ).pack(side=tk.LEFT, padx=(4, 0))
-
-        chk_frame = ttk.LabelFrame(wrap, text=f" 批量可用性检测结果（当前检测模型：{self.model_id}） ", padding=6)
-        chk_frame.pack(fill=tk.BOTH, expand=False, pady=(0, 8))
+        chk_frame = ttk.LabelFrame(wrap, text=f" 批量可用性检测结果（检测模型：{self.model_id}） ", padding=6)
+        chk_frame.pack(side=tk.BOTTOM, fill=tk.X, pady=(0, 4))
 
         self.chk_text = tk.Text(
             chk_frame,
-            height=6,
+            height=5,
             wrap=tk.WORD,
             font=("Microsoft YaHei UI", 9),
             bg="#f8fafc",
@@ -429,25 +673,79 @@ class ApiKeyPoolDialog(tk.Toplevel):
         self.chk_text.configure(yscrollcommand=chk_vsb.set)
         self.chk_text.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
         chk_vsb.pack(side=tk.RIGHT, fill=tk.Y)
-        self.chk_text.insert(tk.END, "点击下方「🧪 批量检测全部 Key」可逐一验证所有密钥可用性，并支持一键剔除失效 Key。\n")
+        self.chk_text.insert(tk.END, "点击下方「批量检测全部 Key」可逐一验证所有密钥可用性，并支持一键剔除失效 Key。\n")
 
-        btns = ttk.Frame(wrap)
-        btns.pack(fill=tk.X)
+        cfg_box = ttk.Frame(wrap)
+        cfg_box.pack(side=tk.BOTTOM, fill=tk.X, pady=(0, 8))
 
-        self.btn_test_all = ttk.Button(btns, text="🧪 批量检测全部 Key", command=self._on_test_all)
-        self.btn_test_all.pack(side=tk.LEFT, padx=(0, 8))
+        stat_row = ttk.Frame(cfg_box)
+        stat_row.pack(fill=tk.X, pady=(0, 6))
+        ttk.Checkbutton(
+            stat_row,
+            text="本机加密记住密钥池 (Windows DPAPI)",
+            variable=self.remember_var,
+        ).pack(side=tk.RIGHT)
+        ttk.Label(
+            stat_row,
+            textvariable=self.count_var,
+            font=("Microsoft YaHei UI", 9, "bold"),
+            foreground="#1d4ed8",
+        ).pack(side=tk.LEFT)
 
-        self.btn_prune = ttk.Button(
-            btns, text="🧹 一键剔除失效 Key", state=tk.DISABLED, command=self._on_prune_failed
+        chan_row = ttk.Frame(cfg_box)
+        chan_row.pack(fill=tk.X)
+        chan_row.columnconfigure(1, weight=1)
+        chan_row.columnconfigure(3, weight=1)
+
+        ttk.Label(chan_row, text="接口通道：").grid(row=0, column=0, sticky=tk.W)
+        ttk.Combobox(
+            chan_row,
+            textvariable=self.api_mode_var,
+            values=[m[0] for m in API_MODES],
+            state="readonly",
+            width=28,
+        ).grid(row=0, column=1, sticky=tk.EW, padx=(4, 14))
+
+        ttk.Label(chan_row, text="调度策略：").grid(row=0, column=2, sticky=tk.W)
+        ttk.Combobox(
+            chan_row,
+            textvariable=self.rotation_var,
+            values=[m[0] for m in ROTATION_MODES],
+            state="readonly",
+            width=30,
+        ).grid(row=0, column=3, sticky=tk.EW, padx=(4, 0))
+
+        # Pack flexible editor LAST so it smoothly absorbs vertical resize
+        ed_frame = ttk.LabelFrame(wrap, text=" 密钥列表（每行 1 个 Key，支持 # 账号备注，数量无上限） ", padding=8)
+        ed_frame.pack(side=tk.TOP, fill=tk.BOTH, expand=True, pady=(0, 8))
+
+        hsb = ttk.Scrollbar(ed_frame, orient=tk.HORIZONTAL, command=lambda *a: self.editor.xview(*a))
+        hsb.pack(side=tk.BOTTOM, fill=tk.X)
+
+        ed_inner = ttk.Frame(ed_frame)
+        ed_inner.pack(side=tk.TOP, fill=tk.BOTH, expand=True)
+
+        self.editor = tk.Text(
+            ed_inner,
+            height=8,
+            wrap=tk.NONE,
+            font=("Consolas", 9),
+            bg="#ffffff",
+            fg="#0f172a",
+            relief=tk.SOLID,
+            borderwidth=1,
+            padx=8,
+            pady=6,
+            undo=True,
         )
-        self.btn_prune.pack(side=tk.LEFT, padx=(0, 8))
+        vsb = ttk.Scrollbar(ed_inner, orient=tk.VERTICAL, command=self.editor.yview)
+        self.editor.configure(yscrollcommand=vsb.set, xscrollcommand=hsb.set)
 
-        ttk.Button(btns, text="🗑️ 清空输入", command=self._on_clear).pack(side=tk.LEFT)
+        self.editor.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+        vsb.pack(side=tk.RIGHT, fill=tk.Y)
 
-        ttk.Button(btns, text="取消", width=9, command=self.destroy).pack(side=tk.RIGHT)
-        ttk.Button(
-            btns, text="💾 保存并应用密钥池", style="Primary.TButton", command=self._on_save
-        ).pack(side=tk.RIGHT, padx=(0, 8))
+        self.editor.bind("<KeyRelease>", lambda _e: self._update_count())
+        self.editor.bind("<<Paste>>", lambda _e: self.after(20, self._update_count))
 
     def _get_raw_text(self) -> str:
         return self.editor.get("1.0", tk.END).strip()
@@ -483,12 +781,12 @@ class ApiKeyPoolDialog(tk.Toplevel):
                 elif kind == "done":
                     ok_cnt, bad_keys = payload
                     self._testing = False
-                    self.btn_test_all.configure(state=tk.NORMAL, text="🧪 批量检测全部 Key")
+                    self.btn_test_all.configure(state=tk.NORMAL, text="批量检测全部 Key")
                     self._failed_keys_set = set(bad_keys)
                     self.btn_prune.configure(state=tk.NORMAL if bad_keys else tk.DISABLED)
-                    summary = f"检测完毕：✅ 可用 {ok_cnt} 个  |  ❌ 不可用/受限 {len(bad_keys)} 个。"
+                    summary = f"检测完毕：可用 {ok_cnt} 个  |  不可用/受限 {len(bad_keys)} 个。"
                     if bad_keys:
-                        summary += "（可点击「🧹 一键剔除失效 Key」自动清理）"
+                        summary += "（可点击「一键剔除失效 Key」自动清理）"
                     self.chk_text.insert(tk.END, summary + "\n", "info")
                     self.chk_text.see(tk.END)
         finally:
@@ -503,29 +801,30 @@ class ApiKeyPoolDialog(tk.Toplevel):
             messagebox.showwarning("提示", "请先输入至少 1 个 API Key。", parent=self)
             return
 
+        eff_mode = self._resolve_current_api_mode()
         self._testing = True
         self._failed_keys_set.clear()
         self.btn_prune.configure(state=tk.DISABLED)
-        self.btn_test_all.configure(state=tk.DISABLED, text="⏳ 正在逐个检测...")
+        self.btn_test_all.configure(state=tk.DISABLED, text="正在逐个检测...")
         self.chk_text.delete("1.0", tk.END)
         self.chk_text.insert(tk.END, f"开始检测共 {len(keys)} 个 API Key（模型：{self.model_id}）...\n", "info")
 
         def _each(done_i: int, tot: int, item: dict):
-            icon = "✅" if item["ok"] else "❌"
+            prefix = "[通过]" if item["ok"] else "[失败]"
             tag = "ok" if item["ok"] else "bad"
             raw_detail = str(item.get("detail", ""))
             if item["ok"]:
                 detail = redact_secrets(_clean_single_line_message(raw_detail), extra_secret=keys)
             else:
                 detail = _format_exception_concise(RuntimeError(raw_detail), keys=keys, api_related=True)
-            self._ui_queue.put(("line", (f"[{done_i}/{tot}] {icon} {item['masked']}：{detail}", tag)))
+            self._ui_queue.put(("line", (f"[{done_i}/{tot}] {prefix} {item['masked']}：{detail}", tag)))
 
         def worker():
             try:
                 reps = test_all_api_keys(
                     keys,
                     model=self.model_id,
-                    api_mode=self.api_mode,
+                    api_mode=eff_mode,
                     on_each_cb=_each,
                 )
                 ok_cnt = sum(1 for r in reps if r["ok"])
@@ -533,7 +832,7 @@ class ApiKeyPoolDialog(tk.Toplevel):
                 self._ui_queue.put(("done", (ok_cnt, bad_keys)))
             except Exception as ex:
                 safe_err = _format_exception_concise(ex, keys=keys, api_related=True)
-                self._ui_queue.put(("line", (f"❌ 检测出错：{safe_err}", "bad")))
+                self._ui_queue.put(("line", (f"[失败] 检测出错：{safe_err}", "bad")))
                 self._ui_queue.put(("done", (0, [])))
 
         threading.Thread(target=worker, daemon=True).start()
@@ -580,8 +879,13 @@ class ApiKeyPoolDialog(tk.Toplevel):
         messagebox.showinfo("清理完成", f"已自动剔除 {removed_cnt} 个检测失败的 API Key！", parent=self)
 
     def _on_save(self):
+        if self._ext_api_mode_var is not None:
+            self._ext_api_mode_var.set(self.api_mode_var.get())
+        if self._ext_remember_var is not None:
+            self._ext_remember_var.set(bool(self.remember_var.get()))
         raw_txt = self._get_raw_text()
-        self.on_save_cb(raw_txt, self.rotation_var.get())
+        if callable(self.on_save_cb):
+            self.on_save_cb(raw_txt, self.rotation_var.get())
         self.destroy()
 
 
@@ -590,11 +894,9 @@ class LanguageManagerDialog(tk.Toplevel):
 
     def __init__(self, parent: tk.Tk, entries: list, on_saved_callback):
         super().__init__(parent)
-        self.title("多语种与标准字体配置管理（支持查看内置语系字体、自由新增/修改语种）")
-        self.geometry("820x560")
-        self.minsize(740, 480)
+        self.withdraw()
+        self.title("多语种与标准字体配置管理")
         self.transient(parent)
-        self.grab_set()
 
         self.entries = [dict(x) for x in entries]
         self.on_saved_callback = on_saved_callback
@@ -606,6 +908,12 @@ class LanguageManagerDialog(tk.Toplevel):
 
         self._build_ui()
         self._refresh_tree()
+        _fit_and_center_window(self, base_w=840, base_h=560, min_w=740, min_h=460, parent=parent)
+        self.deiconify()
+        try:
+            self.grab_set()
+        except tk.TclError:
+            pass
 
     @staticmethod
     def _effective_entry_font(entry: dict) -> str:
@@ -615,43 +923,35 @@ class LanguageManagerDialog(tk.Toplevel):
         return _BUILTIN_FONT_FALLBACKS.get(code, "")
 
     def _build_ui(self):
-        wrap = ttk.Frame(self, padding=12)
+        wrap = ttk.Frame(self, padding=14)
         wrap.pack(fill=tk.BOTH, expand=True)
 
         tip = ttk.Label(
             wrap,
             text=(
-                "说明：所有语种与字体配置实时保存在同目录的 languages.json 中（已内置《各语系字体》规范，如泰语 Angsana New 18/16/14pt）。\n"
-                "• 语种代码：用于定稿文件名前缀（如 GR_、TH_、PL_）及各板块自动识别。\n"
-                "• 标准字体：在「📚 分part稿整理/合并」中自动应用于第 3 列外文；留空表示保留原稿第 3 列自带字体。"
+                "所有语种与字体配置实时保存在同目录 languages.json 中（已内置《各语系字体》规范，如泰语 Angsana New 18/16/14pt）。\n"
+                "• 语种代码：用于定稿文件名前缀（如 GR_、TH_、PL_）及自动识别；标准字体留空表示保留原稿第 3 列字体。"
             ),
             foreground="#475569",
         )
-        tip.pack(fill=tk.X, pady=(0, 8))
+        tip.pack(side=tk.TOP, fill=tk.X, pady=(0, 8))
 
-        tbl_frame = ttk.Frame(wrap)
-        tbl_frame.pack(fill=tk.BOTH, expand=True, pady=(0, 10))
+        # Pack bottom action bar FIRST so bottom buttons NEVER clip
+        btns = ttk.Frame(wrap)
+        btns.pack(side=tk.BOTTOM, fill=tk.X)
 
-        cols = ("code", "name", "font", "keywords")
-        self.tree = ttk.Treeview(tbl_frame, columns=cols, show="headings", selectmode="browse", height=11)
-        self.tree.heading("code", text="语种代码 (前缀)")
-        self.tree.heading("name", text="语种名称")
-        self.tree.heading("font", text="标准字体 (选填，如 Georgia / Angsana New)")
-        self.tree.heading("keywords", text="自动识别关键词（目录名 / 文件名包含任一词即可）")
+        ttk.Button(btns, text="关闭", command=self.destroy).pack(side=tk.RIGHT)
+        _make_primary_btn(btns, text="新增 / 保存语种", command=self._on_add_or_update).pack(
+            side=tk.LEFT, padx=(0, 8)
+        )
+        ttk.Button(btns, text="删除选中语种", command=self._on_delete).pack(side=tk.LEFT, padx=(0, 8))
+        ttk.Button(btns, text="补全内置默认语种", command=self._on_merge_defaults).pack(side=tk.LEFT, padx=(0, 8))
+        ttk.Button(btns, text="打开 languages.json", command=self._on_open_json).pack(side=tk.LEFT)
 
-        self.tree.column("code", width=110, anchor=tk.CENTER)
-        self.tree.column("name", width=120, anchor=tk.CENTER)
-        self.tree.column("font", width=215, anchor=tk.CENTER)
-        self.tree.column("keywords", width=310, anchor=tk.W)
-
-        vsb = ttk.Scrollbar(tbl_frame, orient=tk.VERTICAL, command=self.tree.yview)
-        self.tree.configure(yscrollcommand=vsb.set)
-        self.tree.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
-        vsb.pack(side=tk.RIGHT, fill=tk.Y)
-        self.tree.bind("<<TreeviewSelect>>", self._on_select_row)
+        tk.Frame(wrap, bg="#e2e8f0", height=1).pack(side=tk.BOTTOM, fill=tk.X, pady=(10, 10))
 
         form = ttk.LabelFrame(wrap, text=" 新增 / 修改语种与标准字体（点击上方列表行可直接载入编辑） ", padding=10)
-        form.pack(fill=tk.X, pady=(0, 8))
+        form.pack(side=tk.BOTTOM, fill=tk.X, pady=(0, 4))
         form.columnconfigure(5, weight=1)
 
         ttk.Label(form, text="语种代码(缩写)：").grid(row=0, column=0, sticky=tk.W, pady=4)
@@ -660,7 +960,7 @@ class LanguageManagerDialog(tk.Toplevel):
         ttk.Label(form, text="语种名称(中文)：").grid(row=0, column=2, sticky=tk.W, pady=4)
         ttk.Entry(form, textvariable=self.name_var, width=16).grid(row=0, column=3, sticky=tk.W, pady=4, padx=(4, 12))
 
-        ttk.Label(form, text="标准字体(选填，如 Georgia / Angsana New)：").grid(row=0, column=4, sticky=tk.W, pady=4)
+        ttk.Label(form, text="标准字体(选填)：").grid(row=0, column=4, sticky=tk.W, pady=4)
         self.font_cb = ttk.Combobox(
             form,
             textvariable=self.font_var,
@@ -673,20 +973,30 @@ class LanguageManagerDialog(tk.Toplevel):
         ttk.Entry(form, textvariable=self.kw_var).grid(row=1, column=1, columnspan=5, sticky=tk.EW, pady=4, padx=4)
         ttk.Label(
             form,
-            text="（多个关键词用逗号分隔，如：波兰语, 波语, 中英波, PO；标准字体留空则保留文档原字体）",
-            foreground="#64748b",
+            text="多个关键词用逗号分隔，如：波兰语, 波语, 中英波, PO；标准字体留空则保留文档原字体",
+            foreground="#475569",
         ).grid(row=2, column=1, columnspan=5, sticky=tk.W, padx=4)
 
-        btns = ttk.Frame(wrap)
-        btns.pack(fill=tk.X)
+        tbl_frame = ttk.Frame(wrap)
+        tbl_frame.pack(side=tk.TOP, fill=tk.BOTH, expand=True, pady=(0, 8))
 
-        ttk.Button(btns, text="➕ 新增 / 保存语种", style="Primary.TButton", command=self._on_add_or_update).pack(
-            side=tk.LEFT, padx=(0, 8)
-        )
-        ttk.Button(btns, text="🗑️ 删除选中语种", command=self._on_delete).pack(side=tk.LEFT, padx=(0, 8))
-        ttk.Button(btns, text="↺ 补全内置默认语种", command=self._on_merge_defaults).pack(side=tk.LEFT, padx=(0, 8))
-        ttk.Button(btns, text="📂 打开 languages.json", command=self._on_open_json).pack(side=tk.LEFT)
-        ttk.Button(btns, text="关闭", width=10, command=self.destroy).pack(side=tk.RIGHT)
+        cols = ("code", "name", "font", "keywords")
+        self.tree = ttk.Treeview(tbl_frame, columns=cols, show="headings", selectmode="browse", height=9)
+        self.tree.heading("code", text="语种代码 (前缀)")
+        self.tree.heading("name", text="语种名称")
+        self.tree.heading("font", text="标准字体 (如 Georgia / Angsana New)")
+        self.tree.heading("keywords", text="自动识别关键词（目录名 / 文件名包含任一词即可）")
+
+        self.tree.column("code", width=110, anchor=tk.CENTER)
+        self.tree.column("name", width=120, anchor=tk.CENTER)
+        self.tree.column("font", width=215, anchor=tk.CENTER)
+        self.tree.column("keywords", width=310, anchor=tk.W)
+
+        vsb = ttk.Scrollbar(tbl_frame, orient=tk.VERTICAL, command=self.tree.yview)
+        self.tree.configure(yscrollcommand=vsb.set)
+        self.tree.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+        vsb.pack(side=tk.RIGHT, fill=tk.Y)
+        self.tree.bind("<<TreeviewSelect>>", self._on_select_row)
 
     def _refresh_tree(self):
         for item in self.tree.get_children():
@@ -829,11 +1139,9 @@ class AmbiguousArticleDialog(tk.Toplevel):
 
     def __init__(self, parent: tk.Tk, ambiguous_items: list[dict], resolved_count: int = 0):
         super().__init__(parent)
+        self.withdraw()
         self.title("多篇同名标题选择确认（请勾选本次需要提取对比的具体篇目）")
-        self.geometry("820x560")
-        self.minsize(700, 440)
         self.transient(parent)
-        self.grab_set()
 
         self.ambiguous_items = ambiguous_items or []
         self.resolved_count = resolved_count
@@ -846,6 +1154,12 @@ class AmbiguousArticleDialog(tk.Toplevel):
         self._build_ui()
         self._update_count()
         self.protocol("WM_DELETE_WINDOW", self._on_cancel)
+        _fit_and_center_window(self, base_w=820, base_h=560, min_w=700, min_h=440, parent=parent)
+        self.deiconify()
+        try:
+            self.grab_set()
+        except tk.TclError:
+            pass
 
     @staticmethod
     def _format_candidate_label(cand: dict) -> str:
@@ -871,7 +1185,7 @@ class AmbiguousArticleDialog(tk.Toplevel):
         return " / ".join(parts) if parts else str(cand)
 
     def _build_ui(self):
-        wrap = ttk.Frame(self, padding=12)
+        wrap = ttk.Frame(self, padding=14)
         wrap.pack(fill=tk.BOTH, expand=True)
 
         extra_note = (
@@ -883,12 +1197,34 @@ class AmbiguousArticleDialog(tk.Toplevel):
                 f"检测到以下搜索标题在中英底稿目录中对应多篇不同卷/分部的同名篇目{extra_note}。\n"
                 "请勾选您本次实际需要提取对比的篇目（支持单选或多选），确认后将逐篇独立导出完整版与仅改点版："
             ),
-            foreground="#1e293b",
+            foreground="#0f172a",
             font=("Microsoft YaHei UI", 9, "bold"),
-        ).pack(fill=tk.X, pady=(0, 8))
+        ).pack(side=tk.TOP, fill=tk.X, pady=(0, 8))
+
+        # Pack bottom action bar FIRST so bottom buttons NEVER clip
+        bot = ttk.Frame(wrap)
+        bot.pack(side=tk.BOTTOM, fill=tk.X)
+
+        ttk.Button(bot, text="取消任务", command=self._on_cancel).pack(side=tk.RIGHT)
+        _make_primary_btn(
+            bot,
+            text="确认选择并继续对比",
+            command=self._on_confirm,
+        ).pack(side=tk.RIGHT, padx=(0, 8))
+
+        ttk.Button(bot, text="全选全部候选", command=lambda: self._set_all(True)).pack(side=tk.LEFT, padx=(0, 6))
+        ttk.Button(bot, text="清空全部勾选", command=lambda: self._set_all(False)).pack(side=tk.LEFT, padx=(0, 12))
+        ttk.Label(
+            bot,
+            textvariable=self.count_var,
+            font=("Microsoft YaHei UI", 9, "bold"),
+            foreground="#1d4ed8",
+        ).pack(side=tk.LEFT)
+
+        tk.Frame(wrap, bg="#e2e8f0", height=1).pack(side=tk.BOTTOM, fill=tk.X, pady=(10, 10))
 
         list_outer = ttk.Frame(wrap, relief=tk.SOLID, borderwidth=1)
-        list_outer.pack(fill=tk.BOTH, expand=True, pady=(0, 10))
+        list_outer.pack(side=tk.TOP, fill=tk.BOTH, expand=True, pady=(0, 4))
 
         self.canvas = tk.Canvas(list_outer, bg="#f8fafc", highlightthickness=0)
         vsb = ttk.Scrollbar(list_outer, orient=tk.VERTICAL, command=self.canvas.yview)
@@ -914,7 +1250,7 @@ class AmbiguousArticleDialog(tk.Toplevel):
 
             grp = ttk.LabelFrame(
                 self.scroll_inner,
-                text=f" 🔎 搜索标题：「{q_str}」（匹配到 {len(cands)} 篇候选） ",
+                text=f" 搜索标题：「{q_str}」（匹配到 {len(cands)} 篇候选） ",
                 padding=8,
             )
             grp.pack(fill=tk.X, pady=(0, 8))
@@ -924,13 +1260,11 @@ class AmbiguousArticleDialog(tk.Toplevel):
             ttk.Button(
                 grp_bar,
                 text="全选本组",
-                width=10,
                 command=lambda gk=group_key: self._set_group(gk, True),
             ).pack(side=tk.LEFT, padx=(0, 6))
             ttk.Button(
                 grp_bar,
                 text="清空本组",
-                width=10,
                 command=lambda gk=group_key: self._set_group(gk, False),
             ).pack(side=tk.LEFT)
 
@@ -945,26 +1279,6 @@ class AmbiguousArticleDialog(tk.Toplevel):
                 )
                 cb.pack(fill=tk.X, anchor=tk.W, pady=2)
                 self._cand_records.append((var, cand, group_key))
-
-        bot = ttk.Frame(wrap)
-        bot.pack(fill=tk.X)
-
-        ttk.Button(bot, text="☑️ 全选全部候选", command=lambda: self._set_all(True)).pack(side=tk.LEFT, padx=(0, 6))
-        ttk.Button(bot, text="🧹 清空全部勾选", command=lambda: self._set_all(False)).pack(side=tk.LEFT, padx=(0, 12))
-        ttk.Label(
-            bot,
-            textvariable=self.count_var,
-            font=("Microsoft YaHei UI", 9, "bold"),
-            foreground="#1d4ed8",
-        ).pack(side=tk.LEFT)
-
-        ttk.Button(bot, text="取消任务", width=10, command=self._on_cancel).pack(side=tk.RIGHT)
-        ttk.Button(
-            bot,
-            text="✅ 确认选择并继续对比",
-            style="Primary.TButton",
-            command=self._on_confirm,
-        ).pack(side=tk.RIGHT, padx=(0, 8))
 
     def _set_group(self, group_key: str, val: bool):
         for var, _cand, gk in self._cand_records:
@@ -1008,11 +1322,9 @@ class SoftwareUpdateDialog(tk.Toplevel):
 
     def __init__(self, parent: tk.Tk, app: "ScatteredRevisionApp", initial_info: dict | None = None):
         super().__init__(parent)
+        self.withdraw()
         self.title(f"检查软件更新（当前版本：{APP_VERSION}）")
-        self.geometry("660x480")
-        self.minsize(580, 420)
         self.transient(parent)
-        self.grab_set()
 
         self.app = app
         self.update_info: dict | None = initial_info
@@ -1024,6 +1336,12 @@ class SoftwareUpdateDialog(tk.Toplevel):
         self.prog_var = tk.DoubleVar(value=0.0)
 
         self._build_ui()
+        _fit_and_center_window(self, base_w=680, base_h=480, min_w=580, min_h=400, parent=parent)
+        self.deiconify()
+        try:
+            self.grab_set()
+        except tk.TclError:
+            pass
         self._poll_queue()
 
         if self.update_info is not None:
@@ -1038,17 +1356,44 @@ class SoftwareUpdateDialog(tk.Toplevel):
         self.lbl_header = ttk.Label(
             wrap,
             textvariable=self.header_var,
-            font=("Microsoft YaHei UI", 11, "bold"),
+            font=("Microsoft YaHei UI", 10, "bold"),
             foreground="#1d4ed8",
         )
-        self.lbl_header.pack(fill=tk.X, pady=(0, 8))
+        self.lbl_header.pack(side=tk.TOP, fill=tk.X, pady=(0, 8))
+
+        # Pack bottom action bar FIRST so bottom buttons NEVER clip
+        btns = ttk.Frame(wrap)
+        btns.pack(side=tk.BOTTOM, fill=tk.X)
+
+        ttk.Button(btns, text="关闭", command=self.destroy).pack(side=tk.RIGHT)
+        self.btn_apply = _make_primary_btn(
+            btns,
+            text="立即下载更新并自动重启",
+            state=tk.DISABLED,
+            command=self._start_download_and_apply,
+        )
+        self.btn_apply.pack(side=tk.RIGHT, padx=(0, 8))
+
+        self.btn_recheck = ttk.Button(btns, text="重新检查", command=self._start_check)
+        self.btn_recheck.pack(side=tk.LEFT, padx=(0, 8))
+
+        self.btn_open_web = ttk.Button(btns, text="打开 GitHub 发布页", command=self._open_release_webpage)
+        self.btn_open_web.pack(side=tk.LEFT)
+
+        tk.Frame(wrap, bg="#e2e8f0", height=1).pack(side=tk.BOTTOM, fill=tk.X, pady=(10, 10))
+
+        prog_box = ttk.Frame(wrap)
+        prog_box.pack(side=tk.BOTTOM, fill=tk.X, pady=(0, 4))
+        ttk.Label(prog_box, textvariable=self.status_var, foreground="#475569").pack(fill=tk.X, pady=(0, 4))
+        self.prog_bar = ttk.Progressbar(prog_box, mode="determinate", maximum=100.0, variable=self.prog_var)
+        self.prog_bar.pack(fill=tk.X)
 
         notes_frame = ttk.LabelFrame(wrap, text=" 版本更新说明 (Release Notes) ", padding=8)
-        notes_frame.pack(fill=tk.BOTH, expand=True, pady=(0, 10))
+        notes_frame.pack(side=tk.TOP, fill=tk.BOTH, expand=True, pady=(0, 8))
 
         self.notes_text = tk.Text(
             notes_frame,
-            height=11,
+            height=9,
             wrap=tk.WORD,
             font=("Microsoft YaHei UI", 9),
             bg="#f8fafc",
@@ -1062,31 +1407,6 @@ class SoftwareUpdateDialog(tk.Toplevel):
         self.notes_text.configure(yscrollcommand=vsb.set)
         self.notes_text.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
         vsb.pack(side=tk.RIGHT, fill=tk.Y)
-
-        prog_box = ttk.Frame(wrap)
-        prog_box.pack(fill=tk.X, pady=(0, 10))
-        ttk.Label(prog_box, textvariable=self.status_var, foreground="#475569").pack(fill=tk.X, pady=(0, 4))
-        self.prog_bar = ttk.Progressbar(prog_box, mode="determinate", maximum=100.0, variable=self.prog_var)
-        self.prog_bar.pack(fill=tk.X)
-
-        btns = ttk.Frame(wrap)
-        btns.pack(fill=tk.X)
-
-        self.btn_recheck = ttk.Button(btns, text="🔄 重新检查", command=self._start_check)
-        self.btn_recheck.pack(side=tk.LEFT, padx=(0, 8))
-
-        self.btn_open_web = ttk.Button(btns, text="🌐 打开 GitHub 发布页", command=self._open_release_webpage)
-        self.btn_open_web.pack(side=tk.LEFT)
-
-        ttk.Button(btns, text="关闭", width=9, command=self.destroy).pack(side=tk.RIGHT)
-        self.btn_apply = ttk.Button(
-            btns,
-            text="⚡ 立即下载更新并自动重启",
-            style="Primary.TButton",
-            state=tk.DISABLED,
-            command=self._start_download_and_apply,
-        )
-        self.btn_apply.pack(side=tk.RIGHT, padx=(0, 8))
 
     def _set_notes(self, content: str):
         self.notes_text.configure(state=tk.NORMAL)
@@ -1111,15 +1431,15 @@ class SoftwareUpdateDialog(tk.Toplevel):
         latest_v = str(info.get("latest_version") or RAW_APP_VERSION).lstrip("vV")
         notes = str(info.get("release_notes") or "").strip()
         if has_upd:
-            self.header_var.set(f"🎉 发现新版本 v{latest_v}！（当前版本：{APP_VERSION}）")
+            self.header_var.set(f"发现新版本 v{latest_v}（当前版本：{APP_VERSION}）")
             self.lbl_header.configure(foreground="#1d4ed8")
             self.status_var.set("更新时将自动校验 SHA-256 签名，并完整保留您本机的 API Key 池与语种设置。")
             self.prog_var.set(0.0)
             self._set_notes(notes)
-            self.btn_apply.configure(state=tk.NORMAL, text="⚡ 立即下载更新并自动重启")
+            self.btn_apply.configure(state=tk.NORMAL, text="立即下载更新并自动重启")
             self.app._show_update_banner(info)
         else:
-            self.header_var.set(f"✅ 当前已是最新版本（v{latest_v}）！")
+            self.header_var.set(f"当前已是最新版本（v{latest_v}）")
             self.lbl_header.configure(foreground="#15803d")
             self.status_var.set("无需更新。")
             self.prog_var.set(100.0)
@@ -1130,7 +1450,7 @@ class SoftwareUpdateDialog(tk.Toplevel):
         if self._busy:
             return
         if not callable(check_for_updates):
-            self.header_var.set("⚠️ 更新组件未就绪")
+            self.header_var.set("更新组件未就绪")
             self.lbl_header.configure(foreground="#b45309")
             self._set_notes(f"当前环境未加载 updater 模块，请直接前往 GitHub Releases 页面查看：\n{GITHUB_RELEASES_URL}")
             return
@@ -1139,7 +1459,7 @@ class SoftwareUpdateDialog(tk.Toplevel):
         self.btn_recheck.configure(state=tk.DISABLED)
         self.btn_apply.configure(state=tk.DISABLED)
         self.prog_var.set(15.0)
-        self.header_var.set("⏳ 正在连接 GitHub 检查最新版本...")
+        self.header_var.set("正在连接 GitHub 检查最新版本...")
         self.lbl_header.configure(foreground="#1d4ed8")
         self.status_var.set("正在请求 GitHub Releases 接口...")
         self._set_notes("正在获取最新版本信息，请稍候...")
@@ -1169,7 +1489,7 @@ class SoftwareUpdateDialog(tk.Toplevel):
 
         self._busy = True
         self.btn_recheck.configure(state=tk.DISABLED)
-        self.btn_apply.configure(state=tk.DISABLED, text="⏳ 正在下载更新...")
+        self.btn_apply.configure(state=tk.DISABLED, text="正在下载更新...")
         self.prog_var.set(2.0)
         self.status_var.set("正在准备下载更新包...")
 
@@ -1205,12 +1525,12 @@ class SoftwareUpdateDialog(tk.Toplevel):
                     self._busy = False
                     self.btn_recheck.configure(state=tk.NORMAL)
                     self.prog_var.set(0.0)
-                    self.header_var.set("⚠️ 检查更新失败（可点击下方按钮在浏览器查看）")
+                    self.header_var.set("检查更新失败（可点击下方按钮在浏览器查看）")
                     self.lbl_header.configure(foreground="#b91c1c")
                     self.status_var.set(str(payload))
                     self._set_notes(
                         f"无法连接 GitHub 检查更新：{payload}\n\n"
-                        f"您可以检查网络连接后点击「🔄 重新检查」，或点击「🌐 打开 GitHub 发布页」手动下载最新版：\n{GITHUB_RELEASES_URL}"
+                        f"您可以检查网络连接后点击「重新检查」，或点击「打开 GitHub 发布页」手动下载最新版：\n{GITHUB_RELEASES_URL}"
                     )
                 elif kind == "dl_prog":
                     pct, msg = payload
@@ -1221,14 +1541,14 @@ class SoftwareUpdateDialog(tk.Toplevel):
                     self.prog_var.set(100.0)
                     res = payload if isinstance(payload, dict) else {}
                     if res.get("ready_to_restart"):
-                        self.status_var.set("✅ 更新包 SHA-256 校验通过！正在保存配置并自动重启新版本...")
+                        self.status_var.set("更新包 SHA-256 校验通过！正在保存配置并自动重启新版本...")
                         self.app._save_settings()
                         self.after(350, self.app._on_close)
                         return
                     else:
                         staged = str(res.get("staged_exe") or "")
                         self.btn_recheck.configure(state=tk.NORMAL)
-                        self.status_var.set("✅ 已在源码模式下完成新版 EXE 下载校验。")
+                        self.status_var.set("已在源码模式下完成新版 EXE 下载校验。")
                         messagebox.showinfo(
                             "下载完成（源码运行模式）",
                             "当前以 Python 源码方式运行，已为您下载并校验最新独立版 EXE：\n\n"
@@ -1239,11 +1559,11 @@ class SoftwareUpdateDialog(tk.Toplevel):
                 elif kind == "dl_err":
                     self._busy = False
                     self.btn_recheck.configure(state=tk.NORMAL)
-                    self.btn_apply.configure(state=tk.NORMAL, text="⚡ 立即下载更新并自动重启")
-                    self.status_var.set(f"❌ 自动更新失败：{payload}")
+                    self.btn_apply.configure(state=tk.NORMAL, text="立即下载更新并自动重启")
+                    self.status_var.set(f"自动更新失败：{payload}")
                     messagebox.showerror(
                         "自动更新失败",
-                        f"{payload}\n\n您可点击「🌐 打开 GitHub 发布页」通过浏览器下载最新压缩包。",
+                        f"{payload}\n\n您可点击「打开 GitHub 发布页」通过浏览器下载最新压缩包。",
                         parent=self,
                     )
         finally:
@@ -1252,13 +1572,19 @@ class SoftwareUpdateDialog(tk.Toplevel):
 
 
 class ScatteredRevisionApp:
+    _SECTION_TITLES: dict[str, str] = {
+        "main": "零散改点整理",
+        "fa": "全篇改点整理",
+        "dd": "改点稿查重",
+        "wc": "英文字数统计",
+        "fel": "分part稿整理/合并",
+    }
+
     def __init__(self, root: tk.Tk):
         self.root = root
         self.root.title(
-            f"零散改点自动整理工具 {APP_VERSION}  (零散改点 · 全篇对比 · 改点查重 · 英文字数统计 · 分part稿整理/合并)"
+            f"多语种整理工作台 {APP_VERSION}  (零散改点 · 全篇对比 · 改点查重 · 英文字数统计 · 分part稿整理/合并)"
         )
-        self.root.geometry("1160x860")
-        self.root.minsize(1020, 720)
 
         self.log_queue: queue.Queue = queue.Queue()
         self.is_running = False
@@ -1275,6 +1601,11 @@ class ScatteredRevisionApp:
         self._fel_inspect_cache: dict[str, dict] = {}
         self.active_tab_key: str = "main"
         self._nav_items: dict = {}
+        self._nav_sb_visible: bool = False
+        self._sidebar_hover: bool = False
+        self.key_entry = None
+        self.fa_pool_btn = None
+        self.fel_pool_btn = None
         self._indexing_lock = threading.Lock()
         self._indexing_inflight: set[str] = set()
         self._last_typed_lib_norm: str = ""
@@ -1293,6 +1624,7 @@ class ScatteredRevisionApp:
         self._build_ui()
         self._setup_drag_and_drop()
         self._refresh_key_pool_badge()
+        _fit_and_center_window(self.root, base_w=1180, base_h=820, min_w=1040, min_h=680, parent=None)
         self.root.protocol("WM_DELETE_WINDOW", self._on_close)
         self._poll_log_queue()
         self._tick_elapsed_timer()
@@ -1335,22 +1667,25 @@ class ScatteredRevisionApp:
         tab_font = ("Microsoft YaHei UI", 10, "bold")
 
         self.root.option_add("*Font", default_font)
-        style.configure("TLabelframe.Label", font=bold_font, foreground="#1a56db")
-        style.configure("Primary.TButton", font=btn_font, padding=(12, 6))
-        style.configure("Action.TButton", font=default_font, padding=(10, 5))
+        style.configure("TLabelframe.Label", font=bold_font, foreground="#1d4ed8")
+        style.configure("TButton", font=default_font, padding=(12, 5))
+        style.configure("Action.TButton", font=default_font, padding=(12, 5))
+        style.configure("Compact.TButton", font=default_font, padding=(10, 4))
+        style.configure("Primary.TButton", font=btn_font, padding=(14, 6))
         style.configure("TNotebook.Tab", font=tab_font, padding=(16, 7))
 
     def _init_vars(self):
-        # Shared API vars
+        # Global workbench & shared API vars
+        self.active_section_title_var = tk.StringVar(value=self._SECTION_TITLES["main"])
         self.api_mode_label = tk.StringVar(value=API_MODES[0][0])
         self.rotation_label = tk.StringVar(value=ROTATION_MODES[0][0])
         self.api_key_var = tk.StringVar(value="")
-        self.pool_btn_text_var = tk.StringVar(value="🔑 批量管理 Key (0 个)")
+        self.pool_btn_text_var = tk.StringVar(value="API 密钥池 (0 个)")
         self.show_key_var = tk.BooleanVar(value=False)
         self.remember_key_var = tk.BooleanVar(value=True)
         self.model_label = tk.StringVar(value=SUPPORTED_MODELS[0][0])
 
-        # Tab 1: Scattered Revision (📝 零散改点整理)
+        # Tab 1: Scattered Revision (零散改点整理)
         self.input_docx_var = tk.StringVar(value="")
         self.library_dir_var = tk.StringVar(value="")
         self.output_dir_var = tk.StringVar(value="")
@@ -1365,10 +1700,10 @@ class ScatteredRevisionApp:
         self.sc1_dedup_dir_var = tk.StringVar(value=str(self.settings.get("sc1_dedup_dir", "")))
 
         self.progress_var = tk.DoubleVar(value=0.0)
-        self.stage_var = tk.StringVar(value="状态：就绪（请选择文档与目录后点击「⚡ 一键输出定稿」）")
+        self.stage_var = tk.StringVar(value="状态：就绪（请选择文档与目录后点击「一键输出定稿」）")
         self.pct_timer_var = tk.StringVar(value="0%")
 
-        # Tab 2: Full-Article Revision (📖 全篇改点整理)
+        # Tab 2: Full-Article Revision (全篇改点整理)
         self.fa_master_dir_var = tk.StringVar(value=str(self.settings.get("fa_master_dir", "")))
         self.fa_library_dir_var = tk.StringVar(value=str(self.settings.get("fa_library_dir", "")))
         self.fa_output_dir_var = tk.StringVar(value=str(self.settings.get("fa_output_dir", "")))
@@ -1384,7 +1719,7 @@ class ScatteredRevisionApp:
         self.fa_stage_var = tk.StringVar(value="状态：就绪（粘贴或导入篇目标题并设定目录后点击开始）")
         self.fa_pct_timer_var = tk.StringVar(value="0%")
 
-        # Tab 3: Standalone Dedup Checker (🔍 改点稿查重)
+        # Tab 3: Standalone Dedup Checker (改点稿查重)
         self.dd_pkg_dir_var = tk.StringVar(value=str(self.settings.get("dd_pkg_dir", "")))
         self.dd_out_dir_var = tk.StringVar(value=str(self.settings.get("dd_out_dir", "")))
         self.dd_export_deduped_var = tk.BooleanVar(value=bool(self.settings.get("dd_export_deduped", True)))
@@ -1396,7 +1731,7 @@ class ScatteredRevisionApp:
         self.dd_stage_var = tk.StringVar(value="状态：就绪（拖入待查重文档并选择未入库改点包目录后开始查重）")
         self.dd_pct_timer_var = tk.StringVar(value="0%")
 
-        # Tab 4: English Word Count & Renamer (🔢 英文字数统计)
+        # Tab 4: English Word Count & Renamer (英文字数统计)
         self.wc_lang_var = tk.StringVar(value=AUTO_COMBO_LABEL)
         self.wc_keep_existing_lang_var = tk.BooleanVar(value=True)
         self.wc_date_var = tk.StringVar(value=datetime.now().strftime("%Y%m%d"))
@@ -1411,7 +1746,7 @@ class ScatteredRevisionApp:
             value="当前共 0 份文档  |  第 2 列英文合计：UP 0 words, RV 0 words"
         )
 
-        # Tab 5: Part Manuscript Formatting & Merging (📚 分part稿整理/合并)
+        # Tab 5: Part Manuscript Formatting & Merging (分part稿整理/合并)
         self.fel_output_dir_var = tk.StringVar(value="")
         self.fel_lang_var = tk.StringVar(value=AUTO_COMBO_LABEL)
         self.fel_tri_prefix_var = tk.StringVar(value="")
@@ -1455,7 +1790,7 @@ class ScatteredRevisionApp:
 
     def _refresh_key_pool_badge(self):
         n = len(self._get_all_keys_list())
-        self.pool_btn_text_var.set(f"🔑 批量管理 Key ({n} 个)")
+        self.pool_btn_text_var.set(f"API 密钥池 ({n} 个)")
 
     def _get_api_mode_code(self) -> str:
         lbl = self.api_mode_label.get().strip()
@@ -1674,139 +2009,194 @@ class ScatteredRevisionApp:
     # ---------------- UI Construction ----------------
 
     def _build_ui(self):
-        outer = tk.Frame(self.root)
+        outer = tk.Frame(self.root, bg="#ffffff")
         outer.pack(fill=tk.BOTH, expand=True)
 
-        # Left Navigation Sidebar (5 Sections + Bottom Version & Update Checker)
-        self.sidebar = tk.Frame(
-            outer,
-            bg="#ffffff",
-            width=216,
-            highlightbackground="#cbd5e1",
-            highlightthickness=1,
-        )
+        try:
+            dpi_scale = max(1.0, float(self.root.winfo_fpixels("1i")) / 96.0)
+        except Exception:
+            dpi_scale = 1.0
+        sidebar_w = int(round(212 * dpi_scale))
+
+        # Left Scalable Sidebar (DPI-scaled 212pt logical width, #f8fafc surface + crisp 1px #cbd5e1 right border)
+        self.sidebar = tk.Frame(outer, bg="#f8fafc", width=sidebar_w)
         self.sidebar.pack(side=tk.LEFT, fill=tk.Y)
         self.sidebar.pack_propagate(False)
 
-        brand_box = tk.Frame(self.sidebar, bg="#ffffff", padx=14, pady=12)
-        brand_box.pack(fill=tk.X)
+        tk.Frame(outer, bg="#cbd5e1", width=1).pack(side=tk.LEFT, fill=tk.Y)
+
+        # Top Compact Brand Header
+        brand_box = tk.Frame(self.sidebar, bg="#f8fafc", padx=12, pady=12)
+        brand_box.pack(side=tk.TOP, fill=tk.X)
         tk.Label(
             brand_box,
-            text="多语种改点整理工具",
-            font=("Microsoft YaHei UI", 11, "bold"),
+            text=APP_VERSION,
+            font=("Consolas", 8, "bold"),
+            fg="#1d4ed8",
+            bg="#dbeafe",
+            padx=6,
+            pady=1,
+        ).pack(side=tk.RIGHT)
+        tk.Label(
+            brand_box,
+            text="多语种整理工作台",
+            font=("Microsoft YaHei UI", 10, "bold"),
             fg="#0f172a",
-            bg="#ffffff",
+            bg="#f8fafc",
             anchor=tk.W,
-        ).pack(fill=tk.X)
+        ).pack(side=tk.LEFT, fill=tk.X, expand=True)
+
+        tk.Frame(self.sidebar, bg="#e2e8f0", height=1).pack(side=tk.TOP, fill=tk.X, padx=12, pady=(0, 4))
+
+        # Bottom Anchored Footer (packed BEFORE middle scrollable nav so it NEVER clips)
+        sidebar_footer = tk.Frame(self.sidebar, bg="#f8fafc", padx=12, pady=10)
+        sidebar_footer.pack(side=tk.BOTTOM, fill=tk.X)
+        tk.Frame(sidebar_footer, bg="#e2e8f0", height=1).pack(fill=tk.X, pady=(0, 8))
         tk.Label(
-            brand_box,
-            text=f"{APP_VERSION} · 支持文件/文件夹拖拽",
+            sidebar_footer,
+            text="支持拖拽文件或目录至窗口",
             font=("Microsoft YaHei UI", 8),
-            fg="#64748b",
-            bg="#ffffff",
+            fg="#475569",
+            bg="#f8fafc",
             anchor=tk.W,
-        ).pack(fill=tk.X, pady=(2, 0))
-
-        tk.Frame(self.sidebar, bg="#e2e8f0", height=1).pack(fill=tk.X, padx=12, pady=(0, 8))
-
-        tk.Label(
-            self.sidebar,
-            text="功能工作台（5 大板块）",
-            font=("Microsoft YaHei UI", 8, "bold"),
-            fg="#64748b",
-            bg="#ffffff",
-            anchor=tk.W,
-            padx=14,
-        ).pack(fill=tk.X, pady=(0, 4))
-
-        self.nav_btn_main = self._create_sidebar_tab(
-            key="main",
-            title="📝 零散改点整理",
-            subtitle="一键定稿 · 自动建库 · 查重拉齐",
-        )
-        self.nav_btn_fa = self._create_sidebar_tab(
-            key="fa",
-            title="📖 全篇改点整理",
-            subtitle="按标题提取 · 全章对比 · 逐篇导出",
-        )
-        self.nav_btn_dd = self._create_sidebar_tab(
-            key="dd",
-            title="🔍 改点稿查重",
-            subtitle="第一列四级查重 · 报告与去重稿",
-        )
-        self.nav_btn_wc = self._create_sidebar_tab(
-            key="wc",
-            title="🔢 英文字数统计",
-            subtitle="三模重命名 · 0词省略 · 说明行",
-        )
-        self.nav_btn_fel = self._create_sidebar_tab(
-            key="fel",
-            title="📚 分part稿整理/合并",
-            subtitle="多篇/单篇多Part合并 · 蓝红同步",
-        )
-
-        # Bottom Version + Update Button Box (packed BOTTOM first so it anchors at very bottom)
-        upd_box = tk.Frame(
-            self.sidebar,
-            bg="#ffffff",
-            padx=10,
-            pady=10,
-        )
-        upd_box.pack(side=tk.BOTTOM, fill=tk.X)
-        tk.Frame(upd_box, bg="#e2e8f0", height=1).pack(fill=tk.X, pady=(0, 8))
-        ver_row = tk.Frame(upd_box, bg="#ffffff")
-        ver_row.pack(fill=tk.X, pady=(0, 6))
-        tk.Label(
-            ver_row,
-            text=f"当前版本：{APP_VERSION}",
-            font=("Consolas", 9, "bold"),
-            fg="#334155",
-            bg="#ffffff",
-            anchor=tk.W,
-        ).pack(side=tk.LEFT)
+        ).pack(fill=tk.X, pady=(0, 6))
         self.btn_check_update = ttk.Button(
-            upd_box,
-            text="🔄 检查软件更新",
+            sidebar_footer,
+            text="检查软件更新",
             command=self._on_manual_check_update,
         )
         self.btn_check_update.pack(fill=tk.X)
 
-        # Drag & Drop quick tip card above bottom update box
-        dnd_tip_card = tk.Frame(
-            self.sidebar,
-            bg="#f8fafc",
-            highlightbackground="#cbd5e1",
-            highlightthickness=1,
-            padx=10,
-            pady=8,
-        )
-        dnd_tip_card.pack(side=tk.BOTTOM, fill=tk.X, padx=10, pady=(4, 2))
-        tk.Label(
-            dnd_tip_card,
-            text="📥 全局拖拽支持",
-            font=("Microsoft YaHei UI", 8, "bold"),
-            fg="#1d4ed8",
-            bg="#f8fafc",
-            anchor=tk.W,
-        ).pack(fill=tk.X)
-        tk.Label(
-            dnd_tip_card,
-            text="直接将 .docx / .txt 或文件夹拖入右侧任意输入框、列表或左侧标签即可载入。",
-            font=("Microsoft YaHei UI", 8),
-            fg="#475569",
-            bg="#f8fafc",
-            justify=tk.LEFT,
-            anchor=tk.W,
-            wraplength=184,
-        ).pack(fill=tk.X, pady=(3, 0))
+        # Middle Scrollable Navigation List (auto-hiding scrollbar + mousewheel when hovered)
+        nav_host = tk.Frame(self.sidebar, bg="#f8fafc")
+        nav_host.pack(side=tk.TOP, fill=tk.BOTH, expand=True)
+
+        self.nav_canvas = tk.Canvas(nav_host, bg="#f8fafc", highlightthickness=0, bd=0)
+        self.nav_vsb = ttk.Scrollbar(nav_host, orient=tk.VERTICAL, command=self.nav_canvas.yview)
+        self.nav_inner = tk.Frame(self.nav_canvas, bg="#f8fafc", padx=8, pady=2)
+        self._nav_canvas_win = self.nav_canvas.create_window((0, 0), window=self.nav_inner, anchor="nw")
+        self.nav_canvas.configure(yscrollcommand=self.nav_vsb.set)
+        self.nav_canvas.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+
+        def _sync_nav_scroll(_event=None):
+            if not self.nav_canvas.winfo_exists():
+                return
+            self.nav_canvas.configure(scrollregion=self.nav_canvas.bbox("all"))
+            req_h = int(self.nav_inner.winfo_reqheight())
+            vis_h = int(self.nav_canvas.winfo_height())
+            need_sb = vis_h > 24 and req_h > (vis_h + 2)
+            if need_sb and not self._nav_sb_visible:
+                self.nav_vsb.pack(side=tk.RIGHT, fill=tk.Y)
+                self._nav_sb_visible = True
+            elif not need_sb and self._nav_sb_visible:
+                self.nav_vsb.pack_forget()
+                self._nav_sb_visible = False
+
+        def _on_nav_canvas_cfg(event):
+            self.nav_canvas.itemconfigure(self._nav_canvas_win, width=event.width)
+            _sync_nav_scroll()
+
+        self.nav_inner.bind("<Configure>", _sync_nav_scroll)
+        self.nav_canvas.bind("<Configure>", _on_nav_canvas_cfg)
+
+        def _on_sidebar_wheel(event):
+            if not self._nav_sb_visible or not self.nav_canvas.winfo_exists():
+                return
+            delta = int(getattr(event, "delta", 0))
+            if delta:
+                step = -1 if delta > 0 else 1
+                self.nav_canvas.yview_scroll(step, "units")
+
+        def _bind_sidebar_wheel(_e=None):
+            self._sidebar_hover = True
+            self.nav_canvas.bind_all("<MouseWheel>", _on_sidebar_wheel)
+
+        def _unbind_sidebar_wheel(_e=None):
+            self._sidebar_hover = False
+            self.nav_canvas.unbind_all("<MouseWheel>")
+
+        nav_host.bind("<Enter>", _bind_sidebar_wheel)
+        nav_host.bind("<Leave>", _unbind_sidebar_wheel)
+
+        self._create_sidebar_group_header("核心改点与查重", first=True)
+        self.nav_btn_main = self._create_sidebar_tab(key="main", title="零散改点整理")
+        self.nav_btn_fa = self._create_sidebar_tab(key="fa", title="全篇改点整理")
+        self.nav_btn_dd = self._create_sidebar_tab(key="dd", title="改点稿查重")
+
+        self._create_sidebar_group_header("字数与分篇定稿", first=False)
+        self.nav_btn_wc = self._create_sidebar_tab(key="wc", title="英文字数统计")
+        self.nav_btn_fel = self._create_sidebar_tab(key="fel", title="分part稿整理/合并")
 
         # Right Content Area
-        self.content_area = ttk.Frame(outer, padding=(10, 8, 10, 8))
+        self.content_area = ttk.Frame(outer, padding=(12, 8, 12, 10))
         self.content_area.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
-        self.content_area.rowconfigure(1, weight=1)
+        self.content_area.rowconfigure(2, weight=1)
         self.content_area.columnconfigure(0, weight=1)
 
-        # Row 0: Sleek Top Update Notification Bar (hidden unless new version found)
+        # Row 0: Global Compact Top Bar (44px) — shared across ALL modules
+        self.top_toolbar = tk.Frame(
+            self.content_area,
+            bg="#f8fafc",
+            highlightbackground="#e2e8f0",
+            highlightthickness=1,
+            padx=12,
+            pady=6,
+        )
+        self.top_toolbar.grid(row=0, column=0, sticky=tk.EW, pady=(0, 8))
+
+        # Pack right-side shared controls FIRST so buttons never clip horizontally
+        self.top_lang_btn = ttk.Button(
+            self.top_toolbar,
+            text="语种与字体库",
+            style="Compact.TButton",
+            command=self._open_lang_manager,
+        )
+        self.top_lang_btn.pack(side=tk.RIGHT)
+
+        self.pool_btn = ttk.Button(
+            self.top_toolbar,
+            textvariable=self.pool_btn_text_var,
+            style="Compact.TButton",
+            command=self._open_key_pool_dialog,
+        )
+        self.pool_btn.pack(side=tk.RIGHT, padx=(0, 6))
+
+        self.test_btn = ttk.Button(
+            self.top_toolbar,
+            text="测试连接",
+            style="Compact.TButton",
+            command=self._on_test_api,
+        )
+        self.test_btn.pack(side=tk.RIGHT, padx=(0, 6))
+
+        self.top_model_cb = ttk.Combobox(
+            self.top_toolbar,
+            textvariable=self.model_label,
+            values=[m[0] for m in SUPPORTED_MODELS],
+            state="readonly",
+            width=31,
+        )
+        self.top_model_cb.pack(side=tk.RIGHT, padx=(0, 8))
+        self.top_model_cb.bind("<<ComboboxSelected>>", lambda _e: self._save_settings())
+
+        tk.Label(
+            self.top_toolbar,
+            text="模型：",
+            font=("Microsoft YaHei UI", 9),
+            fg="#334155",
+            bg="#f8fafc",
+        ).pack(side=tk.RIGHT, padx=(0, 2))
+
+        tk.Label(
+            self.top_toolbar,
+            textvariable=self.active_section_title_var,
+            font=("Microsoft YaHei UI", 10, "bold"),
+            fg="#0f172a",
+            bg="#f8fafc",
+            anchor=tk.W,
+        ).pack(side=tk.LEFT, fill=tk.X, expand=True)
+
+        # Row 1: Sleek Top Update Notification Bar (hidden unless new version found)
         self.update_banner = tk.Frame(
             self.content_area,
             bg="#eff6ff",
@@ -1815,44 +2205,39 @@ class ScatteredRevisionApp:
             padx=12,
             pady=6,
         )
-        self.update_banner_lbl = tk.Label(
-            self.update_banner,
-            text="🎉 发现新版本！",
-            font=("Microsoft YaHei UI", 9, "bold"),
-            fg="#1d4ed8",
-            bg="#eff6ff",
-        )
-        self.update_banner_lbl.pack(side=tk.LEFT)
-
         tk.Button(
             self.update_banner,
-            text="查看说明并立即自动更新",
-            font=("Microsoft YaHei UI", 9, "bold"),
-            fg="#ffffff",
-            bg="#2563eb",
-            activebackground="#1d4ed8",
-            activeforeground="#ffffff",
-            relief=tk.FLAT,
-            padx=10,
-            pady=2,
-            cursor="hand2",
-            command=lambda: self._open_update_dialog(self._latest_update_info),
-        ).pack(side=tk.LEFT, padx=(10, 0))
-
-        tk.Button(
-            self.update_banner,
-            text="✕",
-            font=("Microsoft YaHei UI", 9),
-            fg="#64748b",
+            text="关闭",
+            font=("Microsoft YaHei UI", 8),
+            fg="#475569",
             bg="#eff6ff",
             activebackground="#dbeafe",
             relief=tk.FLAT,
-            padx=6,
+            padx=8,
+            pady=2,
             cursor="hand2",
             command=self.update_banner.grid_remove,
         ).pack(side=tk.RIGHT)
 
-        # Row 1: 5 Tab Frames
+        _make_primary_btn(
+            self.update_banner,
+            text="查看说明并立即自动更新",
+            padx=12,
+            pady=3,
+            command=lambda: self._open_update_dialog(self._latest_update_info),
+        ).pack(side=tk.RIGHT, padx=(8, 8))
+
+        self.update_banner_lbl = tk.Label(
+            self.update_banner,
+            text="发现新版本",
+            font=("Microsoft YaHei UI", 9, "bold"),
+            fg="#1d4ed8",
+            bg="#eff6ff",
+            anchor=tk.W,
+        )
+        self.update_banner_lbl.pack(side=tk.LEFT, fill=tk.X, expand=True)
+
+        # Row 2: 5 Tab Frames
         self.tab_main = ttk.Frame(self.content_area)
         self.tab_fa = ttk.Frame(self.content_area)
         self.tab_dd = ttk.Frame(self.content_area)
@@ -1860,7 +2245,7 @@ class ScatteredRevisionApp:
         self.tab_fel = ttk.Frame(self.content_area)
 
         for tf in (self.tab_main, self.tab_fa, self.tab_dd, self.tab_wc, self.tab_fel):
-            tf.grid(row=1, column=0, sticky=tk.NSEW)
+            tf.grid(row=2, column=0, sticky=tk.NSEW)
 
         self._build_tab1_pipeline(self.tab_main)
         self._build_tab2_full_article(self.tab_fa)
@@ -1870,50 +2255,42 @@ class ScatteredRevisionApp:
 
         self._switch_tab("main")
 
-    def _create_sidebar_tab(self, key: str, title: str, subtitle: str) -> tk.Frame:
-        card = tk.Frame(
-            self.sidebar,
-            bg="#ffffff",
-            highlightbackground="#e2e8f0",
-            highlightthickness=1,
-            cursor="hand2",
-        )
-        card.pack(fill=tk.X, padx=10, pady=3)
+    def _create_sidebar_group_header(self, text: str, first: bool = False):
+        top_pad = 6 if first else 14
+        tk.Label(
+            self.nav_inner,
+            text=text,
+            font=("Microsoft YaHei UI", 8, "bold"),
+            fg="#475569",
+            bg="#f8fafc",
+            anchor=tk.W,
+            padx=10,
+        ).pack(fill=tk.X, pady=(top_pad, 4))
 
-        bar = tk.Frame(card, bg="#ffffff", width=4)
+    def _create_sidebar_tab(self, key: str, title: str, subtitle: str = "") -> tk.Frame:
+        item = tk.Frame(self.nav_inner, bg="#f8fafc", cursor="hand2")
+        item.pack(fill=tk.X, pady=1)
+
+        bar = tk.Frame(item, bg="#f8fafc", width=3)
         bar.pack(side=tk.LEFT, fill=tk.Y)
 
-        inner = tk.Frame(card, bg="#ffffff", padx=9, pady=7, cursor="hand2")
-        inner.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
-
         lbl_title = tk.Label(
-            inner,
+            item,
             text=title,
-            font=("Microsoft YaHei UI", 10, "bold"),
-            fg="#1e293b",
-            bg="#ffffff",
+            font=("Microsoft YaHei UI", 9),
+            fg="#334155",
+            bg="#f8fafc",
             anchor=tk.W,
+            padx=12,
+            pady=8,
             cursor="hand2",
         )
-        lbl_title.pack(fill=tk.X)
-
-        lbl_sub = tk.Label(
-            inner,
-            text=subtitle,
-            font=("Microsoft YaHei UI", 8),
-            fg="#64748b",
-            bg="#ffffff",
-            anchor=tk.W,
-            cursor="hand2",
-        )
-        lbl_sub.pack(fill=tk.X, pady=(1, 0))
+        lbl_title.pack(side=tk.LEFT, fill=tk.X, expand=True)
 
         self._nav_items[key] = {
-            "card": card,
+            "card": item,
             "bar": bar,
-            "inner": inner,
             "title": lbl_title,
-            "sub": lbl_sub,
         }
 
         def _on_click(_e=None):
@@ -1921,24 +2298,25 @@ class ScatteredRevisionApp:
 
         def _on_enter(_e=None):
             if self.active_tab_key != key:
-                for w in (card, inner, lbl_title, lbl_sub):
-                    w.configure(bg="#f8fafc")
+                item.configure(bg="#f1f5f9")
+                lbl_title.configure(bg="#f1f5f9", fg="#0f172a")
                 bar.configure(bg="#cbd5e1")
 
         def _on_leave(_e=None):
             if self.active_tab_key != key:
-                for w in (card, inner, lbl_title, lbl_sub):
-                    w.configure(bg="#ffffff")
-                bar.configure(bg="#ffffff")
+                item.configure(bg="#f8fafc")
+                lbl_title.configure(bg="#f8fafc", fg="#334155")
+                bar.configure(bg="#f8fafc")
 
-        for w in (card, bar, inner, lbl_title, lbl_sub):
+        for w in (item, bar, lbl_title):
             w.bind("<Button-1>", _on_click)
-        card.bind("<Enter>", _on_enter)
-        card.bind("<Leave>", _on_leave)
-        return card
+        item.bind("<Enter>", _on_enter)
+        item.bind("<Leave>", _on_leave)
+        return item
 
     def _switch_tab(self, key: str):
         self.active_tab_key = key
+        self.active_section_title_var.set(self._SECTION_TITLES.get(key, "多语种整理工作台"))
         tab_map = {
             "main": self.tab_main,
             "fa": self.tab_fa,
@@ -1948,23 +2326,20 @@ class ScatteredRevisionApp:
         }
         for k, frame in tab_map.items():
             if k == key:
-                frame.grid(row=1, column=0, sticky=tk.NSEW)
+                frame.grid(row=2, column=0, sticky=tk.NSEW)
             else:
                 frame.grid_remove()
 
         for k, parts in self._nav_items.items():
             is_act = k == key
-            bg = "#eff6ff" if is_act else "#ffffff"
-            border = "#93c5fd" if is_act else "#e2e8f0"
-            bar_c = "#2563eb" if is_act else "#ffffff"
-            fg_t = "#1d4ed8" if is_act else "#1e293b"
-            fg_s = "#2563eb" if is_act else "#64748b"
+            bg = "#eff6ff" if is_act else "#f8fafc"
+            bar_c = "#2563eb" if is_act else "#f8fafc"
+            fg_t = "#1d4ed8" if is_act else "#334155"
+            fnt = ("Microsoft YaHei UI", 9, "bold") if is_act else ("Microsoft YaHei UI", 9)
 
-            parts["card"].configure(bg=bg, highlightbackground=border)
+            parts["card"].configure(bg=bg)
             parts["bar"].configure(bg=bar_c)
-            parts["inner"].configure(bg=bg)
-            parts["title"].configure(bg=bg, fg=fg_t)
-            parts["sub"].configure(bg=bg, fg=fg_s)
+            parts["title"].configure(bg=bg, fg=fg_t, font=fnt)
 
     # ---------------- Auto-Update Banner & Dialog Triggers ----------------
 
@@ -1973,8 +2348,8 @@ class ScatteredRevisionApp:
         v_str = str(info.get("latest_version") or "").lstrip("vV")
         if not v_str:
             return
-        self.update_banner_lbl.configure(text=f"🎉 发现新版本 v{v_str}！")
-        self.update_banner.grid(row=0, column=0, sticky=tk.EW, pady=(0, 8))
+        self.update_banner_lbl.configure(text=f"发现新版本 v{v_str}（支持一键校验 SHA-256 自动更新）")
+        self.update_banner.grid(row=1, column=0, sticky=tk.EW, pady=(0, 8))
 
     def _start_auto_update_check_async(self):
         if not callable(check_for_updates):
@@ -1996,87 +2371,56 @@ class ScatteredRevisionApp:
     def _on_manual_check_update(self):
         self._open_update_dialog(initial_info=None)
 
-    # ---------------- Tab 1: 📝 零散改点整理 ----------------
+    @staticmethod
+    def _make_interactive_drop_zone(parent: tk.Misc, text: str, on_click) -> tk.Frame:
+        zone = tk.Frame(
+            parent,
+            bg="#eff6ff",
+            highlightbackground="#93c5fd",
+            highlightthickness=1,
+            padx=12,
+            pady=6,
+            cursor="hand2",
+        )
+        lbl = tk.Label(
+            zone,
+            text=text,
+            font=("Microsoft YaHei UI", 9, "bold"),
+            fg="#1d4ed8",
+            bg="#eff6ff",
+            anchor=tk.W,
+            cursor="hand2",
+        )
+        lbl.pack(fill=tk.X)
+        zone.bind("<Button-1>", lambda _e: on_click())
+        lbl.bind("<Button-1>", lambda _e: on_click())
+        zone.bind("<Enter>", lambda _e: (zone.configure(bg="#dbeafe"), lbl.configure(bg="#dbeafe")))
+        zone.bind("<Leave>", lambda _e: (zone.configure(bg="#eff6ff"), lbl.configure(bg="#eff6ff")))
+        return zone
+
+    # ---------------- Tab 1: 零散改点整理 ----------------
 
     def _build_tab1_pipeline(self, main: ttk.Frame):
-        # 1. API & Model Frame
-        api_frame = ttk.LabelFrame(main, text=" 1. API 密钥池与模型设置（支持无限个 Key 轮换 + 超额/报错秒切） ", padding=8)
-        api_frame.pack(fill=tk.X, pady=(0, 6))
-        api_frame.columnconfigure(1, weight=1)
-
-        ttk.Label(api_frame, text="API 类型：").grid(row=0, column=0, sticky=tk.W, pady=3)
-        mode_cb = ttk.Combobox(
-            api_frame,
-            textvariable=self.api_mode_label,
-            values=[m[0] for m in API_MODES],
-            state="readonly",
-            width=36,
+        _pw, upper, lower = _make_vertical_paned(
+            main, upper_weight=0, lower_weight=1, min_top=220, min_bottom=110
         )
-        mode_cb.grid(row=0, column=1, sticky=tk.W, pady=3, padx=(4, 12))
 
-        ttk.Label(api_frame, text="选择模型：").grid(row=0, column=2, sticky=tk.W, pady=3)
-        model_cb = ttk.Combobox(
-            api_frame,
-            textvariable=self.model_label,
-            values=[m[0] for m in SUPPORTED_MODELS],
-            state="readonly",
-            width=32,
-        )
-        model_cb.grid(row=0, column=3, columnspan=2, sticky=tk.EW, pady=3, padx=(4, 0))
-
-        ttk.Label(api_frame, text="API Key 池：").grid(row=1, column=0, sticky=tk.W, pady=3)
-        self.key_entry = ttk.Entry(api_frame, textvariable=self.api_key_var, show="•")
-        self.key_entry.grid(row=1, column=1, columnspan=2, sticky=tk.EW, pady=3, padx=(4, 8))
-        self.key_entry.bind("<<Paste>>", self._on_paste_into_key_entry)
-
-        self.pool_btn = ttk.Button(
-            api_frame,
-            textvariable=self.pool_btn_text_var,
-            command=self._open_key_pool_dialog,
-        )
-        self.pool_btn.grid(row=1, column=3, sticky=tk.EW, padx=(0, 6))
-
-        self.test_btn = ttk.Button(api_frame, text="测试连接", width=10, command=self._on_test_api)
-        self.test_btn.grid(row=1, column=4, sticky=tk.E)
-
-        ttk.Label(api_frame, text="轮换策略：").grid(row=2, column=0, sticky=tk.W, pady=(3, 0))
-        rot_row = ttk.Frame(api_frame)
-        rot_row.grid(row=2, column=1, columnspan=4, sticky=tk.EW, pady=(3, 0), padx=(4, 0))
-
-        ttk.Combobox(
-            rot_row,
-            textvariable=self.rotation_label,
-            values=[m[0] for m in ROTATION_MODES],
-            state="readonly",
-            width=38,
-        ).pack(side=tk.LEFT, padx=(0, 12))
-
-        ttk.Checkbutton(
-            rot_row, text="显示明文", variable=self.show_key_var, command=self._toggle_key_visibility
-        ).pack(side=tk.LEFT, padx=(0, 8))
-        ttk.Checkbutton(
-            rot_row, text="本机加密记住", variable=self.remember_key_var, command=self._save_settings
-        ).pack(side=tk.LEFT, padx=(0, 12))
-        ttk.Label(
-            rot_row,
-            text="提示：全软件各板块共享此密钥池；无 Key 时自动离线估算标色",
-            foreground="#64748b",
-        ).pack(side=tk.LEFT)
-
-        # 2. Paths, Naming, Column Balance & Dedup Options Frame
+        # 1. Paths, Naming, Column Balance & Dedup Options Frame
         path_frame = ttk.LabelFrame(
-            main,
-            text=" 2. 文档、总库路径与命名/查重设置（📥 支持将文件/文件夹拖拽到对应输入框或页面空白处） ",
+            upper,
+            text=" 1. 文档、总库路径与命名/查重设置（支持直接拖拽文件或文件夹到对应输入框） ",
             padding=8,
         )
-        path_frame.pack(fill=tk.X, pady=(0, 6))
+        path_frame.pack(side=tk.TOP, fill=tk.X, pady=(0, 6))
         path_frame.columnconfigure(1, weight=1)
 
         self.lbl_input_docx = ttk.Label(path_frame, text="待整理文档 (.docx)：")
         self.lbl_input_docx.grid(row=0, column=0, sticky=tk.W, pady=3)
         self.ent_input_docx = ttk.Entry(path_frame, textvariable=self.input_docx_var)
         self.ent_input_docx.grid(row=0, column=1, sticky=tk.EW, pady=3, padx=4)
-        ttk.Button(path_frame, text="浏览...", width=10, command=self._browse_input).grid(row=0, column=2, sticky=tk.W, padx=2)
+        ttk.Button(path_frame, text="浏览...", style="Compact.TButton", command=self._browse_input).grid(
+            row=0, column=2, sticky=tk.W, padx=2
+        )
 
         self.lbl_library_dir = ttk.Label(path_frame, text="对应语种总库目录：")
         self.lbl_library_dir.grid(row=1, column=0, sticky=tk.W, pady=3)
@@ -2086,11 +2430,13 @@ class ScatteredRevisionApp:
         self.ent_library_dir.bind("<FocusOut>", self._on_library_entry_committed)
         lib_btns = ttk.Frame(path_frame)
         lib_btns.grid(row=1, column=2, columnspan=2, sticky=tk.W)
-        ttk.Button(lib_btns, text="浏览...", width=10, command=self._browse_library).pack(side=tk.LEFT, padx=2)
+        ttk.Button(lib_btns, text="浏览...", style="Compact.TButton", command=self._browse_library).pack(
+            side=tk.LEFT, padx=2
+        )
         self.btn_refresh_lib = ttk.Button(
             lib_btns,
-            text="🔄 刷新总库",
-            width=11,
+            text="刷新总库",
+            style="Compact.TButton",
             command=lambda: self._refresh_library_index_manual(self.library_dir_var.get(), target_tab="main"),
         )
         self.btn_refresh_lib.pack(side=tk.LEFT, padx=2)
@@ -2101,8 +2447,12 @@ class ScatteredRevisionApp:
         self.ent_output_dir.grid(row=2, column=1, sticky=tk.EW, pady=3, padx=4)
         out_btns = ttk.Frame(path_frame)
         out_btns.grid(row=2, column=2, columnspan=2, sticky=tk.W)
-        ttk.Button(out_btns, text="浏览...", width=10, command=self._browse_output).pack(side=tk.LEFT, padx=2)
-        ttk.Button(out_btns, text="打开目录", width=11, command=self._open_output_dir).pack(side=tk.LEFT, padx=2)
+        ttk.Button(out_btns, text="浏览...", style="Compact.TButton", command=self._browse_output).pack(
+            side=tk.LEFT, padx=2
+        )
+        ttk.Button(out_btns, text="打开目录", style="Compact.TButton", command=self._open_output_dir).pack(
+            side=tk.LEFT, padx=2
+        )
 
         # Optional Dedup Package Row
         self.chk_sc1_dedup = ttk.Checkbutton(
@@ -2116,10 +2466,12 @@ class ScatteredRevisionApp:
         self.ent_sc1_dedup_dir.grid(row=3, column=1, sticky=tk.EW, pady=3, padx=4)
         dedup_btns = ttk.Frame(path_frame)
         dedup_btns.grid(row=3, column=2, columnspan=2, sticky=tk.W)
-        ttk.Button(dedup_btns, text="浏览...", width=10, command=self._browse_sc1_dedup_dir).pack(side=tk.LEFT, padx=2)
-        ttk.Label(dedup_btns, text="自动剔除发译者版重复段", foreground="#64748b").pack(side=tk.LEFT, padx=2)
+        ttk.Button(dedup_btns, text="浏览...", style="Compact.TButton", command=self._browse_sc1_dedup_dir).pack(
+            side=tk.LEFT, padx=2
+        )
+        ttk.Label(dedup_btns, text="自动剔除发译者版重复段", foreground="#475569").pack(side=tk.LEFT, padx=4)
 
-        # Target Language + Naming Mode Row
+        # Target Language + Output Options Row
         opt_row1 = ttk.Frame(path_frame)
         opt_row1.grid(row=4, column=0, columnspan=4, sticky=tk.EW, pady=(5, 2))
 
@@ -2128,12 +2480,13 @@ class ScatteredRevisionApp:
             opt_row1,
             textvariable=self.lang_var,
             values=get_combo_values(self.languages),
-            width=25,
+            width=28,
         )
         self.lang_cb.pack(side=tk.LEFT, padx=(4, 6))
         ttk.Button(
             opt_row1,
-            text="➕ 管理语种...",
+            text="管理语种...",
+            style="Compact.TButton",
             command=self._open_lang_manager,
         ).pack(side=tk.LEFT, padx=(0, 14))
 
@@ -2163,7 +2516,7 @@ class ScatteredRevisionApp:
             variable=self.sc1_naming_mode_var,
             command=self._save_settings,
         ).pack(side=tk.LEFT, padx=(4, 6))
-        ttk.Label(opt_row_name, text="in 后缀关键词(如 15P，留空为 God's words)：", foreground="#475569").pack(side=tk.LEFT)
+        ttk.Label(opt_row_name, text="关键词(可留空)：", foreground="#475569").pack(side=tk.LEFT)
         ent_kw = ttk.Entry(opt_row_name, textvariable=self.sc1_keyword_var, width=12)
         ent_kw.pack(side=tk.LEFT, padx=(2, 14))
         ent_kw.bind("<KeyRelease>", self._on_sc1_keyword_typed)
@@ -2183,23 +2536,28 @@ class ScatteredRevisionApp:
         opt_row3.grid(row=6, column=0, columnspan=4, sticky=tk.EW, pady=(2, 0))
         ttk.Checkbutton(
             opt_row3,
-            text="使用 AI 辅助分级与第 3 列精准对齐（若 API Key 失效或取消勾选，自动按本地大概位置标色，绝不停工）",
+            text="使用 AI 辅助分级与第 3 列精准对齐（若未填 Key 或额度受限，自动切换本地位置估算标色）",
             variable=self.sc1_enable_ai_var,
             command=self._save_settings,
         ).pack(side=tk.LEFT)
 
-        # 3. One-Click Primary Action & Determinate Progress Frame
-        act_frame = ttk.LabelFrame(main, text=" 3. 一键执行与实时进度（双列自动扩三列 · 同篇重复段自动合并 · 批注无损保留 · 0词自动省略） ", padding=8)
-        act_frame.pack(fill=tk.X, pady=(0, 6))
+        # 2. One-Click Primary Action & Determinate Progress Frame
+        act_frame = ttk.LabelFrame(
+            upper,
+            text=" 2. 一键执行与实时进度（双列自动扩三列 · 同篇重复段自动合并 · 批注无损保留 · 0词自动省略） ",
+            padding=8,
+        )
+        act_frame.pack(side=tk.TOP, fill=tk.X, pady=(0, 4))
 
         btn_row = ttk.Frame(act_frame)
         btn_row.pack(fill=tk.X)
         btn_row.columnconfigure(0, weight=1)
 
-        self.btn_oneclick = ttk.Button(
+        self.btn_oneclick = _make_primary_btn(
             btn_row,
-            text="⚡ 一键输出定稿",
-            style="Primary.TButton",
+            text="一键输出定稿",
+            font=("Microsoft YaHei UI", 10, "bold"),
+            pady=7,
             command=self._on_run_oneclick,
         )
         self.btn_oneclick.grid(row=0, column=0, sticky=tk.EW)
@@ -2207,14 +2565,6 @@ class ScatteredRevisionApp:
 
         prog_info = ttk.Frame(act_frame)
         prog_info.pack(fill=tk.X, pady=(6, 2))
-
-        self.stage_lbl = ttk.Label(
-            prog_info,
-            textvariable=self.stage_var,
-            font=("Microsoft YaHei UI", 9, "bold"),
-            foreground="#1d4ed8",
-        )
-        self.stage_lbl.pack(side=tk.LEFT, fill=tk.X, expand=True)
 
         self.pct_lbl = ttk.Label(
             prog_info,
@@ -2224,6 +2574,14 @@ class ScatteredRevisionApp:
         )
         self.pct_lbl.pack(side=tk.RIGHT, padx=(8, 0))
 
+        self.stage_lbl = ttk.Label(
+            prog_info,
+            textvariable=self.stage_var,
+            font=("Microsoft YaHei UI", 9, "bold"),
+            foreground="#1d4ed8",
+        )
+        self.stage_lbl.pack(side=tk.LEFT, fill=tk.X, expand=True)
+
         self.progress = ttk.Progressbar(
             act_frame,
             mode="determinate",
@@ -2232,100 +2590,99 @@ class ScatteredRevisionApp:
         )
         self.progress.pack(fill=tk.X)
 
-        # 4. Log Frame
-        log_frame = ttk.LabelFrame(main, text=" 4. 实时运行日志 ", padding=6)
-        log_frame.pack(fill=tk.BOTH, expand=True)
+        # 3. Log Frame (Lower Resizable Pane)
+        log_frame = ttk.LabelFrame(lower, text=" 3. 实时运行日志（可拖动上方分隔条调节高度） ", padding=6)
+        log_frame.pack(fill=tk.BOTH, expand=True, pady=(2, 0))
 
         log_top = ttk.Frame(log_frame)
-        log_top.pack(fill=tk.X, pady=(0, 3))
+        log_top.pack(fill=tk.X, pady=(0, 4))
+        ttk.Button(
+            log_top,
+            text="清空日志",
+            style="Compact.TButton",
+            command=lambda: self._clear_log_widget(self.log_text),
+        ).pack(side=tk.RIGHT)
         ttk.Label(
             log_top,
-            text="后台总库索引、同篇段落合并、未入库查重、多 Key 轮换及输出路径均在此实时显示：",
-            foreground="#64748b",
+            text="后台总库索引、同篇段落合并、未入库查重、多 Key 轮换及输出路径实时显示：",
+            foreground="#475569",
         ).pack(side=tk.LEFT)
-        ttk.Button(log_top, text="清空日志", width=9, command=lambda: self._clear_log_widget(self.log_text)).pack(
-            side=tk.RIGHT
-        )
 
         log_body = ttk.Frame(log_frame)
         log_body.pack(fill=tk.BOTH, expand=True)
 
-        self.log_text = self._create_styled_log_text(log_body, height=8)
+        self.log_text = self._create_styled_log_text(log_body, height=7)
 
         key_cnt = len(self._get_all_keys_list())
         self._append_log(
-            f"欢迎使用零散改点自动整理工具 {APP_VERSION}！已载入 {key_cnt} 个 API Key、{len(self.languages)} 种语言；支持零散改点、全篇对比、改点查重、英文字数统计与分part稿整理/合并。",
+            f"欢迎使用多语种整理工作台 {APP_VERSION}！已载入 {key_cnt} 个 API Key、{len(self.languages)} 种语言；顶部工具栏可在任意板块快速切换模型与管理密钥池。",
             target_tab="main",
         )
 
-    # ---------------- Tab 2: 📖 全篇改点整理 ----------------
+    # ---------------- Tab 2: 全篇改点整理 ----------------
 
     def _build_tab2_full_article(self, parent: ttk.Frame):
-        # 1. Multiline Titles Input Frame
-        title_frame = ttk.LabelFrame(
-            parent,
-            text=" 1. 待提取对比的篇目标题（一行一个标题；支持粘贴，或直接拖入/导入标题清单 .docx / .txt） ",
+        _pw, upper, lower = _make_vertical_paned(
+            parent, upper_weight=0, lower_weight=1, min_top=290, min_bottom=100
+        )
+
+        # Anchor Step 3 & Step 2 at bottom of `upper` so dragging sash down expands `fa_titles_text` cleanly
+        act_frame = ttk.LabelFrame(
+            upper,
+            text=" 3. 全篇提取对比执行（自动取首行第 2 列加粗英文标题命名 · 逐篇独立导出完整版 + 仅改点版） ",
             padding=8,
         )
-        title_frame.pack(fill=tk.X, pady=(0, 6))
+        act_frame.pack(side=tk.BOTTOM, fill=tk.X, pady=(0, 4))
 
-        t_bar = ttk.Frame(title_frame)
-        t_bar.pack(fill=tk.X, pady=(0, 5))
-        ttk.Button(
-            t_bar,
-            text="📄 导入标题文档 (.docx / .txt)...",
-            style="Action.TButton",
-            command=self._fa_import_titles_file,
-        ).pack(side=tk.LEFT, padx=(0, 8))
-        ttk.Button(t_bar, text="🧹 清空", command=self._fa_clear_titles).pack(side=tk.LEFT, padx=(0, 12))
+        btn_row = ttk.Frame(act_frame)
+        btn_row.pack(fill=tk.X)
+        btn_row.columnconfigure(0, weight=1)
+        self.btn_fa_run = _make_primary_btn(
+            btn_row,
+            text="开始全篇提取对比（逐篇输出完整版 + 仅改点版）",
+            font=("Microsoft YaHei UI", 10, "bold"),
+            pady=7,
+            command=self._on_run_full_article,
+        )
+        self.btn_fa_run.grid(row=0, column=0, sticky=tk.EW)
+
+        p_info = ttk.Frame(act_frame)
+        p_info.pack(fill=tk.X, pady=(6, 2))
         ttk.Label(
-            t_bar,
-            textvariable=self.fa_title_count_var,
+            p_info,
+            textvariable=self.fa_pct_timer_var,
+            font=("Consolas", 9, "bold"),
+            foreground="#0f172a",
+        ).pack(side=tk.RIGHT, padx=(8, 0))
+        self.fa_stage_lbl = ttk.Label(
+            p_info,
+            textvariable=self.fa_stage_var,
             font=("Microsoft YaHei UI", 9, "bold"),
             foreground="#1d4ed8",
-        ).pack(side=tk.LEFT)
-        ttk.Label(
-            t_bar,
-            text="支持单篇底稿与多篇合集大文档自动拆篇；同名标题（如“第一篇”）自动弹窗确认",
-            foreground="#64748b",
-        ).pack(side=tk.RIGHT)
-
-        ed_wrap = ttk.Frame(title_frame)
-        ed_wrap.pack(fill=tk.X)
-        self.fa_titles_text = tk.Text(
-            ed_wrap,
-            height=5,
-            wrap=tk.WORD,
-            font=("Microsoft YaHei UI", 9),
-            bg="#ffffff",
-            fg="#0f172a",
-            relief=tk.SOLID,
-            borderwidth=1,
-            padx=8,
-            pady=5,
-            undo=True,
         )
-        fa_tvsb = ttk.Scrollbar(ed_wrap, orient=tk.VERTICAL, command=self.fa_titles_text.yview)
-        self.fa_titles_text.configure(yscrollcommand=fa_tvsb.set)
-        self.fa_titles_text.pack(side=tk.LEFT, fill=tk.X, expand=True)
-        fa_tvsb.pack(side=tk.RIGHT, fill=tk.Y)
-        self.fa_titles_text.bind("<KeyRelease>", lambda _e: self._fa_update_title_count())
-        self.fa_titles_text.bind("<<Paste>>", lambda _e: self.root.after(20, self._fa_update_title_count))
+        self.fa_stage_lbl.pack(side=tk.LEFT, fill=tk.X, expand=True)
+
+        ttk.Progressbar(
+            act_frame,
+            mode="determinate",
+            maximum=100.0,
+            variable=self.fa_progress_var,
+        ).pack(fill=tk.X)
 
         # 2. Directories & Options Frame
         cfg_frame = ttk.LabelFrame(
-            parent,
-            text=" 2. 最新中英底稿库、外文三语总库与输出设置（📥 支持直接拖拽文件夹到各输入框） ",
+            upper,
+            text=" 2. 最新中英底稿库、外文三语总库与输出设置（支持直接拖拽文件夹到各输入框） ",
             padding=8,
         )
-        cfg_frame.pack(fill=tk.X, pady=(0, 6))
+        cfg_frame.pack(side=tk.BOTTOM, fill=tk.X, pady=(0, 6))
         cfg_frame.columnconfigure(1, weight=1)
 
         self.lbl_fa_master_dir = ttk.Label(cfg_frame, text="最新中英底稿目录：")
         self.lbl_fa_master_dir.grid(row=0, column=0, sticky=tk.W, pady=3)
         self.ent_fa_master_dir = ttk.Entry(cfg_frame, textvariable=self.fa_master_dir_var)
         self.ent_fa_master_dir.grid(row=0, column=1, sticky=tk.EW, pady=3, padx=4)
-        ttk.Button(cfg_frame, text="浏览...", width=10, command=self._fa_browse_master_dir).grid(
+        ttk.Button(cfg_frame, text="浏览...", style="Compact.TButton", command=self._fa_browse_master_dir).grid(
             row=0, column=2, sticky=tk.W, padx=2
         )
 
@@ -2337,13 +2694,13 @@ class ScatteredRevisionApp:
         self.ent_fa_library_dir.bind("<FocusOut>", self._on_fa_library_entry_committed)
         fa_lib_btns = ttk.Frame(cfg_frame)
         fa_lib_btns.grid(row=1, column=2, columnspan=2, sticky=tk.W)
-        ttk.Button(fa_lib_btns, text="浏览...", width=10, command=self._fa_browse_library_dir).pack(
+        ttk.Button(fa_lib_btns, text="浏览...", style="Compact.TButton", command=self._fa_browse_library_dir).pack(
             side=tk.LEFT, padx=2
         )
         self.btn_fa_refresh_lib = ttk.Button(
             fa_lib_btns,
-            text="🔄 刷新总库",
-            width=11,
+            text="刷新总库",
+            style="Compact.TButton",
             command=lambda: self._refresh_library_index_manual(self.fa_library_dir_var.get(), target_tab="fa"),
         )
         self.btn_fa_refresh_lib.pack(side=tk.LEFT, padx=2)
@@ -2354,10 +2711,10 @@ class ScatteredRevisionApp:
         self.ent_fa_output_dir.grid(row=2, column=1, sticky=tk.EW, pady=3, padx=4)
         fa_out_btns = ttk.Frame(cfg_frame)
         fa_out_btns.grid(row=2, column=2, columnspan=2, sticky=tk.W)
-        ttk.Button(fa_out_btns, text="浏览...", width=10, command=self._fa_browse_output_dir).pack(
+        ttk.Button(fa_out_btns, text="浏览...", style="Compact.TButton", command=self._fa_browse_output_dir).pack(
             side=tk.LEFT, padx=2
         )
-        ttk.Button(fa_out_btns, text="打开目录", width=11, command=self._fa_open_output_dir).pack(
+        ttk.Button(fa_out_btns, text="打开目录", style="Compact.TButton", command=self._fa_open_output_dir).pack(
             side=tk.LEFT, padx=2
         )
 
@@ -2372,8 +2729,10 @@ class ScatteredRevisionApp:
         self.ent_fa_dedup_dir.grid(row=3, column=1, sticky=tk.EW, pady=3, padx=4)
         fa_dd_btns = ttk.Frame(cfg_frame)
         fa_dd_btns.grid(row=3, column=2, columnspan=2, sticky=tk.W)
-        ttk.Button(fa_dd_btns, text="浏览...", width=10, command=self._fa_browse_dedup_dir).pack(side=tk.LEFT, padx=2)
-        ttk.Label(fa_dd_btns, text="仅改点版自动去重", foreground="#64748b").pack(side=tk.LEFT, padx=2)
+        ttk.Button(fa_dd_btns, text="浏览...", style="Compact.TButton", command=self._fa_browse_dedup_dir).pack(
+            side=tk.LEFT, padx=2
+        )
+        ttk.Label(fa_dd_btns, text="仅改点版自动去重", foreground="#475569").pack(side=tk.LEFT, padx=4)
 
         opt_row1 = ttk.Frame(cfg_frame)
         opt_row1.grid(row=4, column=0, columnspan=4, sticky=tk.EW, pady=(5, 2))
@@ -2385,7 +2744,9 @@ class ScatteredRevisionApp:
             width=24,
         )
         self.fa_lang_cb.pack(side=tk.LEFT, padx=(4, 6))
-        ttk.Button(opt_row1, text="➕ 管理语种", command=self._open_lang_manager).pack(side=tk.LEFT, padx=(0, 14))
+        ttk.Button(opt_row1, text="管理语种...", style="Compact.TButton", command=self._open_lang_manager).pack(
+            side=tk.LEFT, padx=(0, 14)
+        )
 
         ttk.Label(opt_row1, text="日期(YYYYMMDD)：").pack(side=tk.LEFT)
         ttk.Entry(opt_row1, textvariable=self.fa_date_var, width=10).pack(side=tk.LEFT, padx=(4, 14))
@@ -2405,131 +2766,126 @@ class ScatteredRevisionApp:
             variable=self.fa_enable_ai_var,
             command=self._save_settings,
         ).pack(side=tk.LEFT)
-        self.fa_pool_btn = ttk.Button(
-            opt_row2,
-            textvariable=self.pool_btn_text_var,
-            command=self._open_key_pool_dialog,
-        )
-        self.fa_pool_btn.pack(side=tk.RIGHT)
 
-        # 3. Primary Button & Progress
-        act_frame = ttk.LabelFrame(
-            parent,
-            text=" 3. 全篇提取对比执行（自动取首行第 2 列加粗英文标题命名 · 逐篇独立导出完整版 + 仅改点版） ",
+        # 1. Multiline Titles Input Frame (expands when sash is dragged down)
+        title_frame = ttk.LabelFrame(
+            upper,
+            text=" 1. 待提取对比的篇目标题（一行一个标题；支持粘贴，或直接拖入/导入标题清单 .docx / .txt） ",
             padding=8,
         )
-        act_frame.pack(fill=tk.X, pady=(0, 6))
+        title_frame.pack(side=tk.TOP, fill=tk.BOTH, expand=True, pady=(0, 6))
 
-        btn_row = ttk.Frame(act_frame)
-        btn_row.pack(fill=tk.X)
-        btn_row.columnconfigure(0, weight=1)
-        self.btn_fa_run = ttk.Button(
-            btn_row,
-            text="⚡ 开始全篇提取对比（逐篇输出完整版 + 仅改点版）",
-            style="Primary.TButton",
-            command=self._on_run_full_article,
-        )
-        self.btn_fa_run.grid(row=0, column=0, sticky=tk.EW)
-
-        p_info = ttk.Frame(act_frame)
-        p_info.pack(fill=tk.X, pady=(6, 2))
-        self.fa_stage_lbl = ttk.Label(
-            p_info,
-            textvariable=self.fa_stage_var,
+        t_bar = ttk.Frame(title_frame)
+        t_bar.pack(side=tk.TOP, fill=tk.X, pady=(0, 5))
+        ttk.Button(
+            t_bar,
+            text="导入标题文档 (.docx / .txt)...",
+            style="Action.TButton",
+            command=self._fa_import_titles_file,
+        ).pack(side=tk.LEFT, padx=(0, 8))
+        ttk.Button(t_bar, text="清空", command=self._fa_clear_titles).pack(side=tk.LEFT, padx=(0, 12))
+        ttk.Label(
+            t_bar,
+            textvariable=self.fa_title_count_var,
             font=("Microsoft YaHei UI", 9, "bold"),
             foreground="#1d4ed8",
-        )
-        self.fa_stage_lbl.pack(side=tk.LEFT, fill=tk.X, expand=True)
+        ).pack(side=tk.LEFT)
         ttk.Label(
-            p_info,
-            textvariable=self.fa_pct_timer_var,
-            font=("Consolas", 9, "bold"),
-            foreground="#0f172a",
+            t_bar,
+            text="兼容单篇与合集拆篇；同名标题自动弹窗确认",
+            foreground="#475569",
         ).pack(side=tk.RIGHT)
 
-        ttk.Progressbar(
-            act_frame,
-            mode="determinate",
-            maximum=100.0,
-            variable=self.fa_progress_var,
-        ).pack(fill=tk.X)
+        ed_wrap = ttk.Frame(title_frame)
+        ed_wrap.pack(side=tk.TOP, fill=tk.BOTH, expand=True)
+        self.fa_titles_text = tk.Text(
+            ed_wrap,
+            height=4,
+            wrap=tk.WORD,
+            font=("Microsoft YaHei UI", 9),
+            bg="#ffffff",
+            fg="#0f172a",
+            relief=tk.SOLID,
+            borderwidth=1,
+            padx=8,
+            pady=5,
+            undo=True,
+        )
+        fa_tvsb = ttk.Scrollbar(ed_wrap, orient=tk.VERTICAL, command=self.fa_titles_text.yview)
+        self.fa_titles_text.configure(yscrollcommand=fa_tvsb.set)
+        self.fa_titles_text.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+        fa_tvsb.pack(side=tk.RIGHT, fill=tk.Y)
+        self.fa_titles_text.bind("<KeyRelease>", lambda _e: self._fa_update_title_count())
+        self.fa_titles_text.bind("<<Paste>>", lambda _e: self.root.after(20, self._fa_update_title_count))
 
-        # 4. Real-Time Log
-        log_frame = ttk.LabelFrame(parent, text=" 4. 全篇提取对比实时日志 ", padding=6)
-        log_frame.pack(fill=tk.BOTH, expand=True)
+        # 4. Real-Time Log (Lower Resizable Pane)
+        log_frame = ttk.LabelFrame(lower, text=" 4. 全篇提取对比实时日志（可拖动上方分隔条调节高度） ", padding=6)
+        log_frame.pack(fill=tk.BOTH, expand=True, pady=(2, 0))
         log_top = ttk.Frame(log_frame)
-        log_top.pack(fill=tk.X, pady=(0, 3))
+        log_top.pack(fill=tk.X, pady=(0, 4))
+        ttk.Button(
+            log_top,
+            text="清空日志",
+            style="Compact.TButton",
+            command=lambda: self._clear_log_widget(self.fa_log_text),
+        ).pack(side=tk.RIGHT)
         ttk.Label(
             log_top,
             text="底稿拆篇定位、同名标题消歧、逐篇全段对比与双版本导出详情：",
-            foreground="#64748b",
+            foreground="#475569",
         ).pack(side=tk.LEFT)
-        ttk.Button(log_top, text="清空日志", width=9, command=lambda: self._clear_log_widget(self.fa_log_text)).pack(
-            side=tk.RIGHT
-        )
         log_body = ttk.Frame(log_frame)
         log_body.pack(fill=tk.BOTH, expand=True)
-        self.fa_log_text = self._create_styled_log_text(log_body, height=7)
+        self.fa_log_text = self._create_styled_log_text(log_body, height=6)
         self.fa_log_text.insert(
             tk.END,
             "提示：可在上方粘贴篇目标题（每行一个，如“只有末后的基督才能赐给人永生的道”或“1-01 追求真理的重要性与路途”），或直接拖入标题 .docx / .txt 文档。\n",
             "dim",
         )
 
-    # ---------------- Tab 3: 🔍 改点稿查重 ----------------
+    # ---------------- Tab 3: 改点稿查重 ----------------
 
     def _build_tab3_dedup(self, parent: ttk.Frame):
+        _pw, upper, lower = _make_vertical_paned(
+            parent, upper_weight=1, lower_weight=1, min_top=220, min_bottom=150
+        )
+
         cfg_frame = ttk.LabelFrame(
-            parent,
+            upper,
             text=" 1. 待查重文档列表与「未入库改点包」路径设置（依据第 1 列中文：整段 -> 段首 -> 段尾 -> 着色片段四级极速查重） ",
             padding=8,
         )
-        cfg_frame.pack(fill=tk.X, pady=(0, 6))
+        cfg_frame.pack(side=tk.TOP, fill=tk.X, pady=(0, 6))
 
-        drop_zone = tk.Frame(
+        drop_zone = self._make_interactive_drop_zone(
             cfg_frame,
-            bg="#eff6ff",
-            highlightbackground="#93c5fd",
-            highlightthickness=1,
-            padx=12,
-            pady=6,
-            cursor="hand2",
+            "直接拖入待查重的 .docx 文档或文件夹即可载入列表（点击此处也可选择待查重文件）",
+            self._dd_add_files,
         )
         drop_zone.pack(fill=tk.X, pady=(0, 6))
-        dz_lbl = tk.Label(
-            drop_zone,
-            text="📥 直接拖入待查重的 .docx 文档或文件夹即可载入列表（点击此处也可选择待查重文件）",
-            font=("Microsoft YaHei UI", 9, "bold"),
-            fg="#1d4ed8",
-            bg="#eff6ff",
-            cursor="hand2",
-        )
-        dz_lbl.pack(fill=tk.X)
-        drop_zone.bind("<Button-1>", lambda _e: self._dd_add_files())
-        dz_lbl.bind("<Button-1>", lambda _e: self._dd_add_files())
 
         btn_bar = ttk.Frame(cfg_frame)
         btn_bar.pack(fill=tk.X, pady=(0, 6))
         ttk.Button(
             btn_bar,
-            text="📄 选择待查重文档(可多选)...",
+            text="选择待查重文档...",
             style="Action.TButton",
             command=self._dd_add_files,
         ).pack(side=tk.LEFT, padx=(0, 6))
         ttk.Button(
             btn_bar,
-            text="📁 选择待查重文件夹...",
+            text="选择待查重文件夹...",
             style="Action.TButton",
             command=self._dd_add_folder,
         ).pack(side=tk.LEFT, padx=(0, 6))
-        ttk.Button(btn_bar, text="🗑️ 移除选中", command=self._dd_remove_selected).pack(side=tk.LEFT, padx=(0, 6))
-        ttk.Button(btn_bar, text="🧹 清空列表", command=self._dd_clear_all).pack(side=tk.LEFT, padx=(0, 12))
+        ttk.Button(btn_bar, text="移除选中", command=self._dd_remove_selected).pack(side=tk.LEFT, padx=(0, 6))
+        ttk.Button(btn_bar, text="清空列表", command=self._dd_clear_all).pack(side=tk.LEFT, padx=(0, 12))
         ttk.Label(
             btn_bar,
             textvariable=self.dd_summary_var,
             font=("Microsoft YaHei UI", 9, "bold"),
             foreground="#1d4ed8",
-        ).pack(side=tk.LEFT)
+        ).pack(side=tk.LEFT, fill=tk.X, expand=True)
 
         paths_grid = ttk.Frame(cfg_frame)
         paths_grid.pack(fill=tk.X)
@@ -2539,7 +2895,7 @@ class ScatteredRevisionApp:
         self.lbl_dd_pkg_dir.grid(row=0, column=0, sticky=tk.W, pady=3)
         self.ent_dd_pkg_dir = ttk.Entry(paths_grid, textvariable=self.dd_pkg_dir_var)
         self.ent_dd_pkg_dir.grid(row=0, column=1, sticky=tk.EW, pady=3, padx=4)
-        ttk.Button(paths_grid, text="浏览...", width=10, command=self._dd_browse_pkg_dir).grid(
+        ttk.Button(paths_grid, text="浏览...", style="Compact.TButton", command=self._dd_browse_pkg_dir).grid(
             row=0, column=2, sticky=tk.W, padx=2
         )
 
@@ -2549,8 +2905,12 @@ class ScatteredRevisionApp:
         self.ent_dd_out_dir.grid(row=1, column=1, sticky=tk.EW, pady=3, padx=4)
         dd_out_btns = ttk.Frame(paths_grid)
         dd_out_btns.grid(row=1, column=2, columnspan=2, sticky=tk.W)
-        ttk.Button(dd_out_btns, text="浏览...", width=10, command=self._dd_browse_out_dir).pack(side=tk.LEFT, padx=2)
-        ttk.Button(dd_out_btns, text="打开目录", width=10, command=self._dd_open_out_dir).pack(side=tk.LEFT, padx=2)
+        ttk.Button(dd_out_btns, text="浏览...", style="Compact.TButton", command=self._dd_browse_out_dir).pack(
+            side=tk.LEFT, padx=2
+        )
+        ttk.Button(dd_out_btns, text="打开目录", style="Compact.TButton", command=self._dd_open_out_dir).pack(
+            side=tk.LEFT, padx=2
+        )
 
         opt_row = ttk.Frame(cfg_frame)
         opt_row.pack(fill=tk.X, pady=(5, 0))
@@ -2571,14 +2931,14 @@ class ScatteredRevisionApp:
 
         # 2. Pending Files Treeview
         tbl_box = ttk.LabelFrame(
-            parent,
+            upper,
             text=" 2. 待查重 Word 文档队列（双击行可打开所在文件夹） ",
             padding=6,
         )
-        tbl_box.pack(fill=tk.BOTH, expand=True, pady=(0, 6))
+        tbl_box.pack(side=tk.TOP, fill=tk.BOTH, expand=True, pady=(0, 4))
 
         cols = ("seq", "filename", "folder", "status")
-        self.dd_tree = ttk.Treeview(tbl_box, columns=cols, show="headings", selectmode="extended", height=7)
+        self.dd_tree = ttk.Treeview(tbl_box, columns=cols, show="headings", selectmode="extended", height=5)
         self.dd_tree.heading("seq", text="序号")
         self.dd_tree.heading("filename", text="待查重文档名")
         self.dd_tree.heading("folder", text="所在目录")
@@ -2595,23 +2955,30 @@ class ScatteredRevisionApp:
         dd_vsb.pack(side=tk.RIGHT, fill=tk.Y)
         self.dd_tree.bind("<Double-1>", self._dd_open_selected_folder)
 
-        # 3. Execute & Log Frame
-        act_box = ttk.LabelFrame(parent, text=" 3. 四级中文查重执行与日志汇总 ", padding=8)
-        act_box.pack(fill=tk.BOTH, expand=True)
+        # 3. Execute & Log Frame (Lower Resizable Pane)
+        act_box = ttk.LabelFrame(lower, text=" 3. 四级中文查重执行与日志汇总（可拖动上方分隔条调节高度） ", padding=8)
+        act_box.pack(fill=tk.BOTH, expand=True, pady=(2, 0))
 
         run_row = ttk.Frame(act_box)
-        run_row.pack(fill=tk.X)
+        run_row.pack(side=tk.TOP, fill=tk.X)
         run_row.columnconfigure(0, weight=1)
-        self.btn_dd_run = ttk.Button(
+        self.btn_dd_run = _make_primary_btn(
             run_row,
-            text="🔍 开始第一列中文四级查重并导出报告",
-            style="Primary.TButton",
+            text="开始第一列中文四级查重并导出报告",
+            font=("Microsoft YaHei UI", 10, "bold"),
+            pady=7,
             command=self._on_run_dedup,
         )
         self.btn_dd_run.grid(row=0, column=0, sticky=tk.EW)
 
         p_info = ttk.Frame(act_box)
-        p_info.pack(fill=tk.X, pady=(6, 2))
+        p_info.pack(side=tk.TOP, fill=tk.X, pady=(6, 2))
+        ttk.Label(
+            p_info,
+            textvariable=self.dd_pct_timer_var,
+            font=("Consolas", 9, "bold"),
+            foreground="#0f172a",
+        ).pack(side=tk.RIGHT, padx=(8, 0))
         self.dd_stage_lbl = ttk.Label(
             p_info,
             textvariable=self.dd_stage_var,
@@ -2619,89 +2986,106 @@ class ScatteredRevisionApp:
             foreground="#1d4ed8",
         )
         self.dd_stage_lbl.pack(side=tk.LEFT, fill=tk.X, expand=True)
-        ttk.Label(
-            p_info,
-            textvariable=self.dd_pct_timer_var,
-            font=("Consolas", 9, "bold"),
-            foreground="#0f172a",
-        ).pack(side=tk.RIGHT)
 
         ttk.Progressbar(
             act_box,
             mode="determinate",
             maximum=100.0,
             variable=self.dd_progress_var,
-        ).pack(fill=tk.X, pady=(0, 5))
+        ).pack(side=tk.TOP, fill=tk.X, pady=(0, 5))
+
+        dd_log_bar = ttk.Frame(act_box)
+        dd_log_bar.pack(side=tk.TOP, fill=tk.X, pady=(0, 3))
+        ttk.Button(
+            dd_log_bar,
+            text="清空日志",
+            style="Compact.TButton",
+            command=lambda: self._clear_log_widget(self.dd_log_text),
+        ).pack(side=tk.RIGHT)
+        ttk.Label(dd_log_bar, text="查重匹配详情与导出结果：", foreground="#475569").pack(side=tk.LEFT)
 
         log_wrap = ttk.Frame(act_box)
-        log_wrap.pack(fill=tk.BOTH, expand=True)
-        self.dd_log_text = self._create_styled_log_text(log_wrap, height=5)
+        log_wrap.pack(side=tk.TOP, fill=tk.BOTH, expand=True)
+        self.dd_log_text = self._create_styled_log_text(log_wrap, height=4)
         self.dd_log_text.insert(
             tk.END,
             "提示：本板块完全离线运行（无需 API Key），自动输出《查重结果明细报告_YYYYMMDD.docx》及去重重算字数后的定稿。\n",
             "dim",
         )
 
-    # ---------------- Tab 4: 🔢 英文字数统计 ----------------
+    # ---------------- Tab 4: 英文字数统计 ----------------
 
     def _build_tab4_word_counter(self, parent: ttk.Frame):
+        # Pack bottom action bar FIRST so primary CTA NEVER clips at any height
+        bot = ttk.Frame(parent)
+        bot.pack(side=tk.BOTTOM, fill=tk.X)
+
+        _make_primary_btn(
+            bot,
+            text="计算字数并立即更新文件名",
+            command=self._wc_execute_rename,
+        ).pack(side=tk.RIGHT)
+        ttk.Button(
+            bot,
+            text="重新计算并刷新预览",
+            style="Action.TButton",
+            command=self._wc_refresh_previews,
+        ).pack(side=tk.RIGHT, padx=(0, 8))
+
+        ttk.Label(
+            bot,
+            textvariable=self.wc_summary_var,
+            font=("Microsoft YaHei UI", 9, "bold"),
+            foreground="#1d4ed8",
+        ).pack(side=tk.LEFT, fill=tk.X, expand=True)
+
+        tk.Frame(parent, bg="#e2e8f0", height=1).pack(side=tk.BOTTOM, fill=tk.X, pady=(8, 8))
+
+        _pw, upper, lower = _make_vertical_paned(
+            parent, upper_weight=0, lower_weight=1, min_top=220, min_bottom=120
+        )
+
         # 1. Rules banner
-        banner = ttk.LabelFrame(parent, text=" 统计与文件重命名规则说明（本地毫秒级解析 · 0 词自动省略 · 可选同步顶部说明行） ", padding=8)
-        banner.pack(fill=tk.X, pady=(0, 6))
+        banner = ttk.LabelFrame(upper, text=" 统计与文件重命名规则说明（本地毫秒级解析 · 0 词自动省略 · 可选同步顶部说明行） ", padding=8)
+        banner.pack(side=tk.TOP, fill=tk.X, pady=(0, 6))
 
         ttk.Label(
             banner,
             text=(
                 "• 统计口径：仅统计表格【第 2 列（英文列）】修订后正文的英文单词数（标点不计，已删除修订自动排除；UP = 黄色高亮，RV = 青色高亮）。\n"
-                "• 0 词省略规范：若 RV=0 自动输出 (UP X words)；若 UP=0 输出 (RV Y words)；若均为 0 自动省略括号字数段！\n"
-                "• 三种命名模式：支持【保留原文档名】、【全篇改点：自动取首行第 2 列加粗英文标题】、【零散改点：God's words [in 关键词]】。"
+                "• 0 词省略与命名：RV=0 或 UP=0 时自动省略 0 词项；支持保留原名、取首行加粗英文标题、或零散标准命名 God's words [in 关键词]。"
             ),
             foreground="#334155",
         ).pack(fill=tk.X)
 
         # 2. File picker & naming parameters
-        cfg_frame = ttk.LabelFrame(parent, text=" 1. 拖拽 / 选择文档与命名参数 ", padding=8)
-        cfg_frame.pack(fill=tk.X, pady=(0, 6))
+        cfg_frame = ttk.LabelFrame(upper, text=" 1. 拖拽 / 选择文档与命名参数 ", padding=8)
+        cfg_frame.pack(side=tk.TOP, fill=tk.X, pady=(0, 4))
 
-        drop_zone = tk.Frame(
+        drop_zone = self._make_interactive_drop_zone(
             cfg_frame,
-            bg="#eff6ff",
-            highlightbackground="#93c5fd",
-            highlightthickness=1,
-            padx=12,
-            pady=6,
-            cursor="hand2",
+            "直接把一个或多个 .docx 文档、文件夹拖拽到此窗口任意位置即可自动载入（点击此处也可选择文件）",
+            self._wc_add_files,
         )
         drop_zone.pack(fill=tk.X, pady=(0, 6))
-        dz_lbl = tk.Label(
-            drop_zone,
-            text="📥 直接把一个或多个 .docx 文档、文件夹拖拽到此窗口任意位置即可自动载入（点击此处也可选择文件）",
-            font=("Microsoft YaHei UI", 9, "bold"),
-            fg="#1d4ed8",
-            bg="#eff6ff",
-            cursor="hand2",
-        )
-        dz_lbl.pack(fill=tk.X)
-        drop_zone.bind("<Button-1>", lambda _e: self._wc_add_files())
-        dz_lbl.bind("<Button-1>", lambda _e: self._wc_add_files())
 
         file_btns = ttk.Frame(cfg_frame)
         file_btns.pack(fill=tk.X, pady=(0, 6))
 
         ttk.Button(
             file_btns,
-            text="📄 选择 Word 文档 (支持单选/多选)...",
+            text="选择 Word 文档...",
             style="Action.TButton",
             command=self._wc_add_files,
         ).pack(side=tk.LEFT, padx=(0, 8))
         ttk.Button(
             file_btns,
-            text="📁 选择文件夹批量载入...",
+            text="选择文件夹批量载入...",
             style="Action.TButton",
             command=self._wc_add_folder,
         ).pack(side=tk.LEFT, padx=(0, 8))
-        ttk.Button(file_btns, text="🗑️ 移除选中行", command=self._wc_remove_selected).pack(side=tk.LEFT, padx=(0, 8))
-        ttk.Button(file_btns, text="🧹 清空列表", command=self._wc_clear_all).pack(side=tk.LEFT)
+        ttk.Button(file_btns, text="移除选中行", command=self._wc_remove_selected).pack(side=tk.LEFT, padx=(0, 8))
+        ttk.Button(file_btns, text="清空列表", command=self._wc_clear_all).pack(side=tk.LEFT)
 
         row_lang = ttk.Frame(cfg_frame)
         row_lang.pack(fill=tk.X, pady=3)
@@ -2711,12 +3095,14 @@ class ScatteredRevisionApp:
             row_lang,
             textvariable=self.wc_lang_var,
             values=get_combo_values(self.languages),
-            width=26,
+            width=25,
         )
         self.wc_lang_cb.pack(side=tk.LEFT, padx=(4, 6))
         self.wc_lang_cb.bind("<<ComboboxSelected>>", lambda _e: self._wc_refresh_previews())
 
-        ttk.Button(row_lang, text="➕ 管理语种...", command=self._open_lang_manager).pack(side=tk.LEFT, padx=(0, 14))
+        ttk.Button(row_lang, text="管理语种...", style="Compact.TButton", command=self._open_lang_manager).pack(
+            side=tk.LEFT, padx=(0, 14)
+        )
 
         ttk.Checkbutton(
             row_lang,
@@ -2779,7 +3165,7 @@ class ScatteredRevisionApp:
 
         ttk.Checkbutton(
             row_date,
-            text="同步在文档开头插入/更新高亮说明行（Blue / Yellow highlighted parts...）",
+            text="同步更新开头高亮说明行（Blue / Yellow highlighted parts...）",
             variable=self.wc_update_headers_var,
             command=self._wc_refresh_previews,
         ).pack(side=tk.LEFT)
@@ -2787,6 +3173,9 @@ class ScatteredRevisionApp:
         row_mode = ttk.Frame(cfg_frame)
         row_mode.pack(fill=tk.X, pady=(3, 0))
 
+        ttk.Button(row_mode, text="浏览...", style="Compact.TButton", command=self._wc_browse_copy_dir).pack(
+            side=tk.RIGHT
+        )
         ttk.Label(row_mode, text="保存方式：").pack(side=tk.LEFT)
         ttk.Radiobutton(
             row_mode,
@@ -2801,20 +3190,19 @@ class ScatteredRevisionApp:
             variable=self.wc_save_mode_var,
         )
         self.wc_copy_radio.pack(side=tk.LEFT)
-        self.wc_copy_dir_entry = ttk.Entry(row_mode, textvariable=self.wc_copy_dir_var, width=30)
+        self.wc_copy_dir_entry = ttk.Entry(row_mode, textvariable=self.wc_copy_dir_var, width=28)
         self.wc_copy_dir_entry.pack(side=tk.LEFT, padx=4, fill=tk.X, expand=True)
-        ttk.Button(row_mode, text="浏览...", width=8, command=self._wc_browse_copy_dir).pack(side=tk.LEFT)
 
-        # 3. Preview & Results Treeview
+        # 3. Preview & Results Treeview (Lower Resizable Pane)
         tbl_box = ttk.LabelFrame(
-            parent,
-            text=" 2. 第 2 列英文字数统计与新文件名预览（📥 支持直接将文件/文件夹拖入下表；双击行可打开目录） ",
+            lower,
+            text=" 2. 第 2 列英文字数统计与新文件名预览（支持拖入文件/文件夹；双击行可打开目录） ",
             padding=8,
         )
-        tbl_box.pack(fill=tk.BOTH, expand=True, pady=(0, 8))
+        tbl_box.pack(fill=tk.BOTH, expand=True, pady=(2, 0))
 
         cols = ("old_name", "lang", "up_words", "rv_words", "new_name", "status")
-        self.wc_tree = ttk.Treeview(tbl_box, columns=cols, show="headings", selectmode="extended", height=11)
+        self.wc_tree = ttk.Treeview(tbl_box, columns=cols, show="headings", selectmode="extended", height=7)
         self.wc_tree.heading("old_name", text="原文件名")
         self.wc_tree.heading("lang", text="语言代号")
         self.wc_tree.heading("up_words", text="UP 单词数 (黄色)")
@@ -2829,103 +3217,66 @@ class ScatteredRevisionApp:
         self.wc_tree.column("new_name", width=320, anchor=tk.W)
         self.wc_tree.column("status", width=120, anchor=tk.CENTER)
 
-        vsb = ttk.Scrollbar(tbl_box, orient=tk.VERTICAL, command=self.wc_tree.yview)
         hsb = ttk.Scrollbar(tbl_box, orient=tk.HORIZONTAL, command=self.wc_tree.xview)
+        vsb = ttk.Scrollbar(tbl_box, orient=tk.VERTICAL, command=self.wc_tree.yview)
         self.wc_tree.configure(yscrollcommand=vsb.set, xscrollcommand=hsb.set)
 
+        hsb.pack(side=tk.BOTTOM, fill=tk.X)
         self.wc_tree.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
         vsb.pack(side=tk.RIGHT, fill=tk.Y)
         self.wc_tree.bind("<Double-1>", self._wc_open_selected_folder)
 
-        # 4. Bottom Action Bar
-        bot = ttk.Frame(parent)
-        bot.pack(fill=tk.X)
-
-        ttk.Label(
-            bot,
-            textvariable=self.wc_summary_var,
-            font=("Microsoft YaHei UI", 9, "bold"),
-            foreground="#1d4ed8",
-        ).pack(side=tk.LEFT)
-
-        ttk.Button(
-            bot,
-            text="⚡ 计算字数并立即更新文件名",
-            style="Primary.TButton",
-            command=self._wc_execute_rename,
-        ).pack(side=tk.RIGHT)
-        ttk.Button(
-            bot,
-            text="🔄 重新计算并刷新预览",
-            style="Action.TButton",
-            command=self._wc_refresh_previews,
-        ).pack(side=tk.RIGHT, padx=(0, 8))
-
-    # ---------------- Tab 5: 📚 分part稿整理/合并 ----------------
+    # ---------------- Tab 5: 分part稿整理/合并 ----------------
 
     def _build_tab5_part_merge(self, parent: ttk.Frame):
+        _pw, upper, lower = _make_vertical_paned(
+            parent, upper_weight=1, lower_weight=1, min_top=240, min_bottom=145
+        )
+
         cfg_frame = ttk.LabelFrame(
-            parent,
+            upper,
             text=" 1. 分part稿整理/合并设置（支持多文件 Part 1..N 合并 & 单文件多 Part 表格合并 · 蓝/红/加粗精准同步 · 语系标准字体） ",
             padding=8,
         )
-        cfg_frame.pack(fill=tk.X, pady=(0, 6))
+        cfg_frame.pack(side=tk.TOP, fill=tk.X, pady=(0, 6))
 
-        drop_zone = tk.Frame(
+        drop_zone = self._make_interactive_drop_zone(
             cfg_frame,
-            bg="#eff6ff",
-            highlightbackground="#93c5fd",
-            highlightthickness=1,
-            padx=12,
-            pady=6,
-            cursor="hand2",
+            "直接拖入分篇文件夹、多个 Part .docx，或含多段 Part 表格的单个 .docx（自动套用语系字体，如泰语 Angsana New 18/16/14pt）",
+            self._fel_add_folder,
         )
         drop_zone.pack(fill=tk.X, pady=(0, 6))
-        dz_lbl = tk.Label(
-            drop_zone,
-            text="📥 直接拖入分篇文件夹、多个 Part .docx，或含多段 Part 表格的单个 .docx（自动套用语系字体，如泰语 Angsana New 18/16/14pt）",
-            font=("Microsoft YaHei UI", 9, "bold"),
-            fg="#1d4ed8",
-            bg="#eff6ff",
-            cursor="hand2",
-        )
-        dz_lbl.pack(fill=tk.X)
-        drop_zone.bind("<Button-1>", lambda _e: self._fel_add_folder())
-        dz_lbl.bind("<Button-1>", lambda _e: self._fel_add_folder())
 
         btn_bar = ttk.Frame(cfg_frame)
         btn_bar.pack(fill=tk.X, pady=(0, 6))
 
         ttk.Button(
             btn_bar,
-            text="📁 选择文件夹批量载入...",
+            text="选择文件夹批量载入...",
             style="Action.TButton",
             command=self._fel_add_folder,
         ).pack(side=tk.LEFT, padx=(0, 6))
         ttk.Button(
             btn_bar,
-            text="📄 选择 Word 文档 (支持单篇多Part或多文件)...",
+            text="选择 Word 文档...",
             style="Action.TButton",
             command=self._fel_add_files,
         ).pack(side=tk.LEFT, padx=(0, 6))
-        ttk.Button(btn_bar, text="🗑️ 移除选中", command=self._fel_remove_selected).pack(side=tk.LEFT, padx=(0, 6))
-        ttk.Button(btn_bar, text="🧹 清空列表", command=self._fel_clear_all).pack(side=tk.LEFT)
-
-        self.fel_pool_btn = ttk.Button(
-            btn_bar,
-            textvariable=self.pool_btn_text_var,
-            command=self._open_key_pool_dialog,
-        )
-        self.fel_pool_btn.pack(side=tk.RIGHT)
+        ttk.Button(btn_bar, text="移除选中", command=self._fel_remove_selected).pack(side=tk.LEFT, padx=(0, 6))
+        ttk.Button(btn_bar, text="清空列表", command=self._fel_clear_all).pack(side=tk.LEFT)
 
         out_row = ttk.Frame(cfg_frame)
         out_row.pack(fill=tk.X, pady=3)
+        ttk.Button(out_row, text="打开目录", style="Compact.TButton", command=self._fel_open_output_dir).pack(
+            side=tk.RIGHT, padx=(2, 0)
+        )
+        ttk.Button(out_row, text="浏览...", style="Compact.TButton", command=self._fel_browse_output).pack(
+            side=tk.RIGHT, padx=2
+        )
         self.lbl_fel_output_dir = ttk.Label(out_row, text="输出保存目录：")
         self.lbl_fel_output_dir.pack(side=tk.LEFT)
         self.ent_fel_output_dir = ttk.Entry(out_row, textvariable=self.fel_output_dir_var)
         self.ent_fel_output_dir.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=4)
-        ttk.Button(out_row, text="浏览...", width=9, command=self._fel_browse_output).pack(side=tk.LEFT, padx=2)
-        ttk.Button(out_row, text="打开目录", width=9, command=self._fel_open_output_dir).pack(side=tk.LEFT, padx=(2, 0))
 
         opt_row = ttk.Frame(cfg_frame)
         opt_row.pack(fill=tk.X, pady=3)
@@ -2935,14 +3286,16 @@ class ScatteredRevisionApp:
             opt_row,
             textvariable=self.fel_lang_var,
             values=get_combo_values(self.languages),
-            width=22,
+            width=20,
         )
         self.fel_lang_cb.pack(side=tk.LEFT, padx=(4, 4))
         self.fel_lang_cb.bind("<<ComboboxSelected>>", self._fel_on_lang_changed)
 
-        ttk.Button(opt_row, text="➕ 管理语种/字体", command=self._open_lang_manager).pack(side=tk.LEFT, padx=(0, 10))
+        ttk.Button(opt_row, text="管理语种/字体...", style="Compact.TButton", command=self._open_lang_manager).pack(
+            side=tk.LEFT, padx=(0, 10)
+        )
 
-        ttk.Label(opt_row, text="三语前缀(可改)：").pack(side=tk.LEFT)
+        ttk.Label(opt_row, text="三语前缀：").pack(side=tk.LEFT)
         fel_pfx_ent = ttk.Entry(opt_row, textvariable=self.fel_tri_prefix_var, width=10)
         fel_pfx_ent.pack(side=tk.LEFT, padx=(3, 10))
         fel_pfx_ent.bind("<KeyRelease>", lambda _e: self._fel_refresh_previews())
@@ -2958,7 +3311,7 @@ class ScatteredRevisionApp:
             textvariable=self.fel_quote_label_var,
             values=[q[0] for q in QUOTE_MODES],
             state="readonly",
-            width=26,
+            width=24,
         ).pack(side=tk.LEFT, padx=(3, 0), fill=tk.X, expand=True)
 
         mode_row = ttk.Frame(cfg_frame)
@@ -2993,14 +3346,14 @@ class ScatteredRevisionApp:
 
         # 2. Sorted Part List & Output Filename Preview Treeview
         tbl_box = ttk.LabelFrame(
-            parent,
+            upper,
             text=" 2. 分篇顺序与输出定稿命名预览（自动合并格线防错位 · 横向 A4 · 清理句尾空格与格底空行 · 标准语系字号） ",
             padding=6,
         )
-        tbl_box.pack(fill=tk.BOTH, expand=True, pady=(0, 6))
+        tbl_box.pack(side=tk.TOP, fill=tk.BOTH, expand=True, pady=(0, 4))
 
         cols = ("seq", "old_name", "part_tag", "rows", "preview_name")
-        self.fel_tree = ttk.Treeview(tbl_box, columns=cols, show="headings", selectmode="extended", height=6)
+        self.fel_tree = ttk.Treeview(tbl_box, columns=cols, show="headings", selectmode="extended", height=5)
         self.fel_tree.heading("seq", text="排序")
         self.fel_tree.heading("old_name", text="原文档名")
         self.fel_tree.heading("part_tag", text="分篇号")
@@ -3019,30 +3372,36 @@ class ScatteredRevisionApp:
         fel_vsb.pack(side=tk.RIGHT, fill=tk.Y)
         self.fel_tree.bind("<Double-1>", self._fel_open_selected_folder)
 
-        # 3. Execute & Progress Frame
-        act_box = ttk.LabelFrame(parent, text=" 3. 一键执行与实时日志 ", padding=8)
-        act_box.pack(fill=tk.BOTH, expand=True)
+        # 3. Execute & Progress Frame (Lower Resizable Pane)
+        act_box = ttk.LabelFrame(lower, text=" 3. 一键执行与实时日志（可拖动上方分隔条调节高度） ", padding=8)
+        act_box.pack(fill=tk.BOTH, expand=True, pady=(2, 0))
 
         run_row = ttk.Frame(act_box)
-        run_row.pack(fill=tk.X)
+        run_row.pack(side=tk.TOP, fill=tk.X)
+
+        # Pack primary button FIRST so long preview filenames never squeeze the button
+        self.btn_fel_run = _make_primary_btn(
+            run_row,
+            text="开始分part稿整理/合并",
+            command=self._on_run_fellowship,
+        )
+        self.btn_fel_run.pack(side=tk.RIGHT, padx=(10, 0))
 
         ttk.Label(
             run_row,
             textvariable=self.fel_summary_var,
             font=("Microsoft YaHei UI", 9, "bold"),
-            foreground="#1e293b",
+            foreground="#0f172a",
         ).pack(side=tk.LEFT, fill=tk.X, expand=True)
 
-        self.btn_fel_run = ttk.Button(
-            run_row,
-            text="⚡ 开始分part稿整理/合并",
-            style="Primary.TButton",
-            command=self._on_run_fellowship,
-        )
-        self.btn_fel_run.pack(side=tk.RIGHT)
-
         p_info = ttk.Frame(act_box)
-        p_info.pack(fill=tk.X, pady=(6, 2))
+        p_info.pack(side=tk.TOP, fill=tk.X, pady=(6, 2))
+        ttk.Label(
+            p_info,
+            textvariable=self.fel_pct_timer_var,
+            font=("Consolas", 9, "bold"),
+            foreground="#0f172a",
+        ).pack(side=tk.RIGHT, padx=(8, 0))
         self.fel_stage_lbl = ttk.Label(
             p_info,
             textvariable=self.fel_stage_var,
@@ -3050,23 +3409,27 @@ class ScatteredRevisionApp:
             foreground="#1d4ed8",
         )
         self.fel_stage_lbl.pack(side=tk.LEFT, fill=tk.X, expand=True)
-        ttk.Label(
-            p_info,
-            textvariable=self.fel_pct_timer_var,
-            font=("Consolas", 9, "bold"),
-            foreground="#0f172a",
-        ).pack(side=tk.RIGHT)
 
         ttk.Progressbar(
             act_box,
             mode="determinate",
             maximum=100.0,
             variable=self.fel_progress_var,
-        ).pack(fill=tk.X, pady=(0, 5))
+        ).pack(side=tk.TOP, fill=tk.X, pady=(0, 5))
+
+        fel_log_bar = ttk.Frame(act_box)
+        fel_log_bar.pack(side=tk.TOP, fill=tk.X, pady=(0, 3))
+        ttk.Button(
+            fel_log_bar,
+            text="清空日志",
+            style="Compact.TButton",
+            command=lambda: self._clear_log_widget(self.fel_log_text),
+        ).pack(side=tk.RIGHT)
+        ttk.Label(fel_log_bar, text="合并排版、样式同步与导出日志：", foreground="#475569").pack(side=tk.LEFT)
 
         log_wrap = ttk.Frame(act_box)
-        log_wrap.pack(fill=tk.BOTH, expand=True)
-        self.fel_log_text = self._create_styled_log_text(log_wrap, height=5)
+        log_wrap.pack(side=tk.TOP, fill=tk.BOTH, expand=True)
+        self.fel_log_text = self._create_styled_log_text(log_wrap, height=4)
         self.fel_log_text.insert(
             tk.END,
             "提示：支持多份分篇文档（Part 1..N）按序整理/合并，也支持单个文档内包含多段 Part 标题与表格自动合并统一列宽。\n",
@@ -3091,7 +3454,7 @@ class ScatteredRevisionApp:
         tw.tag_configure("ok", foreground="#15803d", font=("Microsoft YaHei UI", 9, "bold"))
         tw.tag_configure("err", foreground="#b91c1c", font=("Microsoft YaHei UI", 9, "bold"))
         tw.tag_configure("retry", foreground="#b45309")
-        tw.tag_configure("dim", foreground="#64748b")
+        tw.tag_configure("dim", foreground="#475569")
         sb = ttk.Scrollbar(parent, orient=tk.VERTICAL, command=tw.yview)
         tw.configure(yscrollcommand=sb.set)
         tw.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
@@ -3164,7 +3527,7 @@ class ScatteredRevisionApp:
     def _refresh_library_index_manual(self, lib_dir: str, target_tab: str = "main"):
         raw = (lib_dir or "").strip()
         if not raw:
-            messagebox.showinfo("提示", "请先选择【语种总库目录】，再点击「🔄 刷新总库」。")
+            messagebox.showinfo("提示", "请先选择【语种总库目录】，再点击「刷新总库」。")
             return
         self._save_settings()
         self._warm_library_index_async(raw, force_rebuild=True, target_tab=target_tab)
@@ -4341,7 +4704,7 @@ class ScatteredRevisionApp:
     def _wc_execute_rename(self):
         self._save_settings()
         if not self.wc_files:
-            messagebox.showwarning("提示", "请先点击「📄 选择 Word 文档」添加需要计算字数的 .docx 文件。")
+            messagebox.showwarning("提示", "请先点击「选择 Word 文档...」添加需要计算字数的 .docx 文件。")
             return
 
         copy_dir = None
@@ -4431,13 +4794,16 @@ class ScatteredRevisionApp:
             return "break"
 
         existing_keys = []
-        try:
-            sel_first = self.key_entry.index(tk.SEL_FIRST)
-            sel_last = self.key_entry.index(tk.SEL_LAST)
-            cur_txt = self.api_key_var.get()
-            rem_txt = cur_txt[:sel_first] + cur_txt[sel_last:]
-            existing_keys = parse_api_keys(rem_txt)
-        except tk.TclError:
+        if self.key_entry is not None:
+            try:
+                sel_first = self.key_entry.index(tk.SEL_FIRST)
+                sel_last = self.key_entry.index(tk.SEL_LAST)
+                cur_txt = self.api_key_var.get()
+                rem_txt = cur_txt[:sel_first] + cur_txt[sel_last:]
+                existing_keys = parse_api_keys(rem_txt)
+            except tk.TclError:
+                existing_keys = parse_api_keys(self.api_key_var.get())
+        else:
             existing_keys = parse_api_keys(self.api_key_var.get())
 
         merged = parse_api_keys(existing_keys + pasted_keys)
@@ -4446,7 +4812,7 @@ class ScatteredRevisionApp:
         else:
             self._set_pool_multiline_and_sync_entry("\n".join(merged))
         self._save_settings()
-        self._append_log(f"🔑 已从剪贴板粘贴多行密钥，当前密钥池共 {len(merged)} 个不重复 Key。", target_tab="main")
+        self._append_log(f"已从剪贴板粘贴多行密钥，当前密钥池共 {len(merged)} 个不重复 Key。", target_tab="main")
         return "break"
 
     def _open_key_pool_dialog(self):
@@ -4457,7 +4823,10 @@ class ScatteredRevisionApp:
             self._set_pool_multiline_and_sync_entry(new_raw_txt)
             self._save_settings()
             cnt = len(self._get_all_keys_list())
-            self._append_log(f"✅ 密钥池已更新：当前共 {cnt} 个 API Key | 策略：{new_rot_label}", target_tab=self.active_tab_key)
+            self._append_log(
+                f"✅ 密钥池已更新：当前共 {cnt} 个 API Key | 通道：{self.api_mode_label.get()} | 策略：{new_rot_label}",
+                target_tab=self.active_tab_key,
+            )
 
         ApiKeyPoolDialog(
             self.root,
@@ -4466,6 +4835,8 @@ class ScatteredRevisionApp:
             model_id=self._get_model_id(),
             api_mode=self._get_api_mode_code(),
             on_save_cb=_on_saved,
+            api_mode_label_var=self.api_mode_label,
+            remember_key_var=self.remember_key_var,
         )
 
     def _open_lang_manager(self):
@@ -4495,7 +4866,8 @@ class ScatteredRevisionApp:
         self.log_text.delete("1.0", tk.END)
 
     def _toggle_key_visibility(self):
-        self.key_entry.configure(show="" if self.show_key_var.get() else "•")
+        if self.key_entry is not None:
+            self.key_entry.configure(show="" if self.show_key_var.get() else "•")
 
     def _browse_input(self):
         p = filedialog.askopenfilename(
@@ -4696,7 +5068,8 @@ class ScatteredRevisionApp:
             self.btn_fel_run,
             self.fel_pool_btn,
         ):
-            b.configure(state=state)
+            if b is not None:
+                b.configure(state=state)
 
         pvar, svar, slbl, tvar = self._get_tab_status_widgets(tab_key)
         if running:
@@ -4726,23 +5099,24 @@ class ScatteredRevisionApp:
         model = self._get_model_id()
         mode = self._get_api_mode_code()
         if not keys:
-            messagebox.showwarning("提示", "请先输入至少 1 个 Gemini API Key 或 Vertex API Key。")
+            messagebox.showwarning("提示", "请先点击顶部工具栏「API 密钥池」填入至少 1 个 Gemini 或 Vertex API Key。")
             return
 
-        self._set_running(True, final_stage=f"正在测试 {len(keys)} 个 API Key 与模型 {model} ...", tab_key="main")
+        log_tab = self.active_tab_key if self.active_tab_key in ("main", "fa", "dd", "fel") else "main"
+        self._set_running(True, final_stage=f"正在测试 {len(keys)} 个 API Key 与模型 {model} ...", tab_key=log_tab)
         self._progress(25.0, f"正在验证密钥池（共 {len(keys)} 个 Key）与模型 {model} ...")
-        self._log(f"▶ 开始测试 API 密钥池（共 {len(keys)} 个 Key | 模型：{model}）...", target_tab="main")
+        self._log(f"▶ 开始测试 API 密钥池（共 {len(keys)} 个 Key | 模型：{model}）...", target_tab=log_tab)
 
         def worker():
             try:
-                msg = test_api_connection(keys, model, mode, log_fn=lambda m: self._log(m, target_tab="main"))
-                self._log(f"✅ {msg}", target_tab="main")
-                self.log_queue.put(("done", (True, msg, "main")))
+                msg = test_api_connection(keys, model, mode, log_fn=lambda m: self._log(m, target_tab=log_tab))
+                self._log(f"✅ {msg}", target_tab=log_tab)
+                self.log_queue.put(("done", (True, msg, log_tab)))
                 self.log_queue.put(("popup_info", ("连接测试通过", msg)))
             except Exception as ex:
                 friendly = _format_exception_concise(ex, keys=keys, api_related=True)
-                self._log(f"❌ {friendly}", target_tab="main")
-                self.log_queue.put(("done", (False, friendly, "main")))
+                self._log(f"❌ {friendly}", target_tab=log_tab)
+                self.log_queue.put(("done", (False, friendly, log_tab)))
                 self.log_queue.put(("popup_error", ("API 连接失败", friendly)))
 
         threading.Thread(target=worker, daemon=True).start()
