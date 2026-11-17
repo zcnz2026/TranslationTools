@@ -1,7 +1,9 @@
 from concurrent.futures import ThreadPoolExecutor
 import importlib
+import inspect
 import io
 import json
+import os
 import re
 import shutil
 import sys
@@ -10,7 +12,7 @@ import time
 from contextlib import redirect_stdout
 from datetime import datetime
 from pathlib import Path
-from typing import Callable, List, Optional, Tuple, Union
+from typing import Callable, Dict, List, Optional, Tuple, Union
 from unittest.mock import patch
 
 
@@ -35,31 +37,84 @@ import step1_render_draft  # noqa: E402
 import step2_parse_reviewed  # noqa: E402
 import step2_render_final  # noqa: E402
 from ai_client import ApiKeyPool, align_step2_spans, evaluate_step1_decisions  # noqa: E402
+from dedup_checker import remove_unmerged_duplicates_from_docx  # noqa: E402
 from lang_registry import find_lang_display_name, get_languages_file, load_languages  # noqa: E402
 from security_utils import get_secure_user_workdir, parse_api_keys  # noqa: E402
-from word_counter import parse_doc_filename  # noqa: E402
+from word_counter import (  # noqa: E402
+    balance_trilingual_table_widths,
+    ensure_three_column_tables_and_landscape,
+    format_counted_docx_name,
+    parse_doc_filename,
+    resolve_doc_naming_label,
+    update_top_highlight_instruction_lines,
+)
 
 # Ensure SCATTERED_REV_LANGUAGES_JSON env var points to external languages.json
 get_languages_file()
 
-_OUTPUT_COUNT_TAG_RE = re.compile(r"_\(UP\s+\d+\s+words,\s*RV\s+\d+\s+words\)_", re.IGNORECASE)
+_OUTPUT_COUNT_TAG_RE = re.compile(
+    r"_\((?:UP\s+\d+\s+words(?:,\s*RV\s+\d+\s+words)?|RV\s+\d+\s+words)\)_",
+    re.IGNORECASE,
+)
 _WORD_COUNTS_STDOUT_RE = re.compile(r"Final Col 2 Word Counts:\s*UP\s*=\s*(\d+)\s*words,\s*RV\s*=\s*(\d+)\s*words")
+_CLI_FLAG_SUPPORT_CACHE: Dict[Tuple[str, str], bool] = {}
+
+
+def _script_supports_cli_flag(mod, flag: str, fallback_utils_attr: str) -> bool:
+    key = (getattr(mod, "__name__", str(mod)), flag)
+    if key in _CLI_FLAG_SUPPORT_CACHE:
+        return _CLI_FLAG_SUPPORT_CACHE[key]
+
+    supported = False
+    mod_file = getattr(mod, "__file__", "")
+    if mod_file:
+        pf = Path(mod_file)
+        if pf.is_file() and pf.suffix.lower() == ".py":
+            try:
+                supported = flag in pf.read_text(encoding="utf-8", errors="ignore")
+                _CLI_FLAG_SUPPORT_CACHE[key] = supported
+                return supported
+            except OSError:
+                pass
+    supported = callable(getattr(docx_xml_utils, fallback_utils_attr, None))
+    _CLI_FLAG_SUPPORT_CACHE[key] = supported
+    return supported
 
 
 def ensure_library_index(
     library_dir: Union[str, Path],
     log_fn: Optional[Callable[[str], None]] = None,
     max_workers: int = 8,
+    force_rebuild: bool = False,
 ) -> dict:
     """
     Build or refresh the persistent multi-threaded library index via `library_index.ensure_library_index`,
-    with a safe standalone fallback if `library_index` is not yet present on disk.
+    forwarding `force_rebuild` (with safe fallback when running standalone before branch merge).
     """
     _ensure_skill_scripts_on_path()
     try:
         lib_idx_mod = importlib.import_module("library_index")
         fn = getattr(lib_idx_mod, "ensure_library_index", None)
         if callable(fn):
+            sig = inspect.signature(fn)
+            if "force_rebuild" in sig.parameters:
+                return fn(
+                    library_dir,
+                    log_fn=log_fn,
+                    max_workers=max_workers,
+                    force_rebuild=bool(force_rebuild),
+                )
+            if force_rebuild:
+                resolved_lib = Path(library_dir).resolve()
+                mem_cache = getattr(lib_idx_mod, "_MEM_INDEX_CACHE", None)
+                if isinstance(mem_cache, dict):
+                    mem_cache.pop(os.path.normcase(str(resolved_lib)), None)
+                res_cache_fn = getattr(lib_idx_mod, "_resolve_cache_path", None)
+                if callable(res_cache_fn):
+                    try:
+                        Path(res_cache_fn(resolved_lib)).unlink(missing_ok=True)
+                    except OSError:
+                        pass
             return fn(library_dir, log_fn=log_fn, max_workers=max_workers)
     except ModuleNotFoundError:
         pass
@@ -109,31 +164,46 @@ def ensure_library_index(
 
 
 class _LiveLogWriter(io.TextIOBase):
-    """Captures stdout while streaming each completed line immediately to log_fn."""
+    """Captures stdout while streaming each completed line immediately to log_fn (safe even when log_fn=print)."""
 
     def __init__(self, log_fn: Optional[Callable[[str], None]] = None):
         super().__init__()
         self._log_fn = log_fn
+        self._orig_stdout = sys.stdout
+        self._in_emit = False
         self._full = []
         self._buf = ""
+
+    def _emit_line(self, text: str) -> None:
+        if not self._log_fn or self._in_emit:
+            return
+        self._in_emit = True
+        cur_out = sys.stdout
+        try:
+            sys.stdout = self._orig_stdout
+            self._log_fn(text)
+        finally:
+            sys.stdout = cur_out
+            self._in_emit = False
 
     def write(self, s: str) -> int:
         if not s:
             return 0
         self._full.append(s)
-        if self._log_fn:
+        if self._log_fn and not self._in_emit:
             self._buf += s
             while "\n" in self._buf:
                 line, self._buf = self._buf.split("\n", 1)
                 line = line.rstrip("\r")
                 if line.strip():
-                    self._log_fn(f"  {line}")
+                    self._emit_line(f"  {line}")
         return len(s)
 
     def flush(self):
-        if self._log_fn and self._buf.strip():
-            self._log_fn(f"  {self._buf.rstrip()}")
+        if self._log_fn and not self._in_emit and self._buf.strip():
+            rem = self._buf.rstrip()
             self._buf = ""
+            self._emit_line(f"  {rem}")
 
     def getvalue(self) -> str:
         self.flush()
@@ -155,6 +225,29 @@ def clean_doc_label(stem: str) -> str:
     known_codes = {e["code"].upper() for e in load_languages() if e.get("code")}
     parsed = parse_doc_filename(stem, known_codes=known_codes, strip_draft_prefix=True)
     return docx_xml_utils.sanitize_filename_part(parsed["orig_name"], fallback="Document", max_len=140)
+
+
+def _resolve_pipeline_doc_label(
+    explicit_doc_name: str,
+    naming_mode: str,
+    scattered_keyword: str,
+    fallback_stem: str,
+    source_docx_path: Optional[Path] = None,
+) -> str:
+    exp = (explicit_doc_name or "").strip()
+    if exp:
+        return docx_xml_utils.sanitize_filename_part(exp, fallback="Document", max_len=140)
+    fallback_lbl = clean_doc_label(fallback_stem)
+    mode = (naming_mode or "keep").strip().lower()
+    if mode in ("scattered", "full"):
+        resolved = resolve_doc_naming_label(
+            naming_mode=mode,
+            fallback_orig_name=fallback_lbl,
+            scattered_keyword=scattered_keyword,
+            docx_path=source_docx_path,
+        )
+        return docx_xml_utils.sanitize_filename_part(resolved, fallback=fallback_lbl, max_len=140)
+    return fallback_lbl
 
 
 def _prepare_optional_pool(
@@ -188,6 +281,7 @@ def run_step1_pipeline(
     log_fn: Optional[Callable[[str], None]] = None,
     progress_fn: Optional[Callable[[float, str], None]] = None,
     enable_ai: bool = True,
+    force_full_diff: bool = False,
 ) -> dict:
     pool_or_keys, eff_rot, has_keys, effective_ai = _prepare_optional_pool(
         api_key=api_key,
@@ -206,6 +300,20 @@ def run_step1_pipeline(
 
     safe_inp_stem = docx_xml_utils.sanitize_filename_part(inp_p.stem, fallback="原稿")
     wdir = _get_work_dir(safe_inp_stem)
+
+    # Standalone fallback: auto-expand 2-column tables if `xml-core` has not yet merged into `docx_xml_utils`
+    effective_inp_p = inp_p
+    if not callable(getattr(docx_xml_utils, "ensure_three_column_tables_and_landscape", None)):
+        inp_root, _, inp_ns = docx_xml_utils.load_docx_xml(inp_p)
+        exp_cnt = ensure_three_column_tables_and_landscape(inp_root)
+        if exp_cnt > 0:
+            pre_path = wdir / "_preprocessed_input.docx"
+            inp_cmts = docx_xml_utils.load_docx_comments_xml(inp_p)
+            docx_xml_utils.save_docx_xml(inp_p, pre_path, inp_root, inp_ns, comments_root=inp_cmts)
+            effective_inp_p = pre_path
+            if log_fn:
+                log_fn(f"  ℹ️ 检测到双列表格，已自动扩展 {exp_cnt} 个表格为三列并设为横向 A4。")
+
     if progress_fn:
         progress_fn(5.0, "第一步 (1/3)：正在检索语种总库、提取浅蓝底色细粒度修订...")
     if log_fn:
@@ -213,13 +321,15 @@ def run_step1_pipeline(
 
     argv1 = [
         "step1_extract_and_diff.py",
-        "--input", str(inp_p),
+        "--input", str(effective_inp_p),
         "--library", str(lib_p),
         "--workdir", str(wdir),
     ]
     clean_lang = (lang or "").strip().upper()
     if clean_lang and clean_lang != "AUTO":
         argv1.extend(["--lang", clean_lang])
+    if force_full_diff and _script_supports_cli_flag(step1_extract_and_diff, "--force-full-diff", "format_up_rv_count_tag"):
+        argv1.append("--force-full-diff")
 
     _run_module_main(step1_extract_and_diff.main, argv1, log_fn=log_fn)
 
@@ -312,6 +422,57 @@ def run_step1_pipeline(
     }
 
 
+def _postprocess_rendered_docx(
+    saved_path: Path,
+    lang_code: str,
+    target_label: str,
+    date_yyyymmdd: str,
+    balance_columns: bool,
+    step2_native_v17: bool,
+) -> Tuple[Path, int, int]:
+    """
+    Ensure every rendered output file has:
+      - Balanced 3-column table widths (when `balance_columns=True`)
+      - Top 'Blue/Yellow highlighted parts...' instruction lines synchronized with UP/RV counts
+      - Zero word counts omitted in filename (`format_counted_docx_name`)
+    Works identically both before and after `xml-core` merges!
+    """
+    cfg = docx_xml_utils.load_config()
+    col2_up = cfg.get("col2_up_highlight", "yellow")
+    col2_rv = cfg.get("col2_rv_highlight", "cyan")
+
+    root, _, ns_pairs = docx_xml_utils.load_docx_xml(saved_path)
+    u_w, r_w = docx_xml_utils.compute_col2_up_rv_words(root, up_color=col2_up, rv_color=col2_rv)
+
+    desired_name = format_counted_docx_name(
+        lang_code=lang_code,
+        orig_name=target_label,
+        up_words=u_w,
+        rv_words=r_w,
+        date_yyyymmdd=date_yyyymmdd,
+    )
+    desired_path = docx_xml_utils.safe_join_output_file(saved_path.parent, desired_name)
+
+    if not step2_native_v17:
+        comments_root = docx_xml_utils.load_docx_comments_xml(saved_path)
+        if balance_columns:
+            balance_trilingual_table_widths(root)
+        update_top_highlight_instruction_lines(root, has_up=(u_w > 0), has_rv=(r_w > 0))
+        docx_xml_utils.save_docx_xml(saved_path, desired_path, root, ns_pairs, comments_root=comments_root)
+        if os.path.normcase(str(desired_path.resolve())) != os.path.normcase(str(saved_path.resolve())):
+            try:
+                saved_path.unlink(missing_ok=True)
+            except OSError:
+                pass
+        return desired_path, int(u_w), int(r_w)
+
+    if os.path.normcase(str(desired_path.resolve())) != os.path.normcase(str(saved_path.resolve())):
+        if desired_path.exists():
+            desired_path.unlink()
+        saved_path.rename(desired_path)
+    return desired_path, int(u_w), int(r_w)
+
+
 def run_step2_pipeline(
     draft_docx: str,
     output_dir: str,
@@ -326,6 +487,11 @@ def run_step2_pipeline(
     log_fn: Optional[Callable[[str], None]] = None,
     progress_fn: Optional[Callable[[float, str], None]] = None,
     enable_ai: bool = True,
+    naming_mode: str = "keep",
+    scattered_keyword: str = "",
+    balance_columns: bool = True,
+    dedup_pkg_dir: str = "",
+    date_str: str = "",
 ) -> dict:
     pool_or_keys, eff_rot, has_keys, effective_ai = _prepare_optional_pool(
         api_key=api_key,
@@ -351,8 +517,14 @@ def run_step2_pipeline(
         else:
             clean_lang = "XX"
 
-    base_label = (doc_name or "").strip() or clean_doc_label(draft_p.stem)
-    date_yyyymmdd = (date_mmdd or "").strip() or datetime.now().strftime("%Y%m%d")
+    base_label = _resolve_pipeline_doc_label(
+        explicit_doc_name=doc_name,
+        naming_mode=naming_mode,
+        scattered_keyword=scattered_keyword,
+        fallback_stem=draft_p.stem,
+        source_docx_path=draft_p,
+    )
+    date_yyyymmdd = (date_str or date_mmdd or "").strip() or datetime.now().strftime("%Y%m%d")
 
     if progress_fn:
         progress_fn(5.0, "第二步 (1/3)：正在解析初筛稿高亮区间...")
@@ -405,9 +577,17 @@ def run_step2_pipeline(
     with open(alignments_path, "w", encoding="utf-8") as f:
         json.dump(alignments, f, ensure_ascii=False, indent=2)
 
+    supports_no_bal = _script_supports_cli_flag(
+        step2_render_final, "--no-balance-columns", "balance_trilingual_table_widths"
+    )
+    step2_native_v17 = supports_no_bal and callable(getattr(docx_xml_utils, "format_up_rv_count_tag", None))
+
     saved_files: List[str] = []
     up_words: Optional[int] = None
     rv_words: Optional[int] = None
+    dedup_removed_count = 0
+    dedup_report_path = ""
+    clean_dedup_dir = (dedup_pkg_dir or "").strip()
 
     if dual_outputs:
         if progress_fn:
@@ -421,28 +601,64 @@ def run_step2_pipeline(
         ]
         for idx, (label_suffix, filter_flag, desc_lbl) in enumerate(variants):
             if progress_fn:
-                progress_fn(89.0 + idx * 3.5, f"第二步 (3/3)：正在写出 {desc_lbl} ...")
+                progress_fn(89.0 + idx * 3.0, f"第二步 (3/3)：正在写出 {desc_lbl} ...")
+            target_label = f"{base_label}{label_suffix}"
             argv2b = [
                 "step2_render_final.py",
                 "--tasks", str(tasks_path),
                 "--alignments", str(alignments_path),
                 "--outdir", str(out_d),
                 "--lang", clean_lang,
-                "--doc-name", f"{base_label}{label_suffix}",
+                "--doc-name", target_label,
                 "--date", date_yyyymmdd,
             ]
             if filter_flag:
                 argv2b.append(filter_flag)
+            if not balance_columns and supports_no_bal:
+                argv2b.append("--no-balance-columns")
             out_txt = _run_module_main(step2_render_final.main, argv2b, log_fn=log_fn)
             m = re.search(r"Final Document Saved:\s*(.+)", out_txt)
             if m:
-                saved_files.append(m.group(1).strip())
-            # Capture true UP / RV counts from 发译者版 (idx 0) or 完整留底版 (idx 1), never overwritten by 无改点版 (0, 0)
-            if idx in (0, 1) and up_words is None:
-                m_wc = _WORD_COUNTS_STDOUT_RE.search(out_txt)
-                if m_wc:
-                    up_words = int(m_wc.group(1))
-                    rv_words = int(m_wc.group(2))
+                raw_saved = Path(m.group(1).strip())
+                final_p, u_w, r_w = _postprocess_rendered_docx(
+                    saved_path=raw_saved,
+                    lang_code=clean_lang,
+                    target_label=target_label,
+                    date_yyyymmdd=date_yyyymmdd,
+                    balance_columns=bool(balance_columns),
+                    step2_native_v17=step2_native_v17,
+                )
+                if idx == 0 and clean_dedup_dir:
+                    d_res = remove_unmerged_duplicates_from_docx(
+                        docx_path=final_p,
+                        unmerged_pkg_dir=clean_dedup_dir,
+                        report_dir=out_d,
+                        doc_tag=base_label,
+                        log_fn=log_fn,
+                        balance_columns=bool(balance_columns),
+                        date_str=date_yyyymmdd,
+                    )
+                    dedup_removed_count = int(d_res.get("duplicate_count", 0))
+                    dedup_report_path = str(d_res.get("report_path") or "")
+                    u_w = int(d_res.get("up_words", u_w))
+                    r_w = int(d_res.get("rv_words", r_w))
+                    if dedup_removed_count > 0:
+                        recalc_name = format_counted_docx_name(
+                            lang_code=clean_lang,
+                            orig_name=target_label,
+                            up_words=u_w,
+                            rv_words=r_w,
+                            date_yyyymmdd=date_yyyymmdd,
+                        )
+                        recalc_p = docx_xml_utils.safe_join_output_file(out_d, recalc_name)
+                        if os.path.normcase(str(recalc_p.resolve())) != os.path.normcase(str(final_p.resolve())):
+                            if recalc_p.exists():
+                                recalc_p.unlink()
+                            final_p.rename(recalc_p)
+                            final_p = recalc_p
+                saved_files.append(str(final_p))
+                if idx == 0 or (idx == 1 and up_words is None):
+                    up_words, rv_words = u_w, r_w
     else:
         if progress_fn:
             progress_fn(92.0, "第二步 (3/3)：正在写出最终定稿...")
@@ -457,14 +673,50 @@ def run_step2_pipeline(
             "--doc-name", base_label,
             "--date", date_yyyymmdd,
         ]
+        if not balance_columns and supports_no_bal:
+            argv2b.append("--no-balance-columns")
         out_txt = _run_module_main(step2_render_final.main, argv2b, log_fn=log_fn)
         m = re.search(r"Final Document Saved:\s*(.+)", out_txt)
         if m:
-            saved_files.append(m.group(1).strip())
-        m_wc = _WORD_COUNTS_STDOUT_RE.search(out_txt)
-        if m_wc:
-            up_words = int(m_wc.group(1))
-            rv_words = int(m_wc.group(2))
+            raw_saved = Path(m.group(1).strip())
+            final_p, u_w, r_w = _postprocess_rendered_docx(
+                saved_path=raw_saved,
+                lang_code=clean_lang,
+                target_label=base_label,
+                date_yyyymmdd=date_yyyymmdd,
+                balance_columns=bool(balance_columns),
+                step2_native_v17=step2_native_v17,
+            )
+            if clean_dedup_dir:
+                d_res = remove_unmerged_duplicates_from_docx(
+                    docx_path=final_p,
+                    unmerged_pkg_dir=clean_dedup_dir,
+                    report_dir=out_d,
+                    doc_tag=base_label,
+                    log_fn=log_fn,
+                    balance_columns=bool(balance_columns),
+                    date_str=date_yyyymmdd,
+                )
+                dedup_removed_count = int(d_res.get("duplicate_count", 0))
+                dedup_report_path = str(d_res.get("report_path") or "")
+                u_w = int(d_res.get("up_words", u_w))
+                r_w = int(d_res.get("rv_words", r_w))
+                if dedup_removed_count > 0:
+                    recalc_name = format_counted_docx_name(
+                        lang_code=clean_lang,
+                        orig_name=base_label,
+                        up_words=u_w,
+                        rv_words=r_w,
+                        date_yyyymmdd=date_yyyymmdd,
+                    )
+                    recalc_p = docx_xml_utils.safe_join_output_file(out_d, recalc_name)
+                    if os.path.normcase(str(recalc_p.resolve())) != os.path.normcase(str(final_p.resolve())):
+                        if recalc_p.exists():
+                            recalc_p.unlink()
+                        final_p.rename(recalc_p)
+                        final_p = recalc_p
+            saved_files.append(str(final_p))
+            up_words, rv_words = u_w, r_w
 
     if (up_words is None or rv_words is None) and saved_files:
         try:
@@ -497,6 +749,8 @@ def run_step2_pipeline(
         "rv_words": int(rv_words or 0),
         "used_local_fallback": used_fallback,
         "fallback_reason": fb_reason,
+        "dedup_removed_count": dedup_removed_count,
+        "dedup_report_path": dedup_report_path,
     }
 
 
@@ -512,6 +766,11 @@ def run_oneclick_pipeline(
     doc_name: str = "",
     dual_outputs: bool = True,
     enable_ai: bool = True,
+    naming_mode: str = "scattered",
+    scattered_keyword: str = "",
+    balance_columns: bool = True,
+    dedup_pkg_dir: str = "",
+    date_str: str = "",
     log_fn: Optional[Callable[[str], None]] = None,
     progress_fn: Optional[Callable[[float, str], None]] = None,
     date_mmdd: str = "",
@@ -521,7 +780,8 @@ def run_oneclick_pipeline(
       1. Warms/loads the persistent multi-threaded library index;
       2. Runs Step 1 into an ephemeral temp directory (keeping `output_dir` 100% free of intermediate drafts);
       3. Runs Step 2 (with multi-threaded AI alignment or automatic local approximate Col 3 fallback);
-      4. Outputs clean final `.docx` deliverables to `output_dir`.
+      4. Optionally deduplicates `发译者版` against `dedup_pkg_dir` (`未入库改点包`);
+      5. Outputs clean final `.docx` deliverables (with 0-word counts omitted) to `output_dir`.
     """
     inp_p = Path(input_docx).resolve()
     lib_p = Path(library_dir).resolve()
@@ -547,7 +807,15 @@ def run_oneclick_pipeline(
             f"（{idx_stats.get('total_rows', 0)} 段，耗时 {idx_stats.get('elapsed_sec', 0.0):.2f}s）"
         )
 
-    resolved_doc_name = (doc_name or "").strip() or clean_doc_label(inp_p.stem)
+    resolved_doc_name = _resolve_pipeline_doc_label(
+        explicit_doc_name=doc_name,
+        naming_mode=naming_mode,
+        scattered_keyword=scattered_keyword,
+        fallback_stem=inp_p.stem,
+        source_docx_path=inp_p,
+    )
+    eff_date = (date_str or date_mmdd or "").strip()
+
     tmp_draft_dir = tempfile.mkdtemp(prefix="scattered_rev_draft_")
     try:
         def _prog_s1(p: float, msg: str):
@@ -593,10 +861,15 @@ def run_oneclick_pipeline(
             lang=step2_lang,
             doc_name=resolved_doc_name,
             dual_outputs=dual_outputs,
-            date_mmdd=date_mmdd,
+            date_mmdd=eff_date,
             log_fn=log_fn,
             progress_fn=_prog_s2,
             enable_ai=step2_enable_ai,
+            naming_mode=naming_mode,
+            scattered_keyword=scattered_keyword,
+            balance_columns=balance_columns,
+            dedup_pkg_dir=dedup_pkg_dir,
+            date_str=eff_date,
         )
     finally:
         shutil.rmtree(tmp_draft_dir, ignore_errors=True)
@@ -623,4 +896,6 @@ def run_oneclick_pipeline(
         "rv_words": int(r2.get("rv_words", 0)),
         "total_spans": int(r2.get("total_spans", 0)),
         "edited_sentences": int(r1.get("edited_sentences", 0)),
+        "dedup_removed_count": int(r2.get("dedup_removed_count", 0)),
+        "dedup_report_path": r2.get("dedup_report_path", ""),
     }
