@@ -16,16 +16,19 @@ from docx_xml_utils import (
     clean_and_migrate_col3_paragraphs,
     compute_precision_yellow,
     count_msword_en_words,
+    extract_cell_comment_anchors,
     get_cell_template_ppr,
     get_first_run_rpr,
     insert_rpr_child_ordered,
     load_config,
     load_docx_comments_map,
     load_docx_comments_xml,
+    load_docx_styles_xml,
     load_docx_xml,
     make_run,
     make_track_el,
     new_comments_root,
+    reanchor_comments_to_cell,
     remove_rpr_child,
     save_docx_xml,
 )
@@ -51,10 +54,11 @@ def clean_col3_paragraphs(
     src_comments_map: dict = None,
     target_comments_root: ET.Element = None,
     id_allocator: CommentIdAllocator = None,
+    src_styles_root: ET.Element = None,
 ) -> list:
     """
     Clone text, inline emphasis, and Word comments from library Col 3 while strictly preserving
-    target_tc3 / target_tc2 layout & font formatting and stripping invalid OOXML artifacts.
+    `src_tc3`'s own paragraph & run formatting (`src_styles_root`) and stripping invalid OOXML artifacts.
     """
     return clean_and_migrate_col3_paragraphs(
         src_tc3=src_tc3,
@@ -63,6 +67,7 @@ def clean_col3_paragraphs(
         src_comments_map=src_comments_map,
         target_comments_root=target_comments_root,
         id_allocator=id_allocator,
+        src_styles_root=src_styles_root,
     )
 
 
@@ -121,8 +126,7 @@ def main():
 
     body = root.find("w:body", NS)
 
-    src_cache = {}  # Path -> (list_of_trs, comments_map_dict)
-    rev_id = 1
+    src_cache = {}  # Path -> (list_of_trs, comments_map_dict, styles_root)
     up_texts = []
     rv_texts = []
 
@@ -136,12 +140,13 @@ def main():
         if src_file not in src_cache:
             s_root, _, _ = load_docx_xml(src_file)
             s_cmap = load_docx_comments_map(src_file)
-            src_cache[src_file] = (s_root.findall(".//w:tbl/w:tr", NS), s_cmap)
-        s_trs, s_cmap = src_cache[src_file]
+            s_styles = load_docx_styles_xml(src_file)
+            src_cache[src_file] = (s_root.findall(".//w:tbl/w:tr", NS), s_cmap, s_styles)
+        s_trs, s_cmap, s_styles = src_cache[src_file]
         s_tr = s_trs[rm["source_row_idx"]]
         s_tcs = s_tr.findall("w:tc", NS)
 
-        # 1. Populate Col 3 from library Col 3 while preserving font/size AND migrating Word comments cleanly
+        # 1. Populate Col 3 from library Col 3 while preserving src_tc3's own formatting AND migrating Word comments
         col3_paras = clean_col3_paragraphs(
             src_tc3=s_tcs[2],
             target_tc3=tc3,
@@ -149,6 +154,7 @@ def main():
             src_comments_map=s_cmap,
             target_comments_root=working_comments_root,
             id_allocator=id_allocator,
+            src_styles_root=s_styles,
         )
         tc3_Pr = tc3.find("w:tcPr", NS)
         for ch in list(tc3):
@@ -157,7 +163,10 @@ def main():
         for cp in col3_paras:
             tc3.append(cp)
 
-        # 2. Rebuild Col 2 with white=old, shaded=diff + yellow/cyan (retaining track changes in Step 1!)
+        # 2. Extract any input Col 2 comments BEFORE clearing tc2 so they can be re-anchored onto rebuilt tc2!
+        tc2_comment_anchors = extract_cell_comment_anchors(tc2, working_comments_root)
+
+        # 3. Rebuild Col 2 with white=old, shaded=diff + yellow/cyan (retaining track changes in Step 1!)
         base_rPr = get_first_run_rpr(tc2, fallback_tc=tcs[0])
         orig_pPrs = [
             copy.deepcopy(p_item.find("w:pPr", NS)) if p_item.find("w:pPr", NS) is not None else None
@@ -253,13 +262,14 @@ def main():
                     p_el.append(make_run(txt, base_rPr=base_rPr, highlight=hl, shd_fill=shd, is_del=False))
                 elif kind == "del":
                     r_el = make_run(txt, base_rPr=base_rPr, highlight=hl, shd_fill=None, is_del=True)
-                    p_el.append(make_track_el("del", rev_id, author, date_iso, r_el))
-                    rev_id += 1
+                    p_el.append(make_track_el("del", id_allocator.next_id(), author, date_iso, r_el))
                 elif kind == "ins":
                     r_el = make_run(txt, base_rPr=base_rPr, highlight=hl, shd_fill=shd, is_del=False)
-                    p_el.append(make_track_el("ins", rev_id, author, date_iso, r_el))
-                    rev_id += 1
+                    p_el.append(make_track_el("ins", id_allocator.next_id(), author, date_iso, r_el))
             tc2.append(p_el)
+
+        if tc2_comment_anchors:
+            reanchor_comments_to_cell(tc2, tc2_comment_anchors, working_comments_root, id_allocator)
 
     # 3. Populate skipped rows: keep Col 1 & Col 2 intact, write red `【未在总库匹配到原文，已跳过】` into Col 3
     skipped_list = manifest.get("skipped_rows", [])

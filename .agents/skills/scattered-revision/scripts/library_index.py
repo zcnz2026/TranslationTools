@@ -23,7 +23,7 @@ INDEX_SCHEMA_VERSION = 3
 _FILES_KEY_MARKER = ',"files":{'
 
 _FINAL_OUTPUT_NAME_RE = re.compile(
-    r"_\((?:UP\s+\d+\s+words,\s*RV\s+\d+\s+words|up\s*\d+[\s,]+rv\s*\d+)\)_",
+    r"_\((?:UP\s+\d+\s+words(?:,\s*RV\s+\d+\s+words)?|RV\s+\d+\s+words|up\s*\d+(?:[\s,]+rv\s*\d+)?|rv\s*\d+)\)_",
     re.IGNORECASE,
 )
 _WS_RE = re.compile(r"[\s\u3000\u200b\u200c\ufeff]+")
@@ -139,8 +139,9 @@ def is_excluded_library_file(rel_path: Path, exclude_dir_keywords: List[str]) ->
 
 def _scan_library_docx_stats(resolved_lib_dir: Path, exclude_dir_keywords: List[str]) -> Dict[str, tuple]:
     """
-    Fast recursive os.scandir walk returning {posix_rel_path: (abs_path_str, mtime_ns, size)}.
-    On Windows, DirEntry.stat() uses cached FindFirstFileW metadata without extra syscalls.
+    Recursive os.scandir walk returning {posix_rel_path: (abs_path_str, mtime_ns, size)}.
+    Uses explicit `os.stat(entry.path)` (`st_mtime_ns` + `st_size`) instead of `entry.stat()`
+    so Windows NTFS directory-entry caching never hides modified files!
     """
     kw_lows = [kw.lower() for kw in exclude_dir_keywords if kw]
     found: Dict[str, tuple] = {}
@@ -167,7 +168,7 @@ def _scan_library_docx_stats(resolved_lib_dir: Path, exclude_dir_keywords: List[
                     continue
                 rel_posix = f"{rel_prefix}/{ename}" if rel_prefix else ename
                 try:
-                    st = entry.stat(follow_symlinks=False)
+                    st = os.stat(entry.path)
                 except OSError:
                     continue
                 found[rel_posix] = (entry.path, st.st_mtime_ns, st.st_size)
@@ -291,10 +292,26 @@ class LibraryIndex(dict):
     and fast lazy lookup structures for 5-stage cascading search.
     """
 
+    @staticmethod
+    def _static_file_priority_key(rel_path: str, files_map: Dict[str, dict]) -> tuple:
+        norm_rel = (rel_path or "").replace("\\", "/")
+        fname = norm_rel.rsplit("/", 1)[-1]
+        not_scattered = 0 if "零散" in fname else 1
+        depth = norm_rel.count("/")
+        in_subfolder = 1 if depth > 0 else 0
+        mtime_ns = int(files_map.get(rel_path, {}).get("mtime_ns", 0) or 0)
+        return (not_scattered, in_subfolder, depth, mtime_ns)
+
     def __init__(self, lib_dir: Path, cache_path: Path, files_map: Dict[str, dict], rebuilt_files: int, elapsed_sec: float):
         all_rows: List[dict] = []
         rows_by_rel: Dict[str, List[dict]] = {}
-        for rel_p in sorted(files_map.keys()):
+        # Order files preferring volume subfolders (non-`零散`, deeper relative path) and newer mtime_ns
+        ordered_rels = sorted(
+            files_map.keys(),
+            key=lambda rp: (self._static_file_priority_key(rp, files_map), rp),
+            reverse=True,
+        )
+        for rel_p in ordered_rels:
             f_entry = files_map[rel_p]
             f_rows = f_entry.get("rows", [])
             rows_by_rel[rel_p] = f_rows
@@ -320,6 +337,16 @@ class LibraryIndex(dict):
         self._exact_cn_map: Optional[Dict[str, List[dict]]] = None
         self._loose_list: Optional[List[str]] = None
         self._trigram_postings: Optional[Dict[str, List[int]]] = None
+
+    def get_file_mtime_ns(self, rel_path: str) -> int:
+        return int(self.files_map.get(rel_path, {}).get("mtime_ns", 0) or 0)
+
+    def file_priority_key(self, rel_path: str) -> tuple:
+        """
+        Priority tuple (higher is preferred) when multiple library files match the same paragraph:
+          (not_scattered_filename, is_inside_subfolder, subfolder_depth, mtime_ns)
+        """
+        return self._static_file_priority_key(rel_path, self.files_map)
 
     @property
     def exact_cn_map(self) -> Dict[str, List[dict]]:
@@ -373,13 +400,14 @@ class LibraryIndex(dict):
         if allowed_rels is not None:
             scored = []
             for rel_p in allowed_rels:
+                pkey = self.file_priority_key(rel_p)
                 for r in self.rows_by_rel.get(rel_p, ()):
                     rl = normalize_cn_loose(r["cn_norm"])
                     hits = sum(1 for g in q_grams if g in rl)
                     if hits > 0:
-                        scored.append((hits, r))
-            scored.sort(key=lambda x: x[0], reverse=True)
-            return [r for _, r in scored[:top_k]]
+                        scored.append((hits, pkey, r))
+            scored.sort(key=lambda x: (x[0], x[1]), reverse=True)
+            return [r for _, _, r in scored[:top_k]]
 
         postings = self.trigram_postings
         counts: Dict[int, int] = {}
@@ -390,7 +418,8 @@ class LibraryIndex(dict):
                     counts[r_i] = counts.get(r_i, 0) + 1
         if not counts:
             return []
-        ranked = sorted(counts.items(), key=lambda kv: kv[1], reverse=True)[:top_k]
+        # Note: lower r_i already has higher file_priority_key because self.rows is ordered by file_priority_key desc
+        ranked = sorted(counts.items(), key=lambda kv: (kv[1], -kv[0]), reverse=True)[:top_k]
         return [self.rows[r_i] for r_i, _ in ranked]
 
 
@@ -432,6 +461,7 @@ def _build_or_load_index(
     lib_dir,
     log_fn: Optional[Callable[[str], None]] = None,
     max_workers: int = 8,
+    force_rebuild: bool = False,
 ) -> LibraryIndex:
     t0 = time.perf_counter()
     resolved_lib = Path(lib_dir).resolve()
@@ -442,6 +472,9 @@ def _build_or_load_index(
     lock = _get_lock_for_key(norm_lib_key)
 
     with lock:
+        if force_rebuild:
+            _MEM_INDEX_CACHE.pop(norm_lib_key, None)
+
         cfg = load_config()
         exclude_kws = cfg.get("exclude_library_dir_keywords", ["标记结果", "初筛", "答案", "output", "temp"])
         cache_path = _resolve_cache_path(resolved_lib)
@@ -450,15 +483,16 @@ def _build_or_load_index(
         stat_sig = tuple((rel_p, mt, sz) for rel_p, (_, mt, sz) in sorted(disk_stats.items()))
 
         # Fast path 1: In-process memory cache when disk stats & cache file existence match
-        mem_hit = _MEM_INDEX_CACHE.get(norm_lib_key)
-        if mem_hit is not None and mem_hit[0] == stat_sig and cache_path.exists():
-            elapsed = time.perf_counter() - t0
-            return LibraryIndex(resolved_lib, cache_path, mem_hit[1], rebuilt_files=0, elapsed_sec=elapsed)
+        if not force_rebuild:
+            mem_hit = _MEM_INDEX_CACHE.get(norm_lib_key)
+            if mem_hit is not None and mem_hit[0] == stat_sig and cache_path.exists():
+                elapsed = time.perf_counter() - t0
+                return LibraryIndex(resolved_lib, cache_path, mem_hit[1], rebuilt_files=0, elapsed_sec=elapsed)
 
-        # Load persistent JSON cache if present
+        # Load persistent JSON cache if present (skipped when force_rebuild=True)
         cached_files: Dict[str, dict] = {}
         cache_loaded_ok = False
-        if cache_path.exists():
+        if not force_rebuild and cache_path.exists():
             try:
                 with open(cache_path, "r", encoding="utf-8") as f:
                     raw_cache = json.load(f)
@@ -476,7 +510,7 @@ def _build_or_load_index(
         next_files: Dict[str, dict] = {}
         to_parse = []
         for rel_p, (abs_p, mt, sz) in disk_stats.items():
-            prev = cached_files.get(rel_p)
+            prev = None if force_rebuild else cached_files.get(rel_p)
             if (
                 prev is not None
                 and prev.get("mtime_ns") == mt
@@ -492,8 +526,9 @@ def _build_or_load_index(
 
         if to_parse:
             workers = max(1, min(int(max_workers or 8), len(to_parse)))
-            if log_fn and len(to_parse) >= 5:
-                log_fn(f"📚 正在多线程建立/更新总库索引（需解析 {len(to_parse)}/{len(disk_stats)} 个文档，线程数={workers}）...")
+            if log_fn and (force_rebuild or len(to_parse) >= 5):
+                mode_lbl = "强制全量重建总库索引" if force_rebuild else "多线程建立/更新总库索引"
+                log_fn(f"📚 正在{mode_lbl}（需解析 {len(to_parse)}/{len(disk_stats)} 个文档，线程数={workers}）...")
             if workers == 1:
                 results = [_parse_single_library_docx(t) for t in to_parse]
             else:
@@ -506,7 +541,7 @@ def _build_or_load_index(
                 if err_msg and log_fn:
                     log_fn(f"  ⚠️ 跳过无法读取的总库文件 {rel_p}: {err_msg.splitlines()[0][:100]}")
 
-        need_save = (not cache_loaded_ok) or (rebuilt_count > 0) or (deleted_count > 0)
+        need_save = force_rebuild or (not cache_loaded_ok) or (rebuilt_count > 0) or (deleted_count > 0)
         if need_save:
             total_rows = sum(len(v.get("rows", ())) for v in next_files.values())
             manifest_hdr = {
@@ -547,18 +582,21 @@ def get_library_index(
     lib_dir,
     log_fn: Optional[Callable[[str], None]] = None,
     max_workers: int = 8,
+    force_rebuild: bool = False,
 ) -> LibraryIndex:
-    """Load or incrementally update the persistent library index and return a `LibraryIndex` instance."""
-    return _build_or_load_index(lib_dir, log_fn=log_fn, max_workers=max_workers)
+    """Load or incrementally update (or force-rebuild) the persistent library index and return a `LibraryIndex`."""
+    return _build_or_load_index(lib_dir, log_fn=log_fn, max_workers=max_workers, force_rebuild=force_rebuild)
 
 
 def ensure_library_index(
     lib_dir,
     log_fn: Optional[Callable[[str], None]] = None,
     max_workers: int = 8,
+    force_rebuild: bool = False,
 ) -> dict:
     """
     Ensure the persistent incremental library index for `lib_dir` is up-to-date.
+    When `force_rebuild=True`, clears in-memory cache and re-parses all `.docx` files in `lib_dir`.
     Returns summary dict:
       {"total_files": int, "total_rows": int, "rebuilt_files": int, "cache_path": str, "elapsed_sec": float}
     """
@@ -567,32 +605,33 @@ def ensure_library_index(
     if not resolved_lib.exists() or not resolved_lib.is_dir():
         raise FileNotFoundError(f"找不到语种总库文件夹：{resolved_lib}")
 
-    norm_lib_key = os.path.normcase(str(resolved_lib))
-    lock = _get_lock_for_key(norm_lib_key)
-    with lock:
-        cfg = load_config()
-        exclude_kws = cfg.get("exclude_library_dir_keywords", ["标记结果", "初筛", "答案", "output", "temp"])
-        cache_path = _resolve_cache_path(resolved_lib)
-        disk_stats = _scan_library_docx_stats(resolved_lib, exclude_kws)
-        stat_sig = tuple((rel_p, mt, sz) for rel_p, (_, mt, sz) in sorted(disk_stats.items()))
+    if not force_rebuild:
+        norm_lib_key = os.path.normcase(str(resolved_lib))
+        lock = _get_lock_for_key(norm_lib_key)
+        with lock:
+            cfg = load_config()
+            exclude_kws = cfg.get("exclude_library_dir_keywords", ["标记结果", "初筛", "答案", "output", "temp"])
+            cache_path = _resolve_cache_path(resolved_lib)
+            disk_stats = _scan_library_docx_stats(resolved_lib, exclude_kws)
+            stat_sig = tuple((rel_p, mt, sz) for rel_p, (_, mt, sz) in sorted(disk_stats.items()))
 
-        mem_hit = _MEM_INDEX_CACHE.get(norm_lib_key)
-        if mem_hit is not None and mem_hit[0] == stat_sig and cache_path.exists():
-            tot_rows = sum(len(v.get("rows", ())) for v in mem_hit[1].values())
-            return {
-                "total_files": len(mem_hit[1]),
-                "total_rows": tot_rows,
-                "rebuilt_files": 0,
-                "cache_path": str(cache_path),
-                "elapsed_sec": round(time.perf_counter() - t0, 4),
-            }
+            mem_hit = _MEM_INDEX_CACHE.get(norm_lib_key)
+            if mem_hit is not None and mem_hit[0] == stat_sig and cache_path.exists():
+                tot_rows = sum(len(v.get("rows", ())) for v in mem_hit[1].values())
+                return {
+                    "total_files": len(mem_hit[1]),
+                    "total_rows": tot_rows,
+                    "rebuilt_files": 0,
+                    "cache_path": str(cache_path),
+                    "elapsed_sec": round(time.perf_counter() - t0, 4),
+                }
 
-        fast_res = _try_fast_header_check(cache_path, disk_stats)
-        if fast_res is not None:
-            fast_res["elapsed_sec"] = round(time.perf_counter() - t0, 4)
-            return fast_res
+            fast_res = _try_fast_header_check(cache_path, disk_stats)
+            if fast_res is not None:
+                fast_res["elapsed_sec"] = round(time.perf_counter() - t0, 4)
+                return fast_res
 
-    idx = _build_or_load_index(lib_dir, log_fn=log_fn, max_workers=max_workers)
+    idx = _build_or_load_index(lib_dir, log_fn=log_fn, max_workers=max_workers, force_rebuild=force_rebuild)
     return {
         "total_files": int(idx["total_files"]),
         "total_rows": int(idx["total_rows"]),

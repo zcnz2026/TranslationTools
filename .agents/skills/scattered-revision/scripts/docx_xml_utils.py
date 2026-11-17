@@ -43,6 +43,10 @@ _STRIPPED_COMMENT_REL_TYPES = (
     "/commentsIds",
     "/commentsExtensible",
 )
+_PEOPLE_ZIP_NAMES = frozenset({
+    "word/people.xml",
+    "word/_rels/people.xml.rels",
+})
 
 _ET_NS_LOCK = threading.Lock()
 
@@ -57,8 +61,68 @@ RPR_ORDER = [
 ]
 RPR_RANK = {name: idx for idx, name in enumerate(RPR_ORDER)}
 
+# Strict ECMA-376 CT_PPr child tag order
+PPR_ORDER = [
+    "pStyle", "keepNext", "keepLines", "pageBreakBefore", "framePr",
+    "widowControl", "numPr", "suppressLineNumbers", "pBdr", "shd",
+    "tabs", "suppressAutoHyphens", "kinsoku", "wordWrap", "overflowPunct",
+    "topLinePunct", "autoSpaceDE", "autoSpaceDN", "bidi", "adjustRightInd",
+    "snapToGrid", "spacing", "ind", "contextualSpacing", "mirrorIndents",
+    "suppressOverlap", "jc", "textDirection", "textAlignment",
+    "textboxTightWrap", "outlineLvl", "divId", "cnfStyle", "rPr",
+    "sectPr", "pPrChange",
+]
+PPR_RANK = {name: idx for idx, name in enumerate(PPR_ORDER)}
+
+# Strict ECMA-376 CT_TcPr child tag order
+TCPR_ORDER = [
+    "cnfStyle", "tcW", "gridSpan", "hMerge", "vMerge", "tcBorders",
+    "shd", "noWrap", "tcMar", "textDirection", "tcFitText", "vAlign",
+    "hideMark", "headers", "cellIns", "cellDel", "cellMerge", "tcPrChange",
+]
+TCPR_RANK = {name: idx for idx, name in enumerate(TCPR_ORDER)}
+
+# Strict ECMA-376 CT_TblPr child tag order
+TBLPR_ORDER = [
+    "tblStyle", "tblpPr", "tblOverlap", "bidiVisual", "tblStyleRowBandSize",
+    "tblStyleColBandSize", "tblW", "jc", "tblCellSpacing", "tblInd",
+    "tblBorders", "shd", "tblLayout", "tblCellMar", "tblLook",
+    "tblCaption", "tblDescription", "tblPrChange",
+]
+TBLPR_RANK = {name: idx for idx, name in enumerate(TBLPR_ORDER)}
+
+# Strict ECMA-376 CT_SectPr child tag order
+SECTPR_ORDER = [
+    "headerReference", "footerReference", "footnotePr", "endnotePr", "type",
+    "pgSz", "pgMar", "paperSrc", "pgBorders", "lnNumType", "pgNumType",
+    "cols", "formProt", "vAlign", "noEndnote", "titlePg", "textDirection",
+    "bidi", "rtlGutter", "docGrid", "printerSettings", "sectPrChange",
+]
+SECTPR_RANK = {name: idx for idx, name in enumerate(SECTPR_ORDER)}
+
 INLINE_SEMANTIC_RPR_TAGS = frozenset({
     "b", "bCs", "i", "iCs", "u", "strike", "dstrike", "vertAlign", "caps", "smallCaps", "rtl", "cs"
+})
+
+ALLOWED_COL3_RPR_TAGS = frozenset({
+    "rFonts", "sz", "szCs", "lang", "b", "bCs", "i", "iCs", "u",
+    "rtl", "cs", "color", "vertAlign", "caps", "smallCaps", "strike", "dstrike",
+})
+
+_GLOBAL_MARKUP_ID_TAGS = frozenset({
+    "ins", "del",
+    "rPrChange", "pPrChange", "tblPrChange", "trPrChange", "tcPrChange",
+    "sectPrChange", "tblGridChange", "numberingChange",
+    "bookmarkStart", "bookmarkEnd",
+    "commentRangeStart", "commentRangeEnd", "commentReference", "comment",
+    "moveFrom", "moveTo",
+    "moveFromRangeStart", "moveFromRangeEnd", "moveToRangeStart", "moveToRangeEnd",
+    "customXmlInsRangeStart", "customXmlInsRangeEnd",
+    "customXmlDelRangeStart", "customXmlDelRangeEnd",
+    "customXmlMoveFromRangeStart", "customXmlMoveFromRangeEnd",
+    "customXmlMoveToRangeStart", "customXmlMoveToRangeEnd",
+    "cellIns", "cellDel", "cellMerge",
+    "permStart", "permEnd",
 })
 
 
@@ -318,17 +382,40 @@ def load_docx_comments_map(docx_path: Path) -> dict:
     return out
 
 
-class CommentIdAllocator:
-    """Thread-safe / monotonic integer w:id allocator above all existing comment IDs in target document."""
+def load_docx_styles_xml(docx_path: Path):
+    """Load word/styles.xml from a .docx if present, returning <w:styles> Element or None."""
+    with zipfile.ZipFile(docx_path, "r") as z:
+        _validate_docx_zip(z)
+        if "word/styles.xml" not in z.namelist():
+            return None
+        info = z.getinfo("word/styles.xml")
+        with z.open(info, "r") as fp:
+            xml_bytes = fp.read(MAX_DOCX_MEMBER_BYTES + 1)
+    _assert_safe_openxml_bytes(xml_bytes)
+    return ET.fromstring(xml_bytes)
+
+
+class MarkupIdAllocator:
+    """
+    Unified global OOXML CT_Markup integer w:id allocator.
+    Scans ALL w:id attributes across ins, del, *PrChange, bookmarkStart/End,
+    commentRangeStart/End/Reference, moveFrom/To, etc. in both doc_root and comments_root
+    so newly created revisions, bookmarks, and migrated comments never collide!
+    """
 
     def __init__(self, doc_root: ET.Element = None, comments_root: ET.Element = None):
+        self._lock = threading.Lock()
         max_id = 0
         found_any = False
-        if doc_root is not None:
-            for elem in doc_root.iter():
+        for tree in (doc_root, comments_root):
+            if tree is None:
+                continue
+            for elem in tree.iter():
                 loc = _local_name(elem.tag)
-                if loc in ("commentRangeStart", "commentRangeEnd", "commentReference"):
-                    val = elem.attrib.get(f"{W}id", "").strip()
+                val = elem.attrib.get(f"{W}id", "").strip()
+                if not val and loc in _GLOBAL_MARKUP_ID_TAGS:
+                    val = elem.attrib.get("id", "").strip()
+                if val:
                     try:
                         iv = int(val)
                         found_any = True
@@ -336,22 +423,17 @@ class CommentIdAllocator:
                             max_id = iv
                     except ValueError:
                         pass
-        if comments_root is not None:
-            for c_el in comments_root.findall(f"{W}comment"):
-                val = c_el.attrib.get(f"{W}id", "").strip()
-                try:
-                    iv = int(val)
-                    found_any = True
-                    if iv > max_id:
-                        max_id = iv
-                except ValueError:
-                    pass
         self._next = (max_id + 1) if found_any else 1
 
     def next_id(self) -> int:
-        nid = self._next
-        self._next += 1
-        return nid
+        with self._lock:
+            nid = self._next
+            self._next += 1
+            return nid
+
+
+# Backward-compatible alias
+CommentIdAllocator = MarkupIdAllocator
 
 
 def _clean_comment_subtree_children(parent_in: ET.Element) -> list:
@@ -559,6 +641,281 @@ def _clean_src_col3_p_children(node: ET.Element) -> list:
     return out
 
 
+_SAFE_COL3_PPR_TAGS = frozenset({
+    "keepNext", "keepLines", "widowControl", "suppressAutoHyphens",
+    "autoSpaceDE", "autoSpaceDN", "bidi", "adjustRightInd", "snapToGrid",
+    "spacing", "ind", "contextualSpacing", "jc", "textAlignment", "outlineLvl",
+})
+
+_DEFAULT_STYLE_SAFE_PPR_TAGS = frozenset({
+    "widowControl", "suppressAutoHyphens", "autoSpaceDE", "autoSpaceDN",
+    "bidi", "adjustRightInd", "snapToGrid", "ind", "jc", "outlineLvl",
+})
+
+_BOOLEAN_TOGGLE_RPR_TAGS = frozenset({
+    "b", "bCs", "i", "iCs", "caps", "smallCaps", "strike", "dstrike", "rtl", "cs",
+})
+
+
+def insert_ppr_child_ordered(pPr: ET.Element, new_child: ET.Element):
+    new_local = _local_name(new_child.tag)
+    for existing in list(pPr):
+        if _local_name(existing.tag) == new_local:
+            pPr.remove(existing)
+    target_rank = PPR_RANK.get(new_local, 999)
+    for idx, child in enumerate(list(pPr)):
+        c_local = _local_name(child.tag)
+        if PPR_RANK.get(c_local, 999) > target_rank:
+            pPr.insert(idx, new_child)
+            return
+    pPr.append(new_child)
+
+
+def remove_ppr_child(pPr: ET.Element, local_name: str):
+    if pPr is None:
+        return
+    for existing in list(pPr):
+        if _local_name(existing.tag) == local_name:
+            pPr.remove(existing)
+
+
+def insert_tcpr_child_ordered(tcPr: ET.Element, new_child: ET.Element):
+    new_local = _local_name(new_child.tag)
+    for existing in list(tcPr):
+        if _local_name(existing.tag) == new_local:
+            tcPr.remove(existing)
+    target_rank = TCPR_RANK.get(new_local, 999)
+    for idx, child in enumerate(list(tcPr)):
+        c_local = _local_name(child.tag)
+        if TCPR_RANK.get(c_local, 999) > target_rank:
+            tcPr.insert(idx, new_child)
+            return
+    tcPr.append(new_child)
+
+
+def insert_tblpr_child_ordered(tblPr: ET.Element, new_child: ET.Element):
+    new_local = _local_name(new_child.tag)
+    for existing in list(tblPr):
+        if _local_name(existing.tag) == new_local:
+            tblPr.remove(existing)
+    target_rank = TBLPR_RANK.get(new_local, 999)
+    for idx, child in enumerate(list(tblPr)):
+        c_local = _local_name(child.tag)
+        if TBLPR_RANK.get(c_local, 999) > target_rank:
+            tblPr.insert(idx, new_child)
+            return
+    tblPr.append(new_child)
+
+
+def insert_sectpr_child_ordered(sectPr: ET.Element, new_child: ET.Element):
+    new_local = _local_name(new_child.tag)
+    if new_local not in ("headerReference", "footerReference"):
+        for existing in list(sectPr):
+            if _local_name(existing.tag) == new_local:
+                sectPr.remove(existing)
+    target_rank = SECTPR_RANK.get(new_local, 999)
+    for idx, child in enumerate(list(sectPr)):
+        c_local = _local_name(child.tag)
+        if SECTPR_RANK.get(c_local, 999) > target_rank:
+            sectPr.insert(idx, new_child)
+            return
+    sectPr.append(new_child)
+
+
+def _parse_styles_info(src_styles_root: ET.Element = None) -> dict:
+    info = {
+        "doc_pPr": None,
+        "doc_rPr": None,
+        "p_styles": {},
+        "c_styles": {},
+        "default_p_id": None,
+    }
+    if src_styles_root is None:
+        return info
+    info["doc_pPr"] = src_styles_root.find("./w:docDefaults/w:pPrDefault/w:pPr", NS)
+    info["doc_rPr"] = src_styles_root.find("./w:docDefaults/w:rPrDefault/w:rPr", NS)
+    for st in src_styles_root.findall(f"{W}style"):
+        stype = st.attrib.get(f"{W}type", "").strip()
+        sid = st.attrib.get(f"{W}styleId", "").strip()
+        if not sid:
+            continue
+        is_def = st.attrib.get(f"{W}default", "").strip() in ("1", "true")
+        if stype == "paragraph":
+            info["p_styles"][sid] = st
+            if is_def and info["default_p_id"] is None:
+                info["default_p_id"] = sid
+        elif stype == "character":
+            info["c_styles"][sid] = st
+    return info
+
+
+def _get_style_chain(style_id: str, styles_dict: dict) -> list:
+    if not style_id or style_id not in styles_dict:
+        return []
+    chain = []
+    seen = set()
+    cur = style_id
+    while cur and cur in styles_dict and cur not in seen:
+        seen.add(cur)
+        st = styles_dict[cur]
+        chain.append(st)
+        based = st.find(f"{W}basedOn")
+        cur = based.attrib.get(f"{W}val", "").strip() if based is not None else ""
+    chain.reverse()
+    return chain
+
+
+def _merge_rpr_layer(dst_rPr: ET.Element, src_rPr: ET.Element, allowed_tags=ALLOWED_COL3_RPR_TAGS) -> None:
+    if src_rPr is None:
+        return
+    for ch in src_rPr:
+        if _ns_uri(ch.tag) != W_URI:
+            continue
+        loc = _local_name(ch.tag)
+        if loc not in allowed_tags:
+            continue
+        if loc == "rFonts":
+            dst_rf = dst_rPr.find(f"{W}rFonts")
+            if dst_rf is None:
+                dst_rf = ET.Element(f"{W}rFonts")
+                insert_rpr_child_ordered(dst_rPr, dst_rf)
+            theme_clear_map = {
+                f"{W}ascii": f"{W}asciiTheme",
+                f"{W}hAnsi": f"{W}hAnsiTheme",
+                f"{W}eastAsia": f"{W}eastAsiaTheme",
+                f"{W}cs": f"{W}cstheme",
+            }
+            for ak, av in ch.attrib.items():
+                if _ns_uri(ak) not in (W_URI, ""):
+                    continue
+                dst_rf.set(ak, av)
+                if ak in theme_clear_map and theme_clear_map[ak] in dst_rf.attrib:
+                    del dst_rf.attrib[theme_clear_map[ak]]
+        else:
+            cp = copy.deepcopy(ch)
+            _strip_unsafe_attrs_recursive(cp)
+            insert_rpr_child_ordered(dst_rPr, cp)
+
+
+def _finalize_col3_rpr(rPr: ET.Element, fallback_mark_rPr: ET.Element = None) -> ET.Element:
+    """Clean disabled boolean toggles, fill missing font/size from paragraph-mark fallback or defaults, and enforce RPR_ORDER."""
+    for ch in list(rPr):
+        if _ns_uri(ch.tag) != W_URI:
+            rPr.remove(ch)
+            continue
+        loc = _local_name(ch.tag)
+        if loc in _BOOLEAN_TOGGLE_RPR_TAGS:
+            val = ch.attrib.get(f"{W}val", "1").strip().lower()
+            if val in ("0", "false", "off"):
+                rPr.remove(ch)
+        elif loc == "u":
+            uval = ch.attrib.get(f"{W}val", "single").strip().lower()
+            if uval in ("none", "0", "false"):
+                rPr.remove(ch)
+        elif loc in ("rStyle", "rPrChange", "highlight", "shd"):
+            rPr.remove(ch)
+
+    if fallback_mark_rPr is not None:
+        for fb_tag in ("rFonts", "sz", "szCs", "lang"):
+            if rPr.find(f"{W}{fb_tag}") is None:
+                fb_el = fallback_mark_rPr.find(f"{W}{fb_tag}")
+                if fb_el is not None:
+                    cp_fb = copy.deepcopy(fb_el)
+                    _strip_unsafe_attrs_recursive(cp_fb)
+                    if fb_tag == "rFonts":
+                        for t_attr in (f"{W}asciiTheme", f"{W}hAnsiTheme", f"{W}eastAsiaTheme", f"{W}cstheme"):
+                            cp_fb.attrib.pop(t_attr, None)
+                    insert_rpr_child_ordered(rPr, cp_fb)
+
+    rf = rPr.find(f"{W}rFonts")
+    if rf is None or not rf.attrib:
+        insert_rpr_child_ordered(rPr, ET.Element(f"{W}rFonts", {
+            f"{W}ascii": "Georgia",
+            f"{W}hAnsi": "Georgia",
+            f"{W}cs": "Georgia",
+        }))
+    else:
+        asc = rf.attrib.get(f"{W}ascii")
+        hansi = rf.attrib.get(f"{W}hAnsi")
+        if asc and not hansi:
+            rf.set(f"{W}hAnsi", asc)
+            rf.attrib.pop(f"{W}hAnsiTheme", None)
+        elif hansi and not asc:
+            rf.set(f"{W}ascii", hansi)
+            rf.attrib.pop(f"{W}asciiTheme", None)
+
+    sz_el = rPr.find(f"{W}sz")
+    szcs_el = rPr.find(f"{W}szCs")
+    if sz_el is None and szcs_el is not None:
+        insert_rpr_child_ordered(rPr, ET.Element(f"{W}sz", dict(szcs_el.attrib)))
+    elif szcs_el is None and sz_el is not None:
+        insert_rpr_child_ordered(rPr, ET.Element(f"{W}szCs", dict(sz_el.attrib)))
+    elif sz_el is None and szcs_el is None:
+        insert_rpr_child_ordered(rPr, ET.Element(f"{W}sz", {f"{W}val": "24"}))
+        insert_rpr_child_ordered(rPr, ET.Element(f"{W}szCs", {f"{W}val": "24"}))
+
+    return rPr
+
+
+def _resolve_src_col3_ppr(old_pPr: ET.Element, styles_info: dict, fallback_spacing_el: ET.Element = None) -> ET.Element:
+    """
+    Resolve library Col 3 paragraph <w:pPr> preserving its OWN alignment (jc), indentation (ind),
+    spacing, bidi, and outlineLvl (including inheritance from src_styles_root pStyle / docDefaults).
+    Removes pStyle after resolving so target styles.xml never remaps style IDs.
+    """
+    new_pPr = ET.Element(f"{W}pPr")
+
+    # 1. docDefaults pPr
+    doc_pPr = styles_info.get("doc_pPr")
+    if doc_pPr is not None:
+        for ch in doc_pPr:
+            if _ns_uri(ch.tag) == W_URI and _local_name(ch.tag) in _DEFAULT_STYLE_SAFE_PPR_TAGS:
+                cp = copy.deepcopy(ch)
+                _strip_unsafe_attrs_recursive(cp)
+                insert_ppr_child_ordered(new_pPr, cp)
+
+    # 2. Paragraph style chain (explicit pStyle or default Normal style)
+    explicit_pstyle = None
+    if old_pPr is not None:
+        ps_el = old_pPr.find(f"{W}pStyle")
+        if ps_el is not None:
+            explicit_pstyle = ps_el.attrib.get(f"{W}val", "").strip() or None
+
+    eff_pstyle = explicit_pstyle or styles_info.get("default_p_id")
+    is_explicit_non_default = bool(explicit_pstyle and explicit_pstyle != styles_info.get("default_p_id"))
+    style_allowed = _SAFE_COL3_PPR_TAGS if is_explicit_non_default else _DEFAULT_STYLE_SAFE_PPR_TAGS
+    for st_el in _get_style_chain(eff_pstyle, styles_info.get("p_styles", {})):
+        st_ppr = st_el.find(f"{W}pPr")
+        if st_ppr is None:
+            continue
+        for ch in st_ppr:
+            if _ns_uri(ch.tag) == W_URI and _local_name(ch.tag) in style_allowed:
+                cp = copy.deepcopy(ch)
+                _strip_unsafe_attrs_recursive(cp)
+                insert_ppr_child_ordered(new_pPr, cp)
+
+    # 3. Direct paragraph pPr properties from src_tc3
+    if old_pPr is not None:
+        for ch in old_pPr:
+            if _ns_uri(ch.tag) == W_URI and _local_name(ch.tag) in _SAFE_COL3_PPR_TAGS:
+                cp = copy.deepcopy(ch)
+                _strip_unsafe_attrs_recursive(cp)
+                insert_ppr_child_ordered(new_pPr, cp)
+
+    if new_pPr.find(f"{W}spacing") is None and fallback_spacing_el is not None:
+        cp_sp = copy.deepcopy(fallback_spacing_el)
+        _strip_unsafe_attrs_recursive(cp_sp)
+        insert_ppr_child_ordered(new_pPr, cp_sp)
+
+    # 4. If non-RTL body paragraph still has no explicit <w:jc>, default to justified ("both")
+    bidi_el = new_pPr.find(f"{W}bidi")
+    is_rtl = bidi_el is not None and bidi_el.attrib.get(f"{W}val", "1").strip().lower() not in ("0", "false", "off")
+    if not is_rtl and new_pPr.find(f"{W}jc") is None:
+        insert_ppr_child_ordered(new_pPr, ET.Element(f"{W}jc", {f"{W}val": "both"}))
+
+    return new_pPr
+
+
 def clean_and_migrate_col3_paragraphs(
     src_tc3: ET.Element,
     target_tc3: ET.Element,
@@ -566,48 +923,50 @@ def clean_and_migrate_col3_paragraphs(
     src_comments_map: dict = None,
     target_comments_root: ET.Element = None,
     id_allocator: CommentIdAllocator = None,
+    src_styles_root: ET.Element = None,
 ) -> list:
     """
-    Clone text, inline emphasis, and Word comments from library Col 3 (`src_tc3`) while:
-      1. Strictly preserving target_tc3 / target_tc2 paragraph layout (pPr) & font/size formatting (rPr) + RTL bidi/cs.
+    Clone text, inline formatting, and Word comments from library Col 3 (`src_tc3`) while:
+      1. 100% preserving `src_tc3`'s OWN paragraph formatting (`jc`, `ind`, `spacing`, `bidi`, `outlineLvl`,
+         resolving inherited `pStyle` / `docDefaults` from `src_styles_root` and removing `pStyle`)
+         and `src_tc3`'s OWN per-run `<w:rPr>` (`rFonts`, `sz`, `szCs`, `lang`, `b`, `bCs`, `i`, `iCs`, `u`,
+         `rtl`, `cs`, `color` — NEVER inheriting bold `<w:b/>` or alignment from target cells!).
       2. Stripping all non-comment OOXML troublemakers (bookmarks, footnotes, permissions, proofErr, smartTag,
          customXml, sdt, hyperlinks, track changes ins/del, w14:paraId/textId).
       3. Migrating Word comments from `src_comments_map` into `target_comments_root` with globally unique integer `w:id`s
-         and guaranteeing complete, properly ordered `(commentRangeStart, commentRangeEnd, commentReference)` triplets
-         auto-opened/closed at cell boundaries if a library comment spanned across cells/rows.
+         and guaranteeing complete, properly ordered `(commentRangeStart, commentRangeEnd, commentReference)` triplets.
     """
+    styles_info = _parse_styles_info(src_styles_root)
     tpl_pPr = get_cell_template_ppr(target_tc3, fallback_tc=target_tc2)
-    tpl_rPr = get_first_run_rpr(target_tc3, fallback_tc=target_tc2)
+    fallback_spacing = tpl_pPr.find(f"{W}spacing") if tpl_pPr is not None else None
     src_cmap = src_comments_map if (src_comments_map and target_comments_root is not None and id_allocator is not None) else {}
 
     paras = []
     for p in src_tc3.findall("w:p", NS):
         old_pPr = p.find("w:pPr", NS)
-        old_bidi = old_pPr.find("w:bidi", NS) if old_pPr is not None else None
+        p_mark_rPr = old_pPr.find("w:rPr", NS) if old_pPr is not None else None
+
+        # Build paragraph-level inherited rPr (docDefaults -> pStyle chain)
+        para_base_rPr = ET.Element(f"{W}rPr")
+        _merge_rpr_layer(para_base_rPr, styles_info.get("doc_rPr"))
+        explicit_pstyle = None
+        if old_pPr is not None:
+            ps_el = old_pPr.find(f"{W}pStyle")
+            if ps_el is not None:
+                explicit_pstyle = ps_el.attrib.get(f"{W}val", "").strip() or None
+        eff_pstyle = explicit_pstyle or styles_info.get("default_p_id")
+        for st_el in _get_style_chain(eff_pstyle, styles_info.get("p_styles", {})):
+            _merge_rpr_layer(para_base_rPr, st_el.find(f"{W}rPr"))
+
+        new_pPr = _resolve_src_col3_ppr(old_pPr, styles_info, fallback_spacing_el=fallback_spacing)
+        clean_mark_rPr = _finalize_col3_rpr(copy.deepcopy(para_base_rPr), fallback_mark_rPr=p_mark_rPr)
+        for non_mark in ("b", "bCs", "i", "iCs", "u", "strike", "dstrike", "color"):
+            remove_rpr_child(clean_mark_rPr, non_mark)
+        if len(clean_mark_rPr) > 0:
+            insert_ppr_child_ordered(new_pPr, clean_mark_rPr)
 
         cp = ET.Element(f"{W}p")
-        if tpl_pPr is not None:
-            new_pPr = copy.deepcopy(tpl_pPr)
-            _strip_unsafe_attrs_recursive(new_pPr)
-            if old_bidi is not None and new_pPr.find("w:bidi", NS) is None:
-                after_bidi = {
-                    "adjustRightInd", "snapToGrid", "spacing", "ind",
-                    "contextualSpacing", "jc", "textAlignment", "outlineLvl",
-                    "rPr", "sectPr", "pPrChange"
-                }
-                ins_pos = len(new_pPr)
-                for idx_c, ch_p in enumerate(new_pPr):
-                    if _local_name(ch_p.tag) in after_bidi:
-                        ins_pos = idx_c
-                        break
-                new_pPr.insert(ins_pos, ET.Element(f"{W}bidi", dict(old_bidi.attrib)))
-            remove_rpr_child(new_pPr, "pPrChange")
-            if new_pPr.find(f"{W}sectPr") is not None:
-                new_pPr.remove(new_pPr.find(f"{W}sectPr"))
-            cp.append(new_pPr)
-        elif old_bidi is not None:
-            new_pPr = ET.Element(f"{W}pPr")
-            new_pPr.append(ET.Element(f"{W}bidi", dict(old_bidi.attrib)))
+        if len(new_pPr) > 0:
             cp.append(new_pPr)
 
         cleaned_children = _clean_src_col3_p_children(p)
@@ -615,27 +974,23 @@ def clean_and_migrate_col3_paragraphs(
             if _local_name(ch.tag) == "r":
                 cref = ch.find(f"{W}commentReference")
                 if cref is not None and ch.find(f"{W}t") is None:
-                    # Pure commentReference run: give clean base rPr without rStyle
                     old_rPr = ch.find(f"{W}rPr")
                     if old_rPr is not None:
                         ch.remove(old_rPr)
-                    if tpl_rPr is not None and len(tpl_rPr) > 0:
-                        ch.insert(0, copy.deepcopy(tpl_rPr))
+                    if len(clean_mark_rPr) > 0:
+                        ch.insert(0, copy.deepcopy(clean_mark_rPr))
                 else:
                     old_rPr = ch.find("w:rPr", NS)
-                    new_rPr = copy.deepcopy(tpl_rPr)
+                    new_rPr = copy.deepcopy(para_base_rPr)
                     if old_rPr is not None:
-                        old_rf = old_rPr.find("w:rFonts", NS)
-                        new_rf = new_rPr.find("w:rFonts", NS)
-                        if old_rf is not None and new_rf is not None:
-                            cs_font = old_rf.attrib.get(f"{W}cs")
-                            if cs_font and f"{W}cs" not in new_rf.attrib:
-                                new_rf.set(f"{W}cs", cs_font)
-                        for rch in old_rPr:
-                            local = _local_name(rch.tag)
-                            if local in INLINE_SEMANTIC_RPR_TAGS:
-                                insert_rpr_child_ordered(new_rPr, copy.deepcopy(rch))
+                        rs_el = old_rPr.find(f"{W}rStyle")
+                        if rs_el is not None:
+                            rs_id = rs_el.attrib.get(f"{W}val", "").strip()
+                            for cst in _get_style_chain(rs_id, styles_info.get("c_styles", {})):
+                                _merge_rpr_layer(new_rPr, cst.find(f"{W}rPr"))
+                        _merge_rpr_layer(new_rPr, old_rPr)
                         ch.remove(old_rPr)
+                    _finalize_col3_rpr(new_rPr, fallback_mark_rPr=p_mark_rPr)
                     if len(new_rPr) > 0:
                         ch.insert(0, new_rPr)
             cp.append(ch)
@@ -643,15 +998,327 @@ def clean_and_migrate_col3_paragraphs(
 
     if not paras:
         empty_p = ET.Element(f"{W}p")
-        if tpl_pPr is not None:
-            cp_ppr = copy.deepcopy(tpl_pPr)
-            _strip_unsafe_attrs_recursive(cp_ppr)
-            empty_p.append(cp_ppr)
+        def_pPr = _resolve_src_col3_ppr(None, styles_info, fallback_spacing_el=fallback_spacing)
+        if len(def_pPr) > 0:
+            empty_p.append(def_pPr)
         paras.append(empty_p)
 
     # Remap & repair Word comment markers across `paras`
     _remap_and_repair_cell_comments(paras, src_cmap, target_comments_root, id_allocator)
     return paras
+
+
+def extract_cell_comment_anchors(tc: ET.Element, comments_root: ET.Element = None) -> list:
+    """
+    Extract all Word comments anchored in `tc` along with their visible text snippet,
+    surrounding context, relative position, and cloned <w:comment> element so they can be
+    re-anchored losslessly onto a rebuilt cell (e.g. Col 2 diff runs in step1_render_draft.py).
+    """
+    if tc is None or comments_root is None:
+        return []
+    cmap = {}
+    for c_el in comments_root.findall(f"{W}comment"):
+        cid = c_el.attrib.get(f"{W}id", "").strip()
+        if cid:
+            cmap[cid] = c_el
+    if not cmap:
+        return []
+
+    chars = []
+    open_starts = {}   # cid -> start_char_idx
+    spans = []         # list of (cid, start_idx, end_idx)
+    seen_cids = set()
+    ref_only = []      # list of (cid, char_idx)
+
+    def _walk_node(node: ET.Element):
+        for ch in node:
+            loc = _local_name(ch.tag)
+            if loc in ("del", "moveFrom"):
+                continue
+            if loc == "commentRangeStart":
+                cid = ch.attrib.get(f"{W}id", "").strip()
+                if cid in cmap:
+                    if cid in open_starts:
+                        spans.append((cid, open_starts[cid], len(chars)))
+                        seen_cids.add(cid)
+                    open_starts[cid] = len(chars)
+            elif loc == "commentRangeEnd":
+                cid = ch.attrib.get(f"{W}id", "").strip()
+                if cid in cmap:
+                    s_off = open_starts.pop(cid, 0)
+                    spans.append((cid, s_off, len(chars)))
+                    seen_cids.add(cid)
+            elif loc == "commentReference":
+                cid = ch.attrib.get(f"{W}id", "").strip()
+                if cid in cmap:
+                    ref_only.append((cid, len(chars)))
+            elif loc == "t":
+                if ch.text:
+                    chars.extend(ch.text)
+            else:
+                _walk_node(ch)
+
+    for p_i, p in enumerate(tc.findall("w:p", NS)):
+        if p_i > 0:
+            chars.append("\n")
+        _walk_node(p)
+
+    full_text = "".join(chars)
+    total_len = len(full_text)
+    for cid, s_off in open_starts.items():
+        spans.append((cid, s_off, total_len))
+        seen_cids.add(cid)
+    for cid, r_off in ref_only:
+        if cid not in seen_cids:
+            spans.append((cid, r_off, r_off))
+            seen_cids.add(cid)
+
+    anchors = []
+    for cid, s_off, e_off in spans:
+        anchors.append({
+            "old_cid": cid,
+            "anchor_text": full_text[s_off:e_off],
+            "left_ctx": full_text[max(0, s_off - 45):s_off],
+            "right_ctx": full_text[e_off:min(total_len, e_off + 45)],
+            "rel_pos": s_off / max(1, total_len),
+            "comment_el": copy.deepcopy(cmap[cid]),
+        })
+    return anchors
+
+
+def _locate_anchor_in_rebuilt_text(new_text: str, anc: dict) -> tuple:
+    """Locate best (start_char, end_char) in `new_text` for a saved comment anchor."""
+    total_len = len(new_text)
+    if total_len == 0:
+        return (0, 0)
+
+    atxt = anc.get("anchor_text") or ""
+    rel_pos = float(anc.get("rel_pos", 0.0))
+    left_ctx = anc.get("left_ctx") or ""
+    right_ctx = anc.get("right_ctx") or ""
+    est_pos = int(rel_pos * total_len)
+
+    def _score_candidate(cs: int, ce: int) -> float:
+        l_sub = new_text[max(0, cs - 45):cs]
+        r_sub = new_text[ce:min(total_len, ce + 45)]
+        l_sim = difflib.SequenceMatcher(None, left_ctx, l_sub).ratio() if left_ctx else 0.5
+        r_sim = difflib.SequenceMatcher(None, right_ctx, r_sub).ratio() if right_ctx else 0.5
+        pos_pen = 0.35 * abs((cs / max(1, total_len)) - rel_pos)
+        return l_sim + r_sim - pos_pen
+
+    for cand_needle in ([atxt, atxt.strip()] if atxt.strip() != atxt else [atxt]):
+        if not cand_needle:
+            continue
+        exact_locs = []
+        pos = new_text.find(cand_needle)
+        while pos != -1:
+            exact_locs.append((pos, pos + len(cand_needle)))
+            pos = new_text.find(cand_needle, pos + 1)
+        if len(exact_locs) == 1:
+            return exact_locs[0]
+        if len(exact_locs) > 1:
+            return max(exact_locs, key=lambda pair: _score_candidate(pair[0], pair[1]))
+
+    if atxt.strip():
+        f_loc = find_fuzzy_substring_span(new_text, atxt, search_from=max(0, est_pos - 120))
+        if f_loc is not None:
+            return f_loc
+        # Windowed SequenceMatcher fallback when words inside anchor_text were edited
+        win_rad = max(160, len(atxt) * 2)
+        w_s = max(0, est_pos - win_rad)
+        w_e = min(total_len, est_pos + len(atxt) + win_rad)
+        win_str = new_text[w_s:w_e]
+        sm = difflib.SequenceMatcher(None, atxt.strip(), win_str, autojunk=False)
+        blocks = [b for b in sm.get_matching_blocks() if b.size > 0]
+        matched_chars = sum(b.size for b in blocks)
+        if blocks and matched_chars >= max(3, int(len(atxt.strip()) * 0.45)):
+            return (w_s + blocks[0].b, w_s + blocks[-1].b + blocks[-1].size)
+
+    # Paragraph fallback (first / closest / last paragraph)
+    p_ranges = []
+    cur_off = 0
+    for part in new_text.split("\n"):
+        p_ranges.append((cur_off, cur_off + len(part)))
+        cur_off += len(part) + 1
+    if p_ranges:
+        p_idx = min(len(p_ranges) - 1, max(0, round(rel_pos * max(0, len(p_ranges) - 1))))
+        return p_ranges[p_idx]
+    return (0, total_len)
+
+
+def reanchor_comments_to_cell(
+    tc: ET.Element,
+    anchors: list,
+    target_comments_root: ET.Element,
+    id_allocator: MarkupIdAllocator,
+) -> int:
+    """
+    Re-anchor extracted comment anchors onto `tc` (supporting plain <w:r> AND <w:ins>/<w:del> diff runs)
+    with fresh globally unique `w:id`s allocated from `id_allocator`.
+    Returns count of re-anchored comments.
+    """
+    if not anchors or tc is None or target_comments_root is None or id_allocator is None:
+        return 0
+
+    paras = tc.findall("w:p", NS)
+    if not paras:
+        return 0
+
+    new_text = get_cell_plain_text(tc)
+    p_bounds = []
+    cur_p_off = 0
+    for p in paras:
+        ptxt = "".join(t.text or "" for t in p.findall(".//w:t", NS))
+        p_bounds.append((cur_p_off, cur_p_off + len(ptxt)))
+        cur_p_off += len(ptxt) + 1
+
+    resolved = []  # list of (nid_s, s_pos, e_pos)
+    cut_points = set()
+    for anc in anchors:
+        nid = id_allocator.next_id()
+        nid_s = str(nid)
+        target_comments_root.append(sanitize_comment_element(anc["comment_el"], nid))
+        s_pos, e_pos = _locate_anchor_in_rebuilt_text(new_text, anc)
+        # Snap away from '\n' inter-paragraph virtual separator if needed
+        for idx_p in range(len(p_bounds) - 1):
+            sep_idx = p_bounds[idx_p][1]
+            if s_pos == sep_idx and e_pos > sep_idx:
+                s_pos = p_bounds[idx_p + 1][0]
+            if e_pos == sep_idx + 1 and s_pos <= sep_idx:
+                e_pos = sep_idx
+        if e_pos < s_pos:
+            e_pos = s_pos
+        resolved.append((nid_s, s_pos, e_pos))
+        cut_points.add(s_pos)
+        cut_points.add(e_pos)
+
+    def _clone_sub_run(orig_r: ET.Element, sub_txt: str) -> ET.Element:
+        nr = ET.Element(f"{W}r")
+        rpr = orig_r.find(f"{W}rPr")
+        if rpr is not None:
+            nr.append(copy.deepcopy(rpr))
+        t_el = ET.Element(f"{W}t")
+        if sub_txt.startswith(" ") or sub_txt.endswith(" ") or "  " in sub_txt:
+            t_el.set(XML_SPACE, "preserve")
+        t_el.text = sub_txt
+        nr.append(t_el)
+        return nr
+
+    def _make_ref_run_clean(nid_s: str, donor_rpr: ET.Element = None) -> ET.Element:
+        r_el = _make_comment_ref_run(nid_s)
+        if donor_rpr is not None:
+            clean_rpr = build_rpr(donor_rpr, highlight=None, shd_fill=None)
+            remove_rpr_child(clean_rpr, "rStyle")
+            if len(clean_rpr) > 0:
+                r_el.insert(0, clean_rpr)
+        return r_el
+
+    starts_at = {}      # char_pos -> list of (nid_s, is_zero_len)
+    ends_at = {}        # char_pos -> list of nid_s (for non-zero-len)
+    for nid_s, s_pos, e_pos in resolved:
+        if s_pos == e_pos:
+            starts_at.setdefault(s_pos, []).append((nid_s, True))
+        else:
+            starts_at.setdefault(s_pos, []).append((nid_s, False))
+            ends_at.setdefault(e_pos, []).append(nid_s)
+
+    for p_idx, p in enumerate(paras):
+        p_start, p_end = p_bounds[p_idx]
+        donor_rpr = None
+        for r_cand in p.findall(".//w:r", NS):
+            if r_cand.find(f"{W}rPr") is not None:
+                donor_rpr = r_cand.find(f"{W}rPr")
+                break
+
+        # Step 1: Split plain <w:r> and <w:ins> elements at cut_points inside [p_start, p_end]
+        split_items = []  # list of (el, vis_start, vis_end, is_ppr)
+        cursor = p_start
+        for ch in list(p):
+            loc = _local_name(ch.tag)
+            if loc == "pPr":
+                split_items.append((ch, cursor, cursor, True))
+                continue
+            if loc == "r":
+                rtxt = "".join(t.text or "" for t in ch.findall(f"{W}t"))
+                if not rtxt:
+                    split_items.append((ch, cursor, cursor, False))
+                    continue
+                r_s, r_e = cursor, cursor + len(rtxt)
+                cursor = r_e
+                inner_cuts = sorted(c for c in cut_points if r_s < c < r_e)
+                if not inner_cuts:
+                    split_items.append((ch, r_s, r_e, False))
+                else:
+                    pts = [r_s] + inner_cuts + [r_e]
+                    for k_i in range(len(pts) - 1):
+                        a_off, b_off = pts[k_i], pts[k_i + 1]
+                        sub_r = _clone_sub_run(ch, rtxt[a_off - r_s : b_off - r_s])
+                        split_items.append((sub_r, a_off, b_off, False))
+                continue
+            if loc == "ins":
+                sub_rs = ch.findall(f"{W}r")
+                itxt = "".join(t.text or "" for t in ch.findall(f".//{W}t"))
+                if not itxt or len(sub_rs) != 1:
+                    i_s, i_e = cursor, cursor + len(itxt)
+                    cursor = i_e
+                    split_items.append((ch, i_s, i_e, False))
+                    continue
+                i_s, i_e = cursor, cursor + len(itxt)
+                cursor = i_e
+                inner_cuts = sorted(c for c in cut_points if i_s < c < i_e)
+                if not inner_cuts:
+                    split_items.append((ch, i_s, i_e, False))
+                else:
+                    pts = [i_s] + inner_cuts + [i_e]
+                    orig_r0 = sub_rs[0]
+                    for k_i in range(len(pts) - 1):
+                        a_off, b_off = pts[k_i], pts[k_i + 1]
+                        ins_attrs = dict(ch.attrib)
+                        if k_i > 0:
+                            ins_attrs[f"{W}id"] = str(id_allocator.next_id())
+                        new_ins = ET.Element(f"{W}ins", ins_attrs)
+                        new_ins.append(_clone_sub_run(orig_r0, itxt[a_off - i_s : b_off - i_s]))
+                        split_items.append((new_ins, a_off, b_off, False))
+                continue
+            # <w:del> or other zero-visible-length child
+            split_items.append((ch, cursor, cursor, False))
+
+        # Step 2: Rebuild paragraph children inserting Start / End / Reference at exact offsets
+        emitted_positions = set()
+        new_p_children = []
+
+        def _emit_markers_at(pos: int):
+            if pos in emitted_positions:
+                return
+            emitted_positions.add(pos)
+            for nid_s in ends_at.get(pos, ()):
+                new_p_children.append(ET.Element(f"{W}commentRangeEnd", {f"{W}id": nid_s}))
+                new_p_children.append(_make_ref_run_clean(nid_s, donor_rpr))
+            for nid_s, is_zero in starts_at.get(pos, ()):
+                new_p_children.append(ET.Element(f"{W}commentRangeStart", {f"{W}id": nid_s}))
+                if is_zero:
+                    new_p_children.append(ET.Element(f"{W}commentRangeEnd", {f"{W}id": nid_s}))
+                    new_p_children.append(_make_ref_run_clean(nid_s, donor_rpr))
+
+        for el, v_s, v_e, is_ppr in split_items:
+            if is_ppr:
+                new_p_children.append(el)
+                continue
+            # Only emit markers at v_s once we are about to emit visible text at v_s (or if paragraph has no visible text)
+            if v_e > v_s:
+                _emit_markers_at(v_s)
+            new_p_children.append(el)
+
+        if p_start == p_end:
+            _emit_markers_at(p_start)
+        _emit_markers_at(p_end)
+
+        for ch in list(p):
+            p.remove(ch)
+        for ch in new_p_children:
+            p.append(ch)
+
+    return len(resolved)
 
 
 def _remap_and_repair_cell_comments(
@@ -798,13 +1465,24 @@ def _remap_and_repair_cell_comments(
             plast.append(_make_ref_with_rpr(nid_s, plast))
 
 
+_STANDALONE_TRACK_CHANGE_TAGS = frozenset({
+    "ins", "del",
+    "rPrChange", "pPrChange", "tblPrChange", "trPrChange", "tcPrChange",
+    "sectPrChange", "tblGridChange", "numberingChange",
+    "moveFrom", "moveTo", "cellIns", "cellDel", "cellMerge",
+})
+
+
 def sanitize_document_ooxml(root: ET.Element, comments_root: ET.Element = None):
     """
     Whole-document OOXML integrity pass run before saving any .docx:
       1. Strip invalid (>= 0x80000000 or <= 0) or duplicate w14:paraId / w14:textId attributes.
-      2. Remove orphaned, half-open, reversed, duplicate, or _GoBack w:bookmarkStart / w:bookmarkEnd elements.
+      2. Remove orphaned, half-open, reversed, duplicate, or hidden/internal (`_*` such as `_GoBack`,
+         `_Hlk*`, `_Toc*`, `_3dy6vkm`) w:bookmarkStart / w:bookmarkEnd elements.
       3. Repair/clean w:commentRangeStart / w:commentRangeEnd / w:commentReference in `root` and prune
          any unreferenced or duplicate <w:comment> elements in `comments_root`.
+      4. Enforce global uniqueness across ALL CT_Markup `w:id` attributes (comments, remaining user bookmarks,
+         ins, del, *PrChange, moveFrom/To), re-numbering any colliding bookmarks or revisions!
     Returns sanitized `comments_root` (or None).
     """
     # 1. Clean w14:paraId / w14:textId across root and comments_root
@@ -870,7 +1548,8 @@ def sanitize_document_ooxml(root: ET.Element, comments_root: ET.Element = None):
             continue
         s_ord, _, bname = s_list[0]
         e_ord, _ = e_list[0]
-        if not bname or bname == "_GoBack" or s_ord >= e_ord or bname in used_bm_names:
+        # Strip ALL hidden/internal Word/GoogleDocs bookmarks starting with '_' (_GoBack, _Hlk*, _Toc*, _3dy6vkm, etc.)
+        if not bname or bname.startswith("_") or s_ord >= e_ord or bname in used_bm_names:
             continue
         try:
             int(bid)
@@ -983,11 +1662,62 @@ def sanitize_document_ooxml(root: ET.Element, comments_root: ET.Element = None):
         for cid in sorted(referenced_cids, key=lambda x: int(x)):
             comments_root.append(available_comments[cid])
 
+    # 4. Enforce global CT_Markup w:id uniqueness across comments, remaining user bookmarks, and revisions
+    max_id = 0
+    for tree in (root, comments_root):
+        if tree is None:
+            continue
+        for elem in tree.iter():
+            v_str = elem.attrib.get(f"{W}id", "").strip()
+            if v_str:
+                try:
+                    iv = int(v_str)
+                    if iv > max_id:
+                        max_id = iv
+                except ValueError:
+                    pass
+    next_global_id = max_id + 1
+    used_global_ids = {int(cid) for cid in referenced_cids}
+
+    # Register standalone track-change IDs first (deduplicating any colliding track-change IDs),
+    # then re-number any remaining valid user bookmarks whose w:id collides with anything!
+    for elem in root.iter():
+        loc = _local_name(elem.tag)
+        if loc in _STANDALONE_TRACK_CHANGE_TAGS:
+            raw_id = elem.attrib.get(f"{W}id", "").strip()
+            needs_new = False
+            try:
+                iv = int(raw_id)
+                if iv < 0 or iv in used_global_ids:
+                    needs_new = True
+            except ValueError:
+                needs_new = True
+            if needs_new:
+                new_iv = next_global_id
+                next_global_id += 1
+                elem.set(f"{W}id", str(new_iv))
+                used_global_ids.add(new_iv)
+            else:
+                used_global_ids.add(iv)
+
+    for bid in sorted(valid_bm_ids, key=lambda x: int(x)):
+        bid_int = int(bid)
+        s_el = bm_starts[bid][0][1]
+        e_el = bm_ends[bid][0][1]
+        if bid_int < 0 or bid_int in used_global_ids:
+            new_bid = next_global_id
+            next_global_id += 1
+            s_el.set(f"{W}id", str(new_bid))
+            e_el.set(f"{W}id", str(new_bid))
+            used_global_ids.add(new_bid)
+        else:
+            used_global_ids.add(bid_int)
+
     return comments_root
 
 
-def _patch_document_rels_xml(rels_bytes: bytes, ensure_comments_rel: bool) -> bytes:
-    """Update word/_rels/document.xml.rels: strip extended comment rels and ensure/remove comments.xml rel."""
+def _patch_document_rels_xml(rels_bytes: bytes, ensure_comments_rel: bool, keep_people: bool = False) -> bytes:
+    """Update word/_rels/document.xml.rels: strip extended comment / orphaned people rels and sync comments.xml rel."""
     _assert_safe_openxml_bytes(rels_bytes)
     rels_root = ET.fromstring(rels_bytes)
     kept = []
@@ -1001,10 +1731,13 @@ def _patch_document_rels_xml(rels_bytes: bytes, ensure_comments_rel: bool) -> by
         rtype = rel.attrib.get("Type", "").strip()
         target = rel.attrib.get("Target", "").strip()
         target_low = target.replace("\\", "/").lower()
+        rtype_low = rtype.lower()
 
         if any(target_low.endswith(sfx) for sfx in _STRIPPED_COMMENT_PART_SUFFIXES):
             continue
         if any(rtype.endswith(rt_sfx) for rt_sfx in _STRIPPED_COMMENT_REL_TYPES):
+            continue
+        if not keep_people and (target_low.endswith("people.xml") or rtype_low.endswith("/people")):
             continue
 
         is_cmt = (rtype == COMMENTS_REL_TYPE or target_low.endswith("comments.xml"))
@@ -1041,8 +1774,8 @@ def _patch_document_rels_xml(rels_bytes: bytes, ensure_comments_rel: bool) -> by
     return "".join(parts).encode("utf-8")
 
 
-def _patch_content_types_xml(ct_bytes: bytes, ensure_comments_ct: bool) -> bytes:
-    """Update [Content_Types].xml: strip extended comment overrides and ensure/remove /word/comments.xml Override."""
+def _patch_content_types_xml(ct_bytes: bytes, ensure_comments_ct: bool, keep_people: bool = False) -> bytes:
+    """Update [Content_Types].xml: strip extended comment / orphaned people overrides and sync /word/comments.xml Override."""
     _assert_safe_openxml_bytes(ct_bytes)
     ct_root = ET.fromstring(ct_bytes)
     defaults = []
@@ -1057,6 +1790,8 @@ def _patch_content_types_xml(ct_bytes: bytes, ensure_comments_ct: bool) -> bytes
             pname = ch.attrib.get("PartName", "").strip()
             pname_low = pname.replace("\\", "/").lower()
             if any(pname_low.endswith(sfx) for sfx in _STRIPPED_COMMENT_PART_SUFFIXES):
+                continue
+            if not keep_people and pname_low.endswith("/people.xml"):
                 continue
             if pname_low == "/word/comments.xml":
                 if not ensure_comments_ct or has_comments_ov:
@@ -1150,11 +1885,17 @@ def save_docx_xml(
 
     with zipfile.ZipFile(src_docx_path, "r") as zin:
         _validate_docx_zip(zin)
+        zin_names = {it.filename.replace("\\", "/") for it in zin.infolist()}
+        keep_people = has_active_comments and ("word/people.xml" in zin_names)
         with zipfile.ZipFile(tmp_dst, "w", zipfile.ZIP_DEFLATED) as zout:
             for item in zin.infolist():
                 norm_name = item.filename.replace("\\", "/")
                 if norm_name in _STRIPPED_COMMENT_ZIP_NAMES or any(
                     norm_name.lower().endswith(sfx) for sfx in _STRIPPED_COMMENT_PART_SUFFIXES
+                ):
+                    continue
+                if not keep_people and (
+                    norm_name in _PEOPLE_ZIP_NAMES or norm_name.lower().endswith("/people.xml")
                 ):
                     continue
                 if norm_name == "word/document.xml":
@@ -1166,12 +1907,18 @@ def save_docx_xml(
                 elif norm_name == "word/_rels/document.xml.rels":
                     with zin.open(item, "r") as mfp:
                         raw_rels = mfp.read(MAX_DOCX_MEMBER_BYTES + 1)
-                    zout.writestr(item, _patch_document_rels_xml(raw_rels, ensure_comments_rel=has_active_comments))
+                    zout.writestr(
+                        item,
+                        _patch_document_rels_xml(raw_rels, ensure_comments_rel=has_active_comments, keep_people=keep_people),
+                    )
                     wrote_rels = True
                 elif norm_name == "[Content_Types].xml":
                     with zin.open(item, "r") as mfp:
                         raw_ct = mfp.read(MAX_DOCX_MEMBER_BYTES + 1)
-                    zout.writestr(item, _patch_content_types_xml(raw_ct, ensure_comments_ct=has_active_comments))
+                    zout.writestr(
+                        item,
+                        _patch_content_types_xml(raw_ct, ensure_comments_ct=has_active_comments, keep_people=keep_people),
+                    )
                     wrote_ct = True
                 else:
                     with zin.open(item, "r") as mfp:
@@ -1184,7 +1931,10 @@ def save_docx_xml(
                 zout.writestr("word/comments.xml", comments_bytes)
             if has_active_comments and not wrote_rels:
                 empty_rels = f'<?xml version="1.0" encoding="UTF-8" standalone="yes"?>\r\n<Relationships xmlns="{PKG_REL_URI}"/>'.encode("utf-8")
-                zout.writestr("word/_rels/document.xml.rels", _patch_document_rels_xml(empty_rels, ensure_comments_rel=True))
+                zout.writestr(
+                    "word/_rels/document.xml.rels",
+                    _patch_document_rels_xml(empty_rels, ensure_comments_rel=True, keep_people=keep_people),
+                )
             if has_active_comments and not wrote_ct:
                 empty_ct = (
                     f'<?xml version="1.0" encoding="UTF-8" standalone="yes"?>\r\n'
@@ -1194,7 +1944,10 @@ def save_docx_xml(
                     f'<Override PartName="/word/document.xml" ContentType="application/vnd.openxmlformats-officedocument.wordprocessingml.document.main+xml"/>'
                     f'</Types>'
                 ).encode("utf-8")
-                zout.writestr("[Content_Types].xml", _patch_content_types_xml(empty_ct, ensure_comments_ct=True))
+                zout.writestr(
+                    "[Content_Types].xml",
+                    _patch_content_types_xml(empty_ct, ensure_comments_ct=True, keep_people=keep_people),
+                )
 
     if same_file:
         tmp_dst.replace(dst_docx_path)
@@ -2162,3 +2915,1006 @@ def apply_highlights_to_col3_cell(tc: ET.Element, char_spans: list):
             p.remove(ch)
         for ch in new_children:
             p.append(ch)
+
+
+# ==============================================================================
+# v1.7.0 Public Helpers: 2->3 Col Expansion, Duplicate Row Merge, Column Balance,
+# Naming Tags, Full-Article English Title Extraction, & Top Instruction Lines
+# ==============================================================================
+
+_STRAY_SPAN_TAGS = ("gridSpan", "gridBefore", "gridAfter", "wBefore", "wAfter")
+_TOP_INSTRUCTION_NORMS = frozenset({
+    "blue highlighted parts need to be reviewed",
+    "yellow highlighted parts need to be updated",
+})
+_CJK_WEIGHT_RE = re.compile(r"[\u3000-\u303f\u3040-\u30ff\u3400-\u4dbf\u4e00-\u9fff\uac00-\ud7af\uff00-\uffef]")
+_WS_COLLAPSE_RE = re.compile(r"[\s\u3000\u200b\u200c\ufeff]+")
+
+
+def _strip_stray_grid_spans_on_row(tr: ET.Element) -> bool:
+    changed = False
+    trPr = tr.find(f"{W}trPr")
+    if trPr is not None:
+        for tname in _STRAY_SPAN_TAGS:
+            for el in list(trPr.findall(f"{W}{tname}")):
+                trPr.remove(el)
+                changed = True
+    for tc in tr.findall(f"{W}tc"):
+        tcPr = tc.find(f"{W}tcPr")
+        if tcPr is not None:
+            for tname in _STRAY_SPAN_TAGS:
+                for el in list(tcPr.findall(f"{W}{tname}")):
+                    tcPr.remove(el)
+                    changed = True
+    return changed
+
+
+def _ensure_landscape_a4_on_root(root: ET.Element) -> bool:
+    changed = False
+    body = root.find(f"{W}body")
+    sect_prs = root.findall(f".//{W}sectPr")
+    if not sect_prs and body is not None:
+        sp = ET.SubElement(body, f"{W}sectPr")
+        sect_prs = [sp]
+        changed = True
+
+    for sp in sect_prs:
+        pgSz = sp.find(f"{W}pgSz")
+        if pgSz is None:
+            insert_sectpr_child_ordered(sp, ET.Element(f"{W}pgSz", {
+                f"{W}w": "16838",
+                f"{W}h": "11906",
+                f"{W}orient": "landscape",
+            }))
+            changed = True
+        else:
+            try:
+                cur_w = int(pgSz.attrib.get(f"{W}w", "0") or 0)
+            except ValueError:
+                cur_w = 0
+            try:
+                cur_h = int(pgSz.attrib.get(f"{W}h", "0") or 0)
+            except ValueError:
+                cur_h = 0
+            if cur_w <= 0 or cur_h <= 0 or cur_w < cur_h:
+                pgSz.set(f"{W}w", "16838")
+                pgSz.set(f"{W}h", "11906")
+                pgSz.set(f"{W}orient", "landscape")
+                changed = True
+    return changed
+
+
+def ensure_three_column_tables_and_landscape(root: ET.Element) -> int:
+    """
+    1. Sets <w:sectPr>/<w:pgSz> to Landscape A4 (w="16838" h="11906" orient="landscape") whenever width < height.
+    2. Strips stray <w:gridSpan> / <w:gridBefore> / <w:wBefore> on 2-cell or 3-cell rows.
+    3. Expands any 2-column <w:tbl> to 3 <w:gridCol>s (3057, 5533, 5970) and appends a 3rd <w:tc>
+       (copying <w:tcBorders> from tc[1] + an empty <w:p>) to every 2-cell <w:tr>.
+    Returns count of expanded tables.
+    """
+    _ensure_landscape_a4_on_root(root)
+
+    expanded_tables = 0
+    for tbl in root.findall(f".//{W}tbl"):
+        trs = tbl.findall(f"{W}tr")
+        if not trs:
+            continue
+        has_2cell = False
+        for tr in trs:
+            tcs = tr.findall(f"{W}tc")
+            if len(tcs) in (2, 3):
+                _strip_stray_grid_spans_on_row(tr)
+            if len(tcs) == 2:
+                has_2cell = True
+
+        if not has_2cell:
+            continue
+
+        # Ensure tblPr with 5000 pct width
+        tblPr = tbl.find(f"{W}tblPr")
+        if tblPr is None:
+            tblPr = ET.Element(f"{W}tblPr")
+            tbl.insert(0, tblPr)
+        insert_tblpr_child_ordered(tblPr, ET.Element(f"{W}tblW", {f"{W}w": "5000", f"{W}type": "pct"}))
+
+        # Rebuild tblGrid with 3 gridCols: 3057, 5533, 5970
+        old_grid = tbl.find(f"{W}tblGrid")
+        new_grid = ET.Element(f"{W}tblGrid")
+        for gw in ("3057", "5533", "5970"):
+            ET.SubElement(new_grid, f"{W}gridCol", {f"{W}w": gw})
+        if old_grid is not None:
+            idx_g = list(tbl).index(old_grid)
+            tbl.remove(old_grid)
+            tbl.insert(idx_g, new_grid)
+        else:
+            idx_pr = list(tbl).index(tblPr)
+            tbl.insert(idx_pr + 1, new_grid)
+
+        pct_widths = ("1050", "1900", "2050")
+        for tr in trs:
+            tcs = tr.findall(f"{W}tc")
+            if len(tcs) != 2:
+                continue
+            for col_i in (0, 1):
+                tcPr_i = tcs[col_i].find(f"{W}tcPr")
+                if tcPr_i is None:
+                    tcPr_i = ET.Element(f"{W}tcPr")
+                    tcs[col_i].insert(0, tcPr_i)
+                insert_tcpr_child_ordered(
+                    tcPr_i,
+                    ET.Element(f"{W}tcW", {f"{W}w": pct_widths[col_i], f"{W}type": "pct"}),
+                )
+
+            tc1_pr = tcs[1].find(f"{W}tcPr")
+            new_tc = ET.Element(f"{W}tc")
+            new_tcPr = ET.Element(f"{W}tcPr")
+            insert_tcpr_child_ordered(new_tcPr, ET.Element(f"{W}tcW", {f"{W}w": pct_widths[2], f"{W}type": "pct"}))
+            if tc1_pr is not None:
+                for copy_tag in ("tcBorders", "tcMar", "vAlign"):
+                    sub_el = tc1_pr.find(f"{W}{copy_tag}")
+                    if sub_el is not None:
+                        cp_sub = copy.deepcopy(sub_el)
+                        _strip_unsafe_attrs_recursive(cp_sub)
+                        insert_tcpr_child_ordered(new_tcPr, cp_sub)
+            new_tc.append(new_tcPr)
+            new_tc.append(ET.Element(f"{W}p"))
+            tr.append(new_tc)
+
+        expanded_tables += 1
+
+    return expanded_tables
+
+
+def _normalize_shd_fill_val(shd_el: ET.Element = None):
+    if shd_el is None:
+        return None
+    fill = (shd_el.attrib.get(f"{W}fill") or "").strip()
+    if not fill or fill.lower() in ("auto", "ffffff", "none"):
+        return None
+    return fill.upper()
+
+
+def _normalize_hl_val(hl_el: ET.Element = None):
+    if hl_el is None:
+        return None
+    hval = (hl_el.attrib.get(f"{W}val") or "").strip()
+    if not hval or hval.lower() in ("none", "white"):
+        return None
+    return hval
+
+
+def _normalize_color_val(col_el: ET.Element = None):
+    if col_el is None:
+        return None
+    cval = (col_el.attrib.get(f"{W}val") or "").strip()
+    if not cval or cval.lower() in ("auto", "000000", "black", "ffffff"):
+        return None
+    return cval.upper()
+
+
+def _extract_cell_char_visual_props(tc: ET.Element):
+    """Return (text, list_of_(shd_fill, hl_val, color_val)_per_char)."""
+    chars = []
+    props = []
+    tcPr = tc.find(f"{W}tcPr")
+    tc_shd = _normalize_shd_fill_val(tcPr.find(f"{W}shd") if tcPr is not None else None)
+
+    for p_i, p in enumerate(tc.findall(f"{W}p")):
+        if p_i > 0:
+            chars.append("\n")
+            props.append((None, None, None))
+        pPr = p.find(f"{W}pPr")
+        p_shd = _normalize_shd_fill_val(pPr.find(f"{W}shd") if pPr is not None else None) or tc_shd
+        for r in p.findall(f".//{W}r"):
+            txt = "".join(t.text or "" for t in r.findall(f"{W}t"))
+            if not txt:
+                continue
+            rPr = r.find(f"{W}rPr")
+            r_shd = _normalize_shd_fill_val(rPr.find(f"{W}shd") if rPr is not None else None) or p_shd
+            r_hl = _normalize_hl_val(rPr.find(f"{W}highlight") if rPr is not None else None)
+            r_col = _normalize_color_val(rPr.find(f"{W}color") if rPr is not None else None)
+            prop_tuple = (r_shd, r_hl, r_col)
+            for ch in txt:
+                chars.append(ch)
+                props.append(prop_tuple)
+    return "".join(chars), props
+
+
+def _rebuild_cell_with_visual_props(tc: ET.Element, full_text: str, char_props: list) -> None:
+    """Rebuild paragraphs/runs of `tc` preserving its template pPr & base_rPr with per-char (shd, hl, color)."""
+    base_rPr = get_first_run_rpr(tc)
+    remove_rpr_child(base_rPr, "color")
+    orig_pPrs = [
+        copy.deepcopy(p_item.find(f"{W}pPr")) if p_item.find(f"{W}pPr") is not None else None
+        for p_item in tc.findall(f"{W}p")
+    ]
+    for ppr in orig_pPrs:
+        if ppr is not None:
+            remove_ppr_child(ppr, "shd")
+
+    para_slices = [[]]
+    for ch, prop in zip(full_text, char_props):
+        if ch == "\n":
+            para_slices.append([])
+        else:
+            para_slices[-1].append((ch, prop))
+
+    tcPr = tc.find(f"{W}tcPr")
+    if tcPr is not None:
+        for shd_c in list(tcPr.findall(f"{W}shd")):
+            tcPr.remove(shd_c)
+    for ch in list(tc):
+        if ch is not tcPr:
+            tc.remove(ch)
+
+    for p_idx, items in enumerate(para_slices):
+        p_el = ET.Element(f"{W}p")
+        chosen_pPr = (
+            orig_pPrs[p_idx]
+            if p_idx < len(orig_pPrs)
+            else (orig_pPrs[-1] if orig_pPrs else None)
+        )
+        if chosen_pPr is not None:
+            p_el.append(copy.deepcopy(chosen_pPr))
+
+        if items:
+            seg_chars = [items[0][0]]
+            cur_prop = items[0][1]
+            for ch, prop in items[1:]:
+                if prop == cur_prop:
+                    seg_chars.append(ch)
+                else:
+                    shd_f, hl_v, col_v = cur_prop
+                    r_el = make_run("".join(seg_chars), base_rPr=base_rPr, highlight=hl_v, shd_fill=shd_f)
+                    if col_v:
+                        rPr_el = r_el.find(f"{W}rPr")
+                        if rPr_el is None:
+                            rPr_el = ET.Element(f"{W}rPr")
+                            r_el.insert(0, rPr_el)
+                        insert_rpr_child_ordered(rPr_el, ET.Element(f"{W}color", {f"{W}val": col_v}))
+                    p_el.append(r_el)
+                    seg_chars = [ch]
+                    cur_prop = prop
+            shd_f, hl_v, col_v = cur_prop
+            r_el = make_run("".join(seg_chars), base_rPr=base_rPr, highlight=hl_v, shd_fill=shd_f)
+            if col_v:
+                rPr_el = r_el.find(f"{W}rPr")
+                if rPr_el is None:
+                    rPr_el = ET.Element(f"{W}rPr")
+                    r_el.insert(0, rPr_el)
+                insert_rpr_child_ordered(rPr_el, ET.Element(f"{W}color", {f"{W}val": col_v}))
+            p_el.append(r_el)
+
+        tc.append(p_el)
+
+
+def _merge_col1_visual_runs(
+    earlier_tc0: ET.Element,
+    later_tc0: ET.Element,
+    comments_root: ET.Element = None,
+    id_allocator: MarkupIdAllocator = None,
+) -> bool:
+    txt_a, props_a = _extract_cell_char_visual_props(earlier_tc0)
+    txt_b, props_b = _extract_cell_char_visual_props(later_tc0)
+    if not txt_b or all(p == (None, None, None) for p in props_b):
+        return False
+
+    sm = difflib.SequenceMatcher(None, txt_a, txt_b, autojunk=False)
+    out_chars = []
+    out_props = []
+    for tag, i1, i2, j1, j2 in sm.get_opcodes():
+        if tag == "equal":
+            for k in range(i2 - i1):
+                pa = props_a[i1 + k]
+                pb = props_b[j1 + k]
+                out_chars.append(txt_a[i1 + k])
+                out_props.append((pa[0] or pb[0], pa[1] or pb[1], pa[2] or pb[2]))
+        elif tag == "replace":
+            b_has_style = any(p != (None, None, None) for p in props_b[j1:j2])
+            a_has_style = any(p != (None, None, None) for p in props_a[i1:i2])
+            if b_has_style and not a_has_style:
+                for k in range(j1, j2):
+                    out_chars.append(txt_b[k])
+                    out_props.append(props_b[k])
+            else:
+                for k in range(i1, i2):
+                    out_chars.append(txt_a[k])
+                    out_props.append(props_a[k])
+        elif tag == "delete":
+            for k in range(i1, i2):
+                out_chars.append(txt_a[k])
+                out_props.append(props_a[k])
+        elif tag == "insert":
+            if any(p != (None, None, None) for p in props_b[j1:j2]):
+                for k in range(j1, j2):
+                    out_chars.append(txt_b[k])
+                    out_props.append(props_b[k])
+
+    merged_txt = "".join(out_chars)
+    if merged_txt == txt_a and out_props == props_a:
+        return False
+
+    anchors = (
+        extract_cell_comment_anchors(earlier_tc0, comments_root)
+        + extract_cell_comment_anchors(later_tc0, comments_root)
+    )
+    _rebuild_cell_with_visual_props(earlier_tc0, merged_txt, out_props)
+    if anchors and comments_root is not None and id_allocator is not None:
+        reanchor_comments_to_cell(earlier_tc0, anchors, comments_root, id_allocator)
+    return True
+
+
+_EN_SENT_END_SPLIT_RE = re.compile(r'[.?!]+(?:[”’"\')\]]+)?')
+
+
+def _split_col2_into_sentence_units(text: str, props: list) -> list:
+    """
+    Partition (text, props) into ordered sentence/newline dicts:
+      {"is_nl": bool, "text": str, "props": list, "words": list[str], "has_shd": bool, "shd_chars": int}
+    """
+    units = []
+    n = len(text)
+    idx = 0
+
+    def _make_sent_unit(s_i: int, e_i: int) -> dict:
+        sub_t = text[s_i:e_i]
+        sub_p = props[s_i:e_i]
+        shd_c = sum(1 for ch, p in zip(sub_t, sub_p) if (not ch.isspace()) and p[0] is not None)
+        words = [m.group(0).lower() for m in WORD_EXTRACT_RE.finditer(sub_t)]
+        return {
+            "is_nl": False,
+            "text": sub_t,
+            "props": sub_p,
+            "words": words,
+            "has_shd": shd_c > 0,
+            "shd_chars": shd_c,
+        }
+
+    while idx < n:
+        nl_pos = text.find("\n", idx)
+        p_end = nl_pos if nl_pos != -1 else n
+        p_sub = text[idx:p_end]
+        cur_s = 0
+        for m in _EN_SENT_END_SPLIT_RE.finditer(p_sub):
+            end_local = m.end()
+            if p_sub[cur_s:end_local].strip():
+                units.append(_make_sent_unit(idx + cur_s, idx + end_local))
+                cur_s = end_local
+        if cur_s < len(p_sub):
+            if p_sub[cur_s:].strip() or not units or units[-1]["is_nl"]:
+                units.append(_make_sent_unit(idx + cur_s, p_end))
+            else:
+                # Attach trailing spaces at end of paragraph to last sentence
+                units[-1]["text"] += p_sub[cur_s:]
+                units[-1]["props"].extend(props[idx + cur_s : p_end])
+        if nl_pos != -1:
+            units.append({
+                "is_nl": True,
+                "text": "\n",
+                "props": [props[nl_pos]],
+                "words": [],
+                "has_shd": False,
+                "shd_chars": 0,
+            })
+            idx = nl_pos + 1
+        else:
+            break
+    return units
+
+
+def _sent_similarity(u_a: dict, u_b: dict) -> float:
+    if u_a["is_nl"] != u_b["is_nl"]:
+        return 0.0
+    if u_a["is_nl"]:
+        return 1.0
+    wa, wb = u_a["words"], u_b["words"]
+    if not wa and not wb:
+        return 1.0 if u_a["text"].strip() == u_b["text"].strip() else 0.0
+    if not wa or not wb:
+        return 0.0
+    if wa == wb:
+        return 1.0
+    return difflib.SequenceMatcher(None, wa, wb, autojunk=False).ratio()
+
+
+def _merge_two_shaded_sentence_units(sa: dict, sb: dict) -> tuple:
+    """Merge two aligned sentence units when BOTH contain shading (union spans / prefer shaded edits)."""
+    ta, pa = sa["text"], sa["props"]
+    tb, pb = sb["text"], sb["props"]
+    if ta == tb:
+        merged_p = [(x[0] or y[0], x[1] or y[1], x[2] or y[2]) for x, y in zip(pa, pb)]
+        return ta, merged_p
+
+    # Token-level alignment to union shaded spans or prefer shaded edits
+    toks_a = tokenize_en_fine(ta)
+    toks_b = tokenize_en_fine(tb)
+
+    def _slice_tok_props(toks, all_p):
+        res = []
+        c = 0
+        for tk in toks:
+            ln = len(tk)
+            res.append(all_p[c : c + ln])
+            c += ln
+        return res
+
+    tprops_a = _slice_tok_props(toks_a, pa)
+    tprops_b = _slice_tok_props(toks_b, pb)
+    sm = difflib.SequenceMatcher(None, toks_a, toks_b, autojunk=False)
+    out_t = []
+    out_p = []
+    for tag, i1, i2, j1, j2 in sm.get_opcodes():
+        if tag == "equal":
+            for k in range(i2 - i1):
+                tk = toks_a[i1 + k]
+                out_t.append(tk)
+                for xa, xb in zip(tprops_a[i1 + k], tprops_b[j1 + k]):
+                    out_p.append((xa[0] or xb[0], xa[1] or xb[1], xa[2] or xb[2]))
+        else:
+            a_has = any(p[0] is not None for sl in tprops_a[i1:i2] for p in sl)
+            b_has = any(p[0] is not None for sl in tprops_b[j1:j2] for p in sl)
+            choose_b = (b_has and not a_has) or (b_has and a_has and sb["shd_chars"] > sa["shd_chars"])
+            if choose_b:
+                for k in range(j1, j2):
+                    out_t.append(toks_b[k])
+                    out_p.extend(tprops_b[k])
+            else:
+                for k in range(i1, i2):
+                    out_t.append(toks_a[k])
+                    out_p.extend(tprops_a[k])
+    return "".join(out_t), out_p
+
+
+def _merge_col2_shaded_sentences(
+    earlier_tc1: ET.Element,
+    later_tc1: ET.Element,
+    comments_root: ET.Element = None,
+    id_allocator: MarkupIdAllocator = None,
+) -> bool:
+    txt_a, props_a = _extract_cell_char_visual_props(earlier_tc1)
+    txt_b, props_b = _extract_cell_char_visual_props(later_tc1)
+    later_anchors = extract_cell_comment_anchors(later_tc1, comments_root)
+
+    if not txt_b.strip():
+        if later_anchors and comments_root is not None and id_allocator is not None:
+            reanchor_comments_to_cell(earlier_tc1, later_anchors, comments_root, id_allocator)
+            return True
+        return False
+
+    units_a = _split_col2_into_sentence_units(txt_a, props_a)
+    units_b = _split_col2_into_sentence_units(txt_b, props_b)
+    m_len, n_len = len(units_a), len(units_b)
+
+    # Monotonic DP alignment to anchor matching sentences (>= 0.68 word similarity)
+    dp = [[0.0] * (n_len + 1) for _ in range(m_len + 1)]
+    sim_mat = [[_sent_similarity(units_a[i], units_b[j]) for j in range(n_len)] for i in range(m_len)]
+    for i in range(m_len - 1, -1, -1):
+        for j in range(n_len - 1, -1, -1):
+            best = max(dp[i + 1][j], dp[i][j + 1])
+            sc = sim_mat[i][j]
+            if sc >= 0.68:
+                cand = sc + dp[i + 1][j + 1]
+                if cand >= best:
+                    best = cand
+            dp[i][j] = best
+
+    anchors_ij = []
+    ci, cj = 0, 0
+    while ci < m_len and cj < n_len:
+        sc = sim_mat[ci][cj]
+        if sc >= 0.68 and abs(dp[ci][cj] - (sc + dp[ci + 1][cj + 1])) < 1e-9:
+            anchors_ij.append((ci, cj))
+            ci += 1
+            cj += 1
+        elif dp[ci + 1][cj] >= dp[ci][cj + 1]:
+            ci += 1
+        else:
+            cj += 1
+
+    out_chunks = []  # list of (text_str, props_list)
+
+    def _append_chunk(c_txt: str, c_props: list):
+        if not c_txt:
+            return
+        if c_txt == "\n":
+            out_chunks.append((c_txt, c_props))
+            return
+        at_para_start = (not out_chunks) or (out_chunks[-1][0] == "\n")
+        if at_para_start:
+            # Strip leading horizontal spaces at start of paragraph
+            k = 0
+            while k < len(c_txt) and c_txt[k] == " ":
+                k += 1
+            c_txt = c_txt[k:]
+            c_props = c_props[k:]
+        else:
+            prev_t = out_chunks[-1][0]
+            if prev_t and not prev_t[-1].isspace() and not c_txt[0].isspace():
+                c_txt = " " + c_txt
+                c_props = [(None, None, None)] + list(c_props)
+        if c_txt:
+            out_chunks.append((c_txt, list(c_props)))
+
+    def _emit_gap(a_slice: list, b_slice: list):
+        if not a_slice and not b_slice:
+            return
+        a_shd = any(u["has_shd"] for u in a_slice)
+        b_shd = any(u["has_shd"] for u in b_slice)
+        if b_shd and not a_shd:
+            chosen = b_slice
+        elif a_shd and not b_shd:
+            chosen = a_slice
+        elif a_shd and b_shd:
+            if len(a_slice) == len(b_slice):
+                for ua, ub in zip(a_slice, b_slice):
+                    mt, mp = _merge_two_shaded_sentence_units(ua, ub)
+                    _append_chunk(mt, mp)
+                return
+            a_sc = sum(u["shd_chars"] for u in a_slice)
+            b_sc = sum(u["shd_chars"] for u in b_slice)
+            chosen = b_slice if b_sc > a_sc else a_slice
+        else:
+            chosen = a_slice
+        for u in chosen:
+            _append_chunk(u["text"], u["props"])
+
+    prev_i, prev_j = 0, 0
+    for ai, bj in anchors_ij:
+        _emit_gap(units_a[prev_i:ai], units_b[prev_j:bj])
+        ua, ub = units_a[ai], units_b[bj]
+        if ua["is_nl"]:
+            _append_chunk("\n", [(None, None, None)])
+        elif ub["has_shd"] and not ua["has_shd"]:
+            _append_chunk(ub["text"], ub["props"])
+        elif ua["has_shd"] and not ub["has_shd"]:
+            _append_chunk(ua["text"], ua["props"])
+        elif ua["has_shd"] and ub["has_shd"]:
+            mt, mp = _merge_two_shaded_sentence_units(ua, ub)
+            _append_chunk(mt, mp)
+        else:
+            _append_chunk(ua["text"], ua["props"])
+        prev_i, prev_j = ai + 1, bj + 1
+
+    _emit_gap(units_a[prev_i:], units_b[prev_j:])
+
+    merged_txt = "".join(t for t, _ in out_chunks)
+    merged_props = [p for _, plist in out_chunks for p in plist]
+
+    if merged_txt == txt_a and merged_props == props_a:
+        if later_anchors and comments_root is not None and id_allocator is not None:
+            reanchor_comments_to_cell(earlier_tc1, later_anchors, comments_root, id_allocator)
+            return True
+        return False
+
+    all_anchors = extract_cell_comment_anchors(earlier_tc1, comments_root) + later_anchors
+    _rebuild_cell_with_visual_props(earlier_tc1, merged_txt, merged_props)
+    if all_anchors and comments_root is not None and id_allocator is not None:
+        reanchor_comments_to_cell(earlier_tc1, all_anchors, comments_root, id_allocator)
+    return True
+
+
+def _is_top_instruction_paragraph_text(txt: str) -> bool:
+    cleaned = re.sub(r"\s+", " ", (txt or "").strip()).rstrip(".").strip().lower()
+    return cleaned in _TOP_INSTRUCTION_NORMS
+
+
+def merge_same_doc_duplicate_rows(
+    root: ET.Element,
+    log_fn=print,
+    comments_root: ET.Element = None,
+) -> int:
+    """
+    Scan all <w:tr>s across <w:tbl>s in `body`. When a later row has the same normalized Col 1
+    Chinese full paragraph (`len(cn_norm) >= 20`, exact match or similarity >= 0.96 with length diff < 5%)
+    as an earlier row:
+      - Merges Col 1 visual shading/highlight/color runs onto the earlier row's tc[0];
+      - Merges Col 2 shaded regions onto the earlier row's tc[1] sentence-by-sentence;
+      - Deletes the duplicate later <w:tr>; if its <w:tbl> now has 0 rows, deletes that <w:tbl>
+        plus its immediately preceding title <w:p>(s) and trailing blank <w:p>(s).
+    Returns count of merged duplicate rows.
+    """
+    body = root.find(f"{W}body")
+    if body is None:
+        return 0
+
+    id_allocator = MarkupIdAllocator(doc_root=root, comments_root=comments_root) if comments_root is not None else None
+    seen_rows = []  # list of {"cn_norm": str, "tr": Element, "body_idx": int}
+    emptied_tables = set()
+    merged_count = 0
+
+    for b_idx, ch in enumerate(list(body)):
+        if _local_name(ch.tag) != "tbl":
+            continue
+        for tr in list(ch.findall(f"{W}tr")):
+            tcs = tr.findall(f"{W}tc")
+            if len(tcs) < 2:
+                continue
+            cn_raw = get_cell_plain_text(tcs[0])
+            cn_norm = _WS_COLLAPSE_RE.sub("", cn_raw)
+            if len(cn_norm) < 20:
+                continue
+
+            matched_prev = None
+            for prev in seen_rows:
+                p_norm = prev["cn_norm"]
+                if p_norm == cn_norm:
+                    matched_prev = prev
+                    break
+                max_l = max(len(p_norm), len(cn_norm))
+                if abs(len(p_norm) - len(cn_norm)) / max_l < 0.05:
+                    if difflib.SequenceMatcher(None, p_norm, cn_norm, autojunk=False).ratio() >= 0.96:
+                        matched_prev = prev
+                        break
+
+            if matched_prev is None:
+                seen_rows.append({"cn_norm": cn_norm, "tr": tr, "body_idx": b_idx})
+                continue
+
+            prev_tcs = matched_prev["tr"].findall(f"{W}tc")
+            _merge_col1_visual_runs(prev_tcs[0], tcs[0], comments_root=comments_root, id_allocator=id_allocator)
+            _merge_col2_shaded_sentences(prev_tcs[1], tcs[1], comments_root=comments_root, id_allocator=id_allocator)
+
+            ch.remove(tr)
+            merged_count += 1
+            if log_fn:
+                log_fn(f"🔀 已自动合并同稿重复段落底纹并移除重复行：{cn_norm[:36]}...")
+
+        if len(ch.findall(f"{W}tr")) == 0:
+            emptied_tables.add(ch)
+
+    if emptied_tables:
+        children = list(body)
+        n = len(children)
+        to_remove = set()
+
+        def _is_blank_p(el: ET.Element) -> bool:
+            return _local_name(el.tag) == "p" and "".join(t.text or "" for t in el.findall(f".//{W}t")).strip() == ""
+
+        def _is_title_p(el: ET.Element) -> bool:
+            if _local_name(el.tag) != "p":
+                return False
+            ptxt = "".join(t.text or "" for t in el.findall(f".//{W}t")).strip()
+            return bool(ptxt) and not _is_top_instruction_paragraph_text(ptxt)
+
+        for idx, ch in enumerate(children):
+            if ch not in emptied_tables:
+                continue
+            to_remove.add(idx)
+            b_i = idx - 1
+            if b_i >= 1 and _is_blank_p(children[b_i]) and _is_title_p(children[b_i - 1]):
+                to_remove.add(b_i)
+                b_i -= 1
+            while b_i >= 0 and _is_title_p(children[b_i]):
+                to_remove.add(b_i)
+                b_i -= 1
+            f_i = idx + 1
+            while f_i < n and _is_blank_p(children[f_i]):
+                to_remove.add(f_i)
+                f_i += 1
+
+        for idx in sorted(to_remove, reverse=True):
+            body.remove(children[idx])
+
+        non_sect = [c for c in list(body) if _local_name(c.tag) != "sectPr"]
+        if not non_sect:
+            body.insert(0, ET.Element(f"{W}p"))
+
+    return merged_count
+
+
+def _compute_text_visual_weight(text: str, cjk_mult: float = 1.0) -> float:
+    cleaned = re.sub(r"\s+", " ", (text or "").strip())
+    if not cleaned:
+        return 0.0
+    cjk_cnt = len(_CJK_WEIGHT_RE.findall(cleaned))
+    other_cnt = len(cleaned) - cjk_cnt
+    return cjk_cnt * cjk_mult + other_cnt * 1.0
+
+
+def _project_bounded_pct_triple(weights: tuple, bounds: tuple, target_sum: int = 5000) -> tuple:
+    """Project 3 positive weights onto exact integer triple summing to `target_sum` within `bounds`."""
+    w_list = [max(1.0, float(w)) for w in weights]
+    vals = [0.0, 0.0, 0.0]
+    fixed = [False, False, False]
+
+    for _ in range(5):
+        rem_target = target_sum - sum(vals[i] for i in range(3) if fixed[i])
+        free_idxs = [i for i in range(3) if not fixed[i]]
+        if not free_idxs:
+            break
+        free_w = sum(w_list[i] for i in free_idxs)
+        clamped_any = False
+        for i in free_idxs:
+            raw_v = rem_target * (w_list[i] / free_w) if free_w > 0 else (rem_target / len(free_idxs))
+            lo, hi = bounds[i]
+            if raw_v < lo:
+                vals[i] = float(lo)
+                fixed[i] = True
+                clamped_any = True
+            elif raw_v > hi:
+                vals[i] = float(hi)
+                fixed[i] = True
+                clamped_any = True
+            else:
+                vals[i] = raw_v
+        if not clamped_any:
+            break
+
+    ints = [min(bounds[i][1], max(bounds[i][0], round(vals[i]))) for i in range(3)]
+    diff = target_sum - sum(ints)
+    while diff != 0:
+        step = 1 if diff > 0 else -1
+        moved = False
+        # Prefer adjusting Col 3, then Col 2, then Col 1 within bounds
+        for idx in (2, 1, 0):
+            cand = ints[idx] + step
+            if bounds[idx][0] <= cand <= bounds[idx][1]:
+                ints[idx] = cand
+                diff -= step
+                moved = True
+                if diff == 0:
+                    break
+        if not moved:
+            break
+    return (ints[0], ints[1], ints[2])
+
+
+def balance_trilingual_table_widths(root: ET.Element) -> int:
+    """
+    Adaptive 3-column table width balancer (`三语拉齐`):
+      - Strips stray gridSpan / gridBefore / wBefore on 3-cell rows;
+      - Computes visual text weight of Col 1 (CJK × 1.8), Col 2, and Col 3 per table;
+      - Sets <w:tblW w:w="5000" w:type="pct"/>, <w:tblGrid> summing to printable width (~14560 dxa),
+        and <w:tcW w:type="pct"> on all 3 cells (Col 1 [950, 1250], Col 2 [1700, 2050], Col 3 [1800, 2150], sum=5000).
+    Returns count of balanced tables.
+    """
+    _ensure_landscape_a4_on_root(root)
+
+    printable_dxa = 14560
+    sect = root.find(f".//{W}sectPr")
+    if sect is not None:
+        pgSz = sect.find(f"{W}pgSz")
+        pgMar = sect.find(f"{W}pgMar")
+        try:
+            pw = int(pgSz.attrib.get(f"{W}w", "16838")) if pgSz is not None else 16838
+            ph = int(pgSz.attrib.get(f"{W}h", "11906")) if pgSz is not None else 11906
+            eff_w = max(pw, ph)
+            ml = int(pgMar.attrib.get(f"{W}left", "1134")) if pgMar is not None else 1134
+            mr = int(pgMar.attrib.get(f"{W}right", "1134")) if pgMar is not None else 1134
+            cand_dxa = eff_w - ml - mr
+            if 9000 <= cand_dxa <= 19000:
+                printable_dxa = cand_dxa
+        except ValueError:
+            printable_dxa = 14560
+
+    bounds = ((950, 1250), (1700, 2050), (1800, 2150))
+    balanced_count = 0
+
+    for tbl in root.findall(f".//{W}tbl"):
+        trs = tbl.findall(f"{W}tr")
+        rows_3 = [tr for tr in trs if len(tr.findall(f"{W}tc")) == 3]
+        if not rows_3:
+            continue
+
+        w0, w1, w2 = 0.0, 0.0, 0.0
+        for tr in rows_3:
+            _strip_stray_grid_spans_on_row(tr)
+            tcs = tr.findall(f"{W}tc")
+            c3_txt = get_cell_plain_text(tcs[2])
+            if c3_txt.strip() == SKIPPED_ROW_MARKER:
+                c3_txt = ""
+            w0 += _compute_text_visual_weight(get_cell_plain_text(tcs[0]), cjk_mult=1.8)
+            w1 += _compute_text_visual_weight(get_cell_plain_text(tcs[1]), cjk_mult=1.0)
+            w2 += _compute_text_visual_weight(c3_txt, cjk_mult=1.4)
+
+        if w1 <= 0 and w2 <= 0:
+            pcts = (1050, 1950, 2000)
+        elif w2 <= 0:
+            pcts = (1050, 1950, 2000)
+        else:
+            pcts = _project_bounded_pct_triple((w0, w1, w2), bounds, target_sum=5000)
+
+        g0 = round(printable_dxa * pcts[0] / 5000)
+        g1 = round(printable_dxa * pcts[1] / 5000)
+        g2 = printable_dxa - g0 - g1
+
+        tblPr = tbl.find(f"{W}tblPr")
+        if tblPr is None:
+            tblPr = ET.Element(f"{W}tblPr")
+            tbl.insert(0, tblPr)
+        insert_tblpr_child_ordered(tblPr, ET.Element(f"{W}tblW", {f"{W}w": "5000", f"{W}type": "pct"}))
+
+        old_grid = tbl.find(f"{W}tblGrid")
+        new_grid = ET.Element(f"{W}tblGrid")
+        for gw in (g0, g1, g2):
+            ET.SubElement(new_grid, f"{W}gridCol", {f"{W}w": str(gw)})
+        if old_grid is not None:
+            idx_g = list(tbl).index(old_grid)
+            tbl.remove(old_grid)
+            tbl.insert(idx_g, new_grid)
+        else:
+            idx_pr = list(tbl).index(tblPr)
+            tbl.insert(idx_pr + 1, new_grid)
+
+        for tr in rows_3:
+            tcs = tr.findall(f"{W}tc")
+            for col_i in range(3):
+                tcPr = tcs[col_i].find(f"{W}tcPr")
+                if tcPr is None:
+                    tcPr = ET.Element(f"{W}tcPr")
+                    tcs[col_i].insert(0, tcPr)
+                insert_tcpr_child_ordered(
+                    tcPr,
+                    ET.Element(f"{W}tcW", {f"{W}w": str(pcts[col_i]), f"{W}type": "pct"}),
+                )
+
+        balanced_count += 1
+
+    return balanced_count
+
+
+def format_up_rv_count_tag(up_words: int, rv_words: int) -> str:
+    """
+    Format UP/RV English word count tag omitting zero counts:
+      - up > 0 and rv > 0 -> "(UP {up} words, RV {rv} words)"
+      - up > 0 and rv == 0 -> "(UP {up} words)"
+      - up == 0 and rv > 0 -> "(RV {rv} words)"
+      - up == 0 and rv == 0 -> ""
+    """
+    up = max(0, int(up_words or 0))
+    rv = max(0, int(rv_words or 0))
+    if up > 0 and rv > 0:
+        return f"(UP {up} words, RV {rv} words)"
+    if up > 0:
+        return f"(UP {up} words)"
+    if rv > 0:
+        return f"(RV {rv} words)"
+    return ""
+
+
+def _cell_is_dominantly_bold(tc: ET.Element) -> bool:
+    bold_chars = 0
+    total_chars = 0
+    for p in tc.findall(f"{W}p"):
+        p_b_el = p.find(f"./{W}pPr/{W}rPr/{W}b")
+        p_bold = p_b_el is not None and p_b_el.attrib.get(f"{W}val", "1").strip().lower() not in ("0", "false", "off")
+        for r in p.findall(f".//{W}r"):
+            if _local_name(r.tag) != "r":
+                continue
+            rtxt = "".join(t.text or "" for t in r.findall(f"{W}t")).strip()
+            if not rtxt:
+                continue
+            total_chars += len(rtxt)
+            b_el = r.find(f"./{W}rPr/{W}b")
+            if b_el is not None:
+                is_b = b_el.attrib.get(f"{W}val", "1").strip().lower() not in ("0", "false", "off")
+            else:
+                is_b = p_bold
+            if is_b:
+                bold_chars += len(rtxt)
+    return total_chars > 0 and (bold_chars / total_chars) >= 0.5
+
+
+def extract_full_article_en_title(root: ET.Element) -> str:
+    """
+    Inspect Row 0 of the first <w:tbl>: if Row 0 has >= 2 cells and looks like a chapter title row
+    (bold or <= 180 chars with Row 1 blank or body text below), return clean `get_cell_plain_text(tcs[1]).strip()`.
+    """
+    tbl = root.find(f".//{W}tbl")
+    if tbl is None:
+        return ""
+    trs = tbl.findall(f"{W}tr")
+    if not trs:
+        return ""
+    tcs0 = trs[0].findall(f"{W}tc")
+    if len(tcs0) < 2:
+        return ""
+
+    en_title = re.sub(r"\s+", " ", get_cell_plain_text(tcs0[1])).strip()
+    if not en_title:
+        return ""
+
+    is_bold = _cell_is_dominantly_bold(tcs0[1]) or _cell_is_dominantly_bold(tcs0[0])
+    is_centered = any(
+        (jc.attrib.get(f"{W}val") or "").strip().lower() == "center"
+        for jc in tcs0[1].findall(f".//{W}pPr/{W}jc")
+    )
+
+    if (is_bold or is_centered) and len(en_title) <= 240:
+        return en_title
+
+    if len(en_title) <= 180 and len(trs) >= 2:
+        tcs1 = trs[1].findall(f"{W}tc")
+        row1_en = get_cell_plain_text(tcs1[1]).strip() if len(tcs1) >= 2 else ""
+        row1_cn = get_cell_plain_text(tcs1[0]).strip() if len(tcs1) >= 1 else ""
+        # Row 1 is blank separator row or longer body paragraph
+        if (not row1_en and not row1_cn) or len(row1_en) > len(en_title):
+            return en_title
+
+    return ""
+
+
+def _build_top_instruction_paragraph(text: str, highlight_color: str) -> ET.Element:
+    p_el = ET.Element(f"{W}p")
+    pPr = ET.SubElement(p_el, f"{W}pPr")
+    insert_ppr_child_ordered(pPr, ET.Element(f"{W}spacing", {
+        f"{W}before": "0",
+        f"{W}after": "0",
+        f"{W}line": "400",
+        f"{W}lineRule": "exact",
+    }))
+    insert_ppr_child_ordered(pPr, ET.Element(f"{W}ind", {
+        f"{W}firstLine": "0",
+        f"{W}firstLineChars": "0",
+    }))
+    insert_ppr_child_ordered(pPr, ET.Element(f"{W}jc", {f"{W}val": "left"}))
+    p_rPr = ET.Element(f"{W}rPr")
+    insert_rpr_child_ordered(p_rPr, ET.Element(f"{W}rFonts", {
+        f"{W}ascii": "Georgia",
+        f"{W}eastAsia": "宋体",
+        f"{W}hAnsi": "Georgia",
+        f"{W}cs": "Georgia",
+    }))
+    insert_rpr_child_ordered(p_rPr, ET.Element(f"{W}sz", {f"{W}val": "28"}))
+    insert_rpr_child_ordered(p_rPr, ET.Element(f"{W}szCs", {f"{W}val": "28"}))
+    insert_ppr_child_ordered(pPr, p_rPr)
+
+    r_el = ET.SubElement(p_el, f"{W}r")
+    rPr = ET.SubElement(r_el, f"{W}rPr")
+    insert_rpr_child_ordered(rPr, ET.Element(f"{W}rFonts", {
+        f"{W}ascii": "Georgia",
+        f"{W}eastAsia": "宋体",
+        f"{W}hAnsi": "Georgia",
+        f"{W}cs": "Georgia",
+    }))
+    insert_rpr_child_ordered(rPr, ET.Element(f"{W}sz", {f"{W}val": "28"}))
+    insert_rpr_child_ordered(rPr, ET.Element(f"{W}szCs", {f"{W}val": "28"}))
+    insert_rpr_child_ordered(rPr, ET.Element(f"{W}highlight", {f"{W}val": highlight_color}))
+    t_el = ET.SubElement(r_el, f"{W}t")
+    t_el.text = text
+    return p_el
+
+
+def update_top_highlight_instruction_lines(root: ET.Element, has_up: bool, has_rv: bool) -> None:
+    """
+    Synchronize leading instruction lines at the very top of `body` (index 0):
+      - Removes any existing leading <w:p> matching "blue highlighted parts need to be reviewed"
+        or "yellow highlighted parts need to be updated" (case-insensitive, trailing '.' ignored).
+      - Inserts at index 0:
+          * If `has_rv`: Georgia sz="28" szCs="28" highlight="cyan", "Blue highlighted parts need to be reviewed."
+          * If `has_up`: Georgia sz="28" szCs="28" highlight="yellow", "Yellow highlighted parts need to be updated."
+          * If neither: inserts nothing!
+    """
+    body = root.find(f"{W}body")
+    if body is None:
+        return
+
+    # Remove any existing top instruction lines appearing before the first table
+    for ch in list(body):
+        loc = _local_name(ch.tag)
+        if loc in ("tbl", "sectPr"):
+            break
+        if loc == "p":
+            ptxt = "".join(t.text or "" for t in ch.findall(f".//{W}t")).strip()
+            if _is_top_instruction_paragraph_text(ptxt):
+                body.remove(ch)
+
+    to_insert = []
+    if has_rv:
+        to_insert.append(_build_top_instruction_paragraph(
+            "Blue highlighted parts need to be reviewed.",
+            "cyan",
+        ))
+    if has_up:
+        to_insert.append(_build_top_instruction_paragraph(
+            "Yellow highlighted parts need to be updated.",
+            "yellow",
+        ))
+
+    for idx, p_el in enumerate(to_insert):
+        body.insert(idx, p_el)
+
+    non_sect = [c for c in list(body) if _local_name(c.tag) != "sectPr"]
+    if not non_sect:
+        body.insert(0, ET.Element(f"{W}p"))
+

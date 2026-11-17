@@ -9,8 +9,10 @@ from docx_xml_utils import (
     SKIPPED_ROW_MARKER,
     W,
     apply_highlights_to_col3_cell,
+    balance_trilingual_table_widths,
     compute_col2_up_rv_words,
     find_fuzzy_substring_span,
+    format_up_rv_count_tag,
     get_cell_plain_text,
     insert_rpr_child_ordered,
     load_config,
@@ -19,6 +21,7 @@ from docx_xml_utils import (
     safe_join_output_file,
     sanitize_filename_part,
     save_docx_xml,
+    update_top_highlight_instruction_lines,
 )
 
 RV_HIGHLIGHT_VALS = {"cyan", "blue", "darkCyan"}
@@ -84,7 +87,17 @@ def accept_rv_revisions_in_col2(tc2: ET.Element, target_rv_color: str = "cyan"):
             elif local == "ins":
                 pending_non_rv = []
                 for r in list(ch):
-                    if r.tag.split("}")[-1] != "r":
+                    rloc = r.tag.split("}")[-1]
+                    if rloc in ("commentRangeStart", "commentRangeEnd"):
+                        if pending_non_rv:
+                            ins_copy = ET.Element(ch.tag, dict(ch.attrib))
+                            for pr in pending_non_rv:
+                                ins_copy.append(pr)
+                            new_children.append(ins_copy)
+                            pending_non_rv = []
+                        new_children.append(r)
+                        continue
+                    if rloc != "r":
                         continue
                     hl = r.find("./w:rPr/w:highlight", NS)
                     hval = hl.attrib.get(f"{W}val") if hl is not None else None
@@ -221,6 +234,8 @@ def main():
     parser.add_argument("--date", default="", help="Optional YYYYMMDD string, defaults to current local YYYYMMDD")
     parser.add_argument("--remove-unchanged-tables", action="store_true", help="Keep only tables that have Col 2 highlights/revisions")
     parser.add_argument("--only-unchanged-tables", action="store_true", help="Keep only tables that have ZERO Col 2 highlights/revisions")
+    parser.add_argument("--no-balance-columns", action="store_true", help="Disable automatic adaptive 3-column width balancing")
+    parser.add_argument("--no-header-lines", action="store_true", help="Disable automatic top Blue/Yellow highlight instruction lines")
     args = parser.parse_args()
 
     cfg = load_config()
@@ -301,17 +316,24 @@ def main():
         kept_cnt, removed_cnt = filter_tables_in_body(body, col2_up, col2_rv, keep_changed=True)
         print(f"Kept {kept_cnt} changed tables (removed {removed_cnt} unchanged/empty tables, {rem_skip} skipped rows).")
 
-    # 3. Optional top header paragraphs (if configured in config.json; empty by default)
-    header_paras = cfg.get("header_paragraphs", [])
-    if header_paras:
-        for idx, hp_text in enumerate(header_paras):
-            p_el = ET.Element(f"{W}p")
-            p_el.append(make_run(hp_text))
-            body.insert(idx, p_el)
-
-    # 4. Compute exact UP & RV English word counts from Col 2 (punctuation & skipped rows excluded)
+    # 3. Compute exact UP & RV English word counts from Col 2 (punctuation & skipped rows excluded)
     up_words, rv_words = compute_final_col2_word_counts(root, col2_up, col2_rv)
-    count_tag = f"(UP {up_words} words, RV {rv_words} words)"
+
+    # 3.5 Adaptive trilingual 3-column width balancing & top highlight instruction lines
+    if not args.no_balance_columns:
+        balance_trilingual_table_widths(root)
+
+    if not args.no_header_lines:
+        update_top_highlight_instruction_lines(root, has_up=(up_words > 0), has_rv=(rv_words > 0))
+    else:
+        header_paras = cfg.get("header_paragraphs", [])
+        if header_paras:
+            for idx, hp_text in enumerate(header_paras):
+                p_el = ET.Element(f"{W}p")
+                p_el.append(make_run(hp_text))
+                body.insert(idx, p_el)
+
+    count_tag = format_up_rv_count_tag(up_words, rv_words)
 
     date_str = sanitize_filename_part(
         args.date.strip() or datetime.now().strftime("%Y%m%d"),
@@ -320,7 +342,10 @@ def main():
     )
     lang_str = sanitize_filename_part(args.lang.strip().upper(), fallback="XX", max_len=16)
     doc_label = sanitize_filename_part(args.doc_name.strip(), fallback="Document", max_len=140)
-    out_filename = f"{lang_str}_{doc_label}_{count_tag}_{date_str}.docx"
+    if count_tag:
+        out_filename = f"{lang_str}_{doc_label}_{count_tag}_{date_str}.docx"
+    else:
+        out_filename = f"{lang_str}_{doc_label}_{date_str}.docx"
 
     outdir = Path(args.outdir).resolve()
     outdir.mkdir(parents=True, exist_ok=True)

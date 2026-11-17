@@ -10,10 +10,14 @@ from docx_xml_utils import (
     NS,
     W,
     diff_tokens,
+    ensure_three_column_tables_and_landscape,
     extract_char_shading,
     get_cell_plain_text,
     load_config,
+    load_docx_comments_xml,
     load_docx_xml,
+    merge_same_doc_duplicate_rows,
+    save_docx_xml,
     segment_diff_into_sentences,
     sentence_unit_stats,
     split_into_bg_regions,
@@ -131,7 +135,14 @@ def match_title_to_index_rels(title: str, lib_index: LibraryIndex) -> List[str]:
     if not hits and pool is not all_rels:
         hits = _search_pool(all_rels)
 
-    hits.sort(key=lambda rp: len(Path(rp).stem))
+    hits.sort(
+        key=lambda rp: (
+            0 if "零散" not in Path(rp).name else 1,
+            0 if "/" in rp.replace("\\", "/") else 1,
+            len(Path(rp).stem),
+            -lib_index.get_file_mtime_ns(rp),
+        )
+    )
     return hits
 
 
@@ -493,14 +504,28 @@ def _search_stages_2_to_5(
     if exact_hits:
         if len(exact_hits) == 1 and (len(inp_loose) >= 6 or _en_sc(exact_hits[0]) >= 0.20):
             return exact_hits[0], 1.0, "stage2_full_exact"
-        scored_ex = sorted(exact_hits, key=lambda r: _en_sc(r), reverse=True)
+        if len(inp_loose) >= 15:
+            # Same full Chinese paragraph across multiple library files (e.g. root `零散` summary vs volume subfolder chapter):
+            # prefer volume subfolder / non-`零散` filename / newer mtime_ns first!
+            viable_ex = [r for r in exact_hits if _en_sc(r) >= 0.20] or exact_hits
+            scored_ex = sorted(
+                viable_ex,
+                key=lambda r: (lib_index.file_priority_key(r["rel_path"]), _en_sc(r)),
+                reverse=True,
+            )
+        else:
+            scored_ex = sorted(
+                exact_hits,
+                key=lambda r: (round(_en_sc(r), 2), lib_index.file_priority_key(r["rel_path"])),
+                reverse=True,
+            )
         best_r = scored_ex[0]
         if len(inp_loose) >= 6 or _en_sc(best_r) >= 0.20:
             return best_r, 1.0, "stage2_full_exact"
 
     full_cands = lib_index.retrieve_trigram_candidates(inp_cn, top_k=25, allowed_rels=allowed_rels)
     best_full = None
-    best_full_rank = 0.0
+    best_full_key = None
     best_full_sim = 0.0
     for r in full_cands:
         r_norm = r["cn_norm"]
@@ -515,8 +540,9 @@ def _search_stages_2_to_5(
         esc = _en_sc(r)
         if c_sim >= 0.86 or (c_sim >= 0.74 and esc >= 0.12):
             rank = 0.70 * c_sim + 0.30 * esc
-            if rank > best_full_rank:
-                best_full_rank = rank
+            cand_key = (round(rank, 3), lib_index.file_priority_key(r["rel_path"]), rank)
+            if best_full_key is None or cand_key > best_full_key:
+                best_full_key = cand_key
                 best_full_sim = c_sim
                 best_full = r
     if best_full is not None:
@@ -732,12 +758,80 @@ def search_library_row_5stage(
     return None, 0.0, ""
 
 
+def _has_word_lock_file(src_file: Path) -> bool:
+    if (src_file.parent / f"~${src_file.name}").exists():
+        return True
+    if len(src_file.name) >= 8 and src_file.name[:2].isascii():
+        if (src_file.parent / f"~${src_file.name[2:]}").exists():
+            return True
+    return False
+
+
+def _resolve_live_source_row(
+    live_trs: List[ET.Element],
+    expected_row_idx: int,
+    inp_cn: str,
+    inp_en: str,
+    matched_cn_norm: str = "",
+) -> Tuple[int, Optional[List[ET.Element]]]:
+    """
+    Re-verify `expected_row_idx` against the live `src_file` XML on disk.
+    If the file was edited since indexing (e.g. rows inserted/deleted or Chinese text modified),
+    search `live_trs` live so we NEVER extract a shifted or stale row!
+    """
+    inp_norm = normalize_cn(inp_cn)
+
+    if 0 <= expected_row_idx < len(live_trs):
+        tcs0 = live_trs[expected_row_idx].findall("w:tc", NS)
+        if len(tcs0) >= 3 and get_cell_plain_text(tcs0[2]).strip():
+            live_norm0 = normalize_cn(get_cell_plain_text(tcs0[0]))
+            if live_norm0 and (
+                live_norm0 == inp_norm
+                or (matched_cn_norm and live_norm0 == matched_cn_norm)
+                or best_local_cn_similarity(inp_cn, live_norm0) >= 0.85
+            ):
+                return expected_row_idx, tcs0
+
+    # Live fallback search across all rows in src_file
+    best_idx = -1
+    best_tcs = None
+    best_rank = 0.0
+    for idx, tr in enumerate(live_trs):
+        tcs = tr.findall("w:tc", NS)
+        if len(tcs) < 3 or not get_cell_plain_text(tcs[2]).strip():
+            continue
+        live_cn = get_cell_plain_text(tcs[0])
+        live_norm = normalize_cn(live_cn)
+        if not live_norm:
+            continue
+        if live_norm == inp_norm or (matched_cn_norm and live_norm == matched_cn_norm):
+            return idx, tcs
+        csim = best_local_cn_similarity(inp_cn, live_norm)
+        if csim < 0.72:
+            continue
+        esc = compute_en_overlap_score(inp_en, get_cell_plain_text(tcs[1]))
+        rank = 0.72 * csim + 0.28 * esc
+        if rank > best_rank:
+            best_rank = rank
+            best_idx = idx
+            best_tcs = tcs
+
+    if best_tcs is not None:
+        return best_idx, best_tcs
+    return -1, None
+
+
 def main():
     parser = argparse.ArgumentParser(description="Step 1a: Extract library rows and compute sentence diffs.")
     parser.add_argument("--input", required=True, help="Path to 英文底稿.docx")
     parser.add_argument("--library", required=True, help="Path to target language total library directory")
     parser.add_argument("--workdir", required=True, help="Directory to store intermediate JSON manifest")
     parser.add_argument("--lang", default="", help="Optional explicit language code (e.g. FR, PT)")
+    parser.add_argument(
+        "--force-full-diff",
+        action="store_true",
+        help="Full-article comparison mode: compare every paragraph in full regardless of shading",
+    )
     args = parser.parse_args()
 
     cfg = load_config()
@@ -747,25 +841,49 @@ def main():
     workdir.mkdir(parents=True, exist_ok=True)
 
     lib_index = get_library_index(lib_dir, log_fn=print)
-    inp_root, _, _ = load_docx_xml(inp_path)
+    inp_root, _, inp_ns_pairs = load_docx_xml(inp_path)
+    inp_comments_root = load_docx_comments_xml(inp_path)
+
+    # Preprocess input: auto-expand 2-column tables -> 3 columns + Landscape A4, and merge duplicate paragraphs
+    xml_before_preproc = ET.tostring(inp_root, encoding="unicode")
+    exp_cnt = ensure_three_column_tables_and_landscape(inp_root)
+    merged_cnt = merge_same_doc_duplicate_rows(inp_root, log_fn=print, comments_root=inp_comments_root)
+    preproc_modified = (
+        exp_cnt > 0
+        or merged_cnt > 0
+        or (ET.tostring(inp_root, encoding="unicode") != xml_before_preproc)
+    )
+
+    effective_inp_path = inp_path
+    if preproc_modified:
+        preproc_path = workdir / "_preprocessed_input.docx"
+        save_docx_xml(inp_path, preproc_path, inp_root, inp_ns_pairs, comments_root=inp_comments_root)
+        effective_inp_path = preproc_path
+        inp_root, _, _ = load_docx_xml(effective_inp_path)
+        if exp_cnt > 0:
+            print(f"📐 已自动将 {exp_cnt} 个两列表格扩展为三列表格并设为横向 A4 页面。")
+
     body = inp_root.find("w:body", NS)
 
     # Check if ANY shading exists across all tables in input Col 2
     any_doc_shading = False
-    for tbl in body.findall("w:tbl", NS):
-        for tr in tbl.findall("w:tr", NS):
-            tcs = tr.findall("w:tc", NS)
-            if len(tcs) >= 2:
-                _, fills = extract_char_shading(tcs[1])
-                if any(f is not None for f in fills):
-                    any_doc_shading = True
-                    break
+    if not args.force_full_diff:
+        for tbl in body.findall("w:tbl", NS):
+            for tr in tbl.findall("w:tr", NS):
+                tcs = tr.findall("w:tc", NS)
+                if len(tcs) >= 2:
+                    _, fills = extract_char_shading(tcs[1])
+                    if any(f is not None for f in fills):
+                        any_doc_shading = True
+                        break
 
     cur_title = ""
     tbl_counter = 0
     rows_manifest = []
     skipped_rows = []
     matched_lib_paths: List[Path] = []
+    live_src_cache: Dict[Path, List[ET.Element]] = {}
+    warned_open_files: Set[Path] = set()
 
     rv_threshold = cfg.get("rv_word_change_ratio_threshold", 0.42)
 
@@ -784,7 +902,7 @@ def main():
                 inp_en, inp_fills = extract_char_shading(tcs[1])
                 if not normalize_cn(inp_cn) and not inp_en.strip():
                     continue
-                if not any_doc_shading:
+                if args.force_full_diff or not any_doc_shading:
                     inp_fills = ["NONE_FULL"] * len(inp_en)
 
                 matched_row, match_conf, match_stage = search_library_row_5stage(
@@ -811,12 +929,52 @@ def main():
                     continue
 
                 src_file = lib_index.resolve_file_path(matched_row["rel_path"])
+                if not src_file.exists():
+                    cn_prev = normalize_cn(inp_cn)[:80]
+                    print(f"⚠️ 总库文件已被移除，跳过该行 [{src_file.name}]: {cn_prev}")
+                    skipped_rows.append({
+                        "body_idx": body_idx,
+                        "row_idx": r_idx,
+                        "article_title": cur_title,
+                        "cn_preview": cn_prev,
+                    })
+                    continue
+
+                if src_file not in warned_open_files:
+                    warned_open_files.add(src_file)
+                    if _has_word_lock_file(src_file):
+                        print(
+                            f"⚠️ 检测到总库文件《{src_file.name}》正在 Word 中打开，若刚作修改请确认已在 Word 中按 Ctrl+S 保存！"
+                        )
+
+                # CRITICAL: Always load src_file LIVE from disk (never use cached matched_row['en_plain']!)
+                if src_file not in live_src_cache:
+                    s_root_live, _, _ = load_docx_xml(src_file)
+                    live_src_cache[src_file] = s_root_live.findall(".//w:tbl/w:tr", NS)
+
+                s_row_idx, live_tcs = _resolve_live_source_row(
+                    live_trs=live_src_cache[src_file],
+                    expected_row_idx=int(matched_row["row_idx"]),
+                    inp_cn=inp_cn,
+                    inp_en=inp_en,
+                    matched_cn_norm=matched_row.get("cn_norm", ""),
+                )
+                if live_tcs is None:
+                    cn_prev = normalize_cn(inp_cn)[:80]
+                    print(f"⚠️ 总库文件《{src_file.name}》实时校验未找到对应有效段落，已跳过该行: {cn_prev}")
+                    skipped_rows.append({
+                        "body_idx": body_idx,
+                        "row_idx": r_idx,
+                        "article_title": cur_title,
+                        "cn_preview": cn_prev,
+                    })
+                    continue
+
                 if src_file not in matched_lib_paths:
                     matched_lib_paths.append(src_file)
 
-                s_row_idx = int(matched_row["row_idx"])
-                src_en = matched_row.get("en_plain", "")
-                col3_preview = matched_row.get("col3_preview", "")
+                src_en = get_cell_plain_text(live_tcs[1])
+                col3_preview = get_cell_plain_text(live_tcs[2])[:120]
 
                 regions = split_into_bg_regions(src_en, inp_en, inp_fills)
                 region_entries = []
@@ -872,10 +1030,14 @@ def main():
     all_idx_files = [lib_index.resolve_file_path(rp) for rp in list(lib_index.files_map.keys())[:20]]
     lang_code = args.lang.strip().upper() or detect_lang_code(lib_dir, matched_lib_paths or all_idx_files, cfg)
     manifest = {
-        "input_docx": str(inp_path),
+        "input_docx": str(effective_inp_path),
+        "original_input_docx": str(inp_path),
         "library_dir": str(lib_dir),
         "lang_code": lang_code,
         "any_doc_shading": any_doc_shading,
+        "force_full_diff": bool(args.force_full_diff),
+        "expanded_2col_tables": exp_cnt,
+        "merged_duplicate_rows": merged_cnt,
         "rows": rows_manifest,
         "skipped_rows": skipped_rows,
     }
