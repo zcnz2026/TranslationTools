@@ -58,11 +58,20 @@ from lang_registry import (
 )
 
 get_lang_typography = getattr(_lang_reg_mod, "get_lang_typography", None)
+_ext_get_prioritized_combo_values = getattr(_lang_reg_mod, "get_prioritized_combo_values", None)
+_ext_record_recent_language = getattr(_lang_reg_mod, "record_recent_language", None)
 
 import pipeline as _pipeline_mod
 
 run_oneclick_pipeline = getattr(_pipeline_mod, "run_oneclick_pipeline", None)
 ensure_library_index = getattr(_pipeline_mod, "ensure_library_index", None)
+
+try:
+    import master_sync as _master_sync_mod
+except ImportError:
+    _master_sync_mod = None
+
+sync_pending_with_latest_master = getattr(_master_sync_mod, "sync_pending_with_latest_master", None)
 
 try:
     import full_article_processor as _fa_mod
@@ -71,7 +80,9 @@ except ImportError:
 
 parse_titles_text_or_file = getattr(_fa_mod, "parse_titles_text_or_file", None)
 parse_titles_multiline = getattr(_fa_mod, "parse_titles_multiline", None)
+refresh_master_index = getattr(_fa_mod, "refresh_master_index", None)
 resolve_full_articles = getattr(_fa_mod, "resolve_full_articles", None)
+resolve_direct_folder_articles = getattr(_fa_mod, "resolve_direct_folder_articles", None)
 run_full_article_pipeline = getattr(_fa_mod, "run_full_article_pipeline", None)
 
 try:
@@ -86,7 +97,7 @@ try:
 except ImportError:
     _updater_mod = None
 
-RAW_APP_VERSION = str(getattr(_updater_mod, "APP_VERSION", "1.7.0")).lstrip("vV") or "1.7.0"
+RAW_APP_VERSION = "1.8.0"
 APP_VERSION = f"v{RAW_APP_VERSION}"
 check_for_updates = getattr(_updater_mod, "check_for_updates", None)
 download_and_apply_update = getattr(_updater_mod, "download_and_apply_update", None)
@@ -174,6 +185,83 @@ def _call_compatible(fn, *args, **kwargs):
         return fn(*args, **filtered_kw)
     except (ValueError, TypeError):
         return fn(*args, **kwargs)
+
+
+def _resolve_combo_code(text: str, entries: list[dict]) -> str:
+    """Resolve combobox label (including `★ ` / `⏱ ` prefixes) cleanly to canonical language code."""
+    cleaned = re.sub(r"^[★☆⏱\s]+", "", str(text or "")).strip()
+    return resolve_combo_to_code(cleaned, entries)
+
+
+def get_prioritized_combo_values(
+    entries: list[dict],
+    recent_codes: list[str] | None = None,
+    favorite_codes: list[str] | None = None,
+) -> list[str]:
+    """Return language combobox items ordered: AUTO -> ★ Favorites -> ⏱ Recent -> Remaining."""
+    if callable(_ext_get_prioritized_combo_values):
+        return list(
+            _call_compatible(
+                _ext_get_prioritized_combo_values,
+                entries,
+                recent_codes=recent_codes,
+                favorite_codes=favorite_codes,
+            )
+        )
+    fav_set = {str(c).strip().upper() for c in (favorite_codes or []) if str(c).strip()}
+    for e in entries:
+        if e.get("favorite"):
+            fav_set.add(str(e.get("code", "")).strip().upper())
+
+    by_code = {str(e.get("code", "")).strip().upper(): e for e in entries if str(e.get("code", "")).strip()}
+    out: list[str] = [AUTO_COMBO_LABEL]
+    listed: set[str] = set()
+
+    # 1. Favorites (preserving entries order)
+    for e in entries:
+        c = str(e.get("code", "")).strip().upper()
+        if c and c in fav_set and c not in listed:
+            out.append(f"★ {e['code']} - {e['name']}")
+            listed.add(c)
+
+    # 2. Recently used (MRU order, excluding favorites)
+    for rc in recent_codes or []:
+        c = str(rc or "").strip().upper()
+        if not c or c in ("AUTO", "XX") or c in listed:
+            continue
+        ent = by_code.get(c)
+        if ent is not None:
+            out.append(f"⏱ {ent['code']} - {ent['name']}")
+            listed.add(c)
+
+    # 3. Remaining entries
+    for e in entries:
+        c = str(e.get("code", "")).strip().upper()
+        if c and c not in listed:
+            out.append(f"{e['code']} - {e['name']}")
+            listed.add(c)
+
+    return out
+
+
+def record_recent_language(code: str, recent_codes: list[str] | None = None, max_items: int = 5) -> list[str]:
+    """Record `code` at head of MRU list (ignoring AUTO/XX/empty), capped at `max_items`."""
+    if callable(_ext_record_recent_language):
+        return list(_call_compatible(_ext_record_recent_language, code, list(recent_codes or []), max_items=max_items))
+    c = re.sub(r"^[★☆⏱\s]+", "", str(code or "")).strip().upper()
+    existing = [
+        str(x).strip().upper()
+        for x in (recent_codes or [])
+        if str(x).strip() and str(x).strip().upper() not in ("AUTO", "XX")
+    ]
+    dedup_existing: list[str] = []
+    for x in existing:
+        if x not in dedup_existing:
+            dedup_existing.append(x)
+    if not c or c in ("AUTO", "XX"):
+        return dedup_existing[: max(1, int(max_items))]
+    updated = [c] + [x for x in dedup_existing if x != c]
+    return updated[: max(1, int(max_items))]
 
 
 def _fallback_parse_titles_multiline(raw_text: str) -> list[str]:
@@ -890,25 +978,39 @@ class ApiKeyPoolDialog(tk.Toplevel):
 
 
 class LanguageManagerDialog(tk.Toplevel):
-    """Modal dialog for viewing, adding, editing, and deleting languages + standard fonts."""
+    """Modal dialog for viewing, adding, editing, pinning favorite languages, and managing standard fonts."""
 
-    def __init__(self, parent: tk.Tk, entries: list, on_saved_callback):
+    def __init__(
+        self,
+        parent: tk.Tk,
+        entries: list,
+        on_saved_callback,
+        favorite_codes: list[str] | None = None,
+    ):
         super().__init__(parent)
         self.withdraw()
-        self.title("多语种与标准字体配置管理")
+        self.title("常用语种置顶与标准字体配置管理")
         self.transient(parent)
 
-        self.entries = [dict(x) for x in entries]
+        fav_set = {str(c).strip().upper() for c in (favorite_codes or []) if str(c).strip()}
+        self.entries = []
+        for x in entries:
+            item = dict(x)
+            code_u = str(item.get("code") or "").strip().upper()
+            item["favorite"] = bool(item.get("favorite") or code_u in fav_set)
+            self.entries.append(item)
         self.on_saved_callback = on_saved_callback
 
         self.code_var = tk.StringVar()
         self.name_var = tk.StringVar()
         self.font_var = tk.StringVar()
         self.kw_var = tk.StringVar()
+        self.fav_var = tk.BooleanVar(value=False)
+        self.summary_var = tk.StringVar(value="")
 
         self._build_ui()
         self._refresh_tree()
-        _fit_and_center_window(self, base_w=840, base_h=560, min_w=740, min_h=460, parent=parent)
+        _fit_and_center_window(self, base_w=880, base_h=590, min_w=760, min_h=480, parent=parent)
         self.deiconify()
         try:
             self.grab_set()
@@ -922,6 +1024,10 @@ class LanguageManagerDialog(tk.Toplevel):
         code = str(entry.get("code") or "").strip().upper()
         return _BUILTIN_FONT_FALLBACKS.get(code, "")
 
+    @staticmethod
+    def _is_entry_fav(entry: dict) -> bool:
+        return bool(entry.get("favorite"))
+
     def _build_ui(self):
         wrap = ttk.Frame(self, padding=14)
         wrap.pack(fill=tk.BOTH, expand=True)
@@ -929,7 +1035,7 @@ class LanguageManagerDialog(tk.Toplevel):
         tip = ttk.Label(
             wrap,
             text=(
-                "所有语种与字体配置实时保存在同目录 languages.json 中（已内置《各语系字体》规范，如泰语 Angsana New 18/16/14pt）。\n"
+                "支持将高频语种设为「★ 常用」置顶（与最近使用的语种自动排在所有板块下拉框最上方），配置实时保存在 languages.json 与系统设置中。\n"
                 "• 语种代码：用于定稿文件名前缀（如 GR_、TH_、PL_）及自动识别；标准字体留空表示保留原稿第 3 列字体。"
             ),
             foreground="#475569",
@@ -944,9 +1050,13 @@ class LanguageManagerDialog(tk.Toplevel):
         _make_primary_btn(btns, text="新增 / 保存语种", command=self._on_add_or_update).pack(
             side=tk.LEFT, padx=(0, 8)
         )
-        ttk.Button(btns, text="删除选中语种", command=self._on_delete).pack(side=tk.LEFT, padx=(0, 8))
-        ttk.Button(btns, text="补全内置默认语种", command=self._on_merge_defaults).pack(side=tk.LEFT, padx=(0, 8))
-        ttk.Button(btns, text="打开 languages.json", command=self._on_open_json).pack(side=tk.LEFT)
+        self.btn_toggle_fav = ttk.Button(
+            btns,
+            text="切换选中语种常用置顶",
+            command=self._on_toggle_favorite,
+        )
+        self.btn_toggle_fav.pack(side=tk.LEFT, padx=(0, 8))
+        ttk.Button(btns, text="删除选中语种", command=self._on_delete).pack(side=tk.LEFT)
 
         tk.Frame(wrap, bg="#e2e8f0", height=1).pack(side=tk.BOTTOM, fill=tk.X, pady=(10, 10))
 
@@ -971,37 +1081,77 @@ class LanguageManagerDialog(tk.Toplevel):
 
         ttk.Label(form, text="自动识别关键词：").grid(row=1, column=0, sticky=tk.W, pady=4)
         ttk.Entry(form, textvariable=self.kw_var).grid(row=1, column=1, columnspan=5, sticky=tk.EW, pady=4, padx=4)
+
+        fav_row = ttk.Frame(form)
+        fav_row.grid(row=2, column=0, columnspan=6, sticky=tk.EW, pady=(2, 0))
+        self.chk_fav = ttk.Checkbutton(
+            fav_row,
+            text="设为常用语种（下拉框置顶）",
+            variable=self.fav_var,
+        )
+        self.chk_fav.pack(side=tk.LEFT, padx=(0, 14))
         ttk.Label(
-            form,
-            text="多个关键词用逗号分隔，如：波兰语, 波语, 中英波, PO；标准字体留空则保留文档原字体",
+            fav_row,
+            text="多个关键词用逗号分隔（如：波兰语, 波语, 中英波, PO）；标准字体留空则保留原字体",
             foreground="#475569",
-        ).grid(row=2, column=1, columnspan=5, sticky=tk.W, padx=4)
+        ).pack(side=tk.LEFT)
+
+        tbl_toolbar = ttk.Frame(wrap)
+        tbl_toolbar.pack(side=tk.TOP, fill=tk.X, pady=(0, 6))
+        ttk.Button(
+            tbl_toolbar,
+            text="打开 languages.json",
+            style="Compact.TButton",
+            command=self._on_open_json,
+        ).pack(side=tk.RIGHT)
+        ttk.Button(
+            tbl_toolbar,
+            text="补全内置默认语种",
+            style="Compact.TButton",
+            command=self._on_merge_defaults,
+        ).pack(side=tk.RIGHT, padx=(0, 6))
+        ttk.Label(
+            tbl_toolbar,
+            textvariable=self.summary_var,
+            font=("Microsoft YaHei UI", 9, "bold"),
+            foreground="#1d4ed8",
+        ).pack(side=tk.LEFT)
 
         tbl_frame = ttk.Frame(wrap)
         tbl_frame.pack(side=tk.TOP, fill=tk.BOTH, expand=True, pady=(0, 8))
 
-        cols = ("code", "name", "font", "keywords")
-        self.tree = ttk.Treeview(tbl_frame, columns=cols, show="headings", selectmode="browse", height=9)
+        cols = ("fav", "code", "name", "font", "keywords")
+        self.tree = ttk.Treeview(tbl_frame, columns=cols, show="headings", selectmode="browse", height=8)
+        self.tree.heading("fav", text="常用置顶")
         self.tree.heading("code", text="语种代码 (前缀)")
         self.tree.heading("name", text="语种名称")
         self.tree.heading("font", text="标准字体 (如 Georgia / Angsana New)")
         self.tree.heading("keywords", text="自动识别关键词（目录名 / 文件名包含任一词即可）")
 
-        self.tree.column("code", width=110, anchor=tk.CENTER)
-        self.tree.column("name", width=120, anchor=tk.CENTER)
-        self.tree.column("font", width=215, anchor=tk.CENTER)
-        self.tree.column("keywords", width=310, anchor=tk.W)
+        self.tree.column("fav", width=80, anchor=tk.CENTER)
+        self.tree.column("code", width=105, anchor=tk.CENTER)
+        self.tree.column("name", width=110, anchor=tk.CENTER)
+        self.tree.column("font", width=240, anchor=tk.CENTER)
+        self.tree.column("keywords", width=295, anchor=tk.W)
+        self.tree.tag_configure("fav_row", foreground="#1d4ed8")
 
         vsb = ttk.Scrollbar(tbl_frame, orient=tk.VERTICAL, command=self.tree.yview)
         self.tree.configure(yscrollcommand=vsb.set)
         self.tree.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
         vsb.pack(side=tk.RIGHT, fill=tk.Y)
         self.tree.bind("<<TreeviewSelect>>", self._on_select_row)
+        self.tree.bind("<Double-1>", lambda _e: self._on_toggle_favorite())
 
-    def _refresh_tree(self):
+    def _refresh_tree(self, keep_code: str | None = None):
         for item in self.tree.get_children():
             self.tree.delete(item)
+        fav_cnt = 0
+        select_iid: str | None = None
         for idx, e in enumerate(self.entries):
+            is_fav = self._is_entry_fav(e)
+            if is_fav:
+                fav_cnt += 1
+            fav_disp = "★ 常用" if is_fav else "-"
             f_val = self._effective_entry_font(e)
             if f_val and e.get("code") == "TH":
                 t_pt = e.get("title_pt", 18)
@@ -1010,12 +1160,21 @@ class LanguageManagerDialog(tk.Toplevel):
                 f_disp = f"{f_val} ({t_pt}/{b_pt}/{c_pt}pt)"
             else:
                 f_disp = f_val if f_val else "（保留原字体）"
+            iid = str(idx)
+            tags = ("fav_row",) if is_fav else ()
             self.tree.insert(
                 "",
                 tk.END,
-                iid=str(idx),
-                values=(e["code"], e["name"], f_disp, ", ".join(e.get("keywords", []))),
+                iid=iid,
+                values=(fav_disp, e["code"], e["name"], f_disp, ", ".join(e.get("keywords", []))),
+                tags=tags,
             )
+            if keep_code and str(e.get("code", "")).upper() == keep_code.upper():
+                select_iid = iid
+        self.summary_var.set(f"当前共 {len(self.entries)} 个语种  |  已设常用置顶：{fav_cnt} 个（双击行也可快速切换）")
+        if select_iid is not None:
+            self.tree.selection_set(select_iid)
+            self.tree.see(select_iid)
 
     def _on_select_row(self, _event=None):
         sel = self.tree.selection()
@@ -1028,11 +1187,39 @@ class LanguageManagerDialog(tk.Toplevel):
             self.name_var.set(e["name"])
             self.font_var.set(self._effective_entry_font(e))
             self.kw_var.set(", ".join(e.get("keywords", [])))
+            self.fav_var.set(self._is_entry_fav(e))
+
+    def _on_toggle_favorite(self):
+        sel = self.tree.selection()
+        target_idx = -1
+        if sel:
+            cand = int(sel[0])
+            if 0 <= cand < len(self.entries):
+                target_idx = cand
+        elif self.code_var.get().strip():
+            code_u = re.sub(r"[^A-Za-z0-9_-]", "", self.code_var.get().strip()).upper()
+            for i, e in enumerate(self.entries):
+                if str(e.get("code", "")).upper() == code_u:
+                    target_idx = i
+                    break
+        if target_idx < 0:
+            messagebox.showinfo("提示", "请先在列表中点击选中一个语种，再切换常用置顶。", parent=self)
+            return
+
+        entry = dict(self.entries[target_idx])
+        new_fav = not self._is_entry_fav(entry)
+        entry["favorite"] = new_fav
+        self.entries[target_idx] = entry
+        self.fav_var.set(new_fav)
+        save_languages(self.entries)
+        self._refresh_tree(keep_code=entry["code"])
+        self.on_saved_callback(self.entries, selected_code=None)
 
     def _on_add_or_update(self):
         raw_code = re.sub(r"[^A-Za-z0-9_-]", "", self.code_var.get().strip()).upper()
         name = self.name_var.get().strip()
         font_val = self.font_var.get().strip()
+        is_fav = bool(self.fav_var.get())
         if not raw_code or raw_code == "AUTO":
             messagebox.showwarning("提示", "请填写有效的英文语种代码（例如 TH、NL、SR，不能为 AUTO）。", parent=self)
             return
@@ -1052,6 +1239,7 @@ class LanguageManagerDialog(tk.Toplevel):
                         "name": name,
                         "keywords": kws,
                         "font": font_val,
+                        "favorite": is_fav,
                     }
                 )
                 self.entries[i] = merged_entry
@@ -1065,17 +1253,19 @@ class LanguageManagerDialog(tk.Toplevel):
                     "name": name,
                     "keywords": kws,
                     "font": font_val,
+                    "favorite": is_fav,
                 },
             )
 
         save_languages(self.entries)
-        self._refresh_tree()
+        self._refresh_tree(keep_code=raw_code)
         self.on_saved_callback(self.entries, selected_code=raw_code)
         action_str = "已更新" if updated else "已新增"
         font_disp = font_val or "保留原稿字体"
+        fav_disp = "★ 常用置顶" if is_fav else "普通排序"
         messagebox.showinfo(
             "保存成功",
-            f"{action_str}语种：{raw_code} - {name}\n标准字体：{font_disp}\n识别关键词：{', '.join(kws)}",
+            f"{action_str}语种：{raw_code} - {name}（{fav_disp}）\n标准字体：{font_disp}\n识别关键词：{', '.join(kws)}",
             parent=self,
         )
 
@@ -1103,6 +1293,7 @@ class LanguageManagerDialog(tk.Toplevel):
                 entry_copy = dict(d)
                 if "font" not in entry_copy:
                     entry_copy["font"] = _BUILTIN_FONT_FALLBACKS.get(code, "")
+                entry_copy.setdefault("favorite", False)
                 self.entries.append(entry_copy)
                 added += 1
             else:
@@ -1119,7 +1310,7 @@ class LanguageManagerDialog(tk.Toplevel):
         self.on_saved_callback(self.entries, selected_code=None)
         messagebox.showinfo(
             "完成",
-            f"已补全 {added} 个内置语种，同步补齐 {backfilled} 项默认标准字体（您自定义的语种与字体均保留）。",
+            f"已补全 {added} 个内置语种，同步补齐 {backfilled} 项默认标准字体（您自定义的语种、常用置顶与字体均保留）。",
             parent=self,
         )
 
@@ -1578,12 +1769,13 @@ class ScatteredRevisionApp:
         "dd": "改点稿查重",
         "wc": "英文字数统计",
         "fel": "分part稿整理/合并",
+        "settings": "系统设置",
     }
 
     def __init__(self, root: tk.Tk):
         self.root = root
         self.root.title(
-            f"多语种整理工作台 {APP_VERSION}  (零散改点 · 全篇对比 · 改点查重 · 英文字数统计 · 分part稿整理/合并)"
+            f"多语种整理工作台 {APP_VERSION}  (零散改点 · 全篇对比 · 改点查重 · 英文字数统计 · 分part稿整理/合并 · 系统设置)"
         )
 
         self.log_queue: queue.Queue = queue.Queue()
@@ -1592,9 +1784,15 @@ class ScatteredRevisionApp:
         self.task_start_ts: float = 0.0
         self.current_pct: float = 0.0
         self.languages: list = load_languages()
+        self.favorite_langs: list[str] = [
+            str(e.get("code", "")).strip().upper() for e in self.languages if e.get("favorite")
+        ]
+        self.recent_langs: list[str] = []
 
         self._pool_multiline_text: str = ""
         self._syncing_key_var: bool = False
+        self._syncing_settings_editor: bool = False
+        self.settings_key_editor: tk.Text | None = None
         self.dd_files: list[str] = []
         self.wc_files: list[str] = []
         self.fel_files: list[str] = []
@@ -1604,8 +1802,14 @@ class ScatteredRevisionApp:
         self._nav_sb_visible: bool = False
         self._sidebar_hover: bool = False
         self.key_entry = None
+        self.pool_btn = None
+        self.test_btn = None
         self.fa_pool_btn = None
         self.fel_pool_btn = None
+        self.btn_refresh_input = None
+        self.btn_fa_refresh_master = None
+        self.btn_settings_test = None
+        self.btn_settings_test_all = None
         self._indexing_lock = threading.Lock()
         self._indexing_inflight: set[str] = set()
         self._last_typed_lib_norm: str = ""
@@ -1624,7 +1828,9 @@ class ScatteredRevisionApp:
         self._build_ui()
         self._setup_drag_and_drop()
         self._refresh_key_pool_badge()
-        _fit_and_center_window(self.root, base_w=1180, base_h=820, min_w=1040, min_h=680, parent=None)
+        self._refresh_fav_summary()
+        self._refresh_top_status_summary()
+        _fit_and_center_window(self.root, base_w=1200, base_h=850, min_w=1050, min_h=700, parent=None)
         self.root.protocol("WM_DELETE_WINDOW", self._on_close)
         self._poll_log_queue()
         self._tick_elapsed_timer()
@@ -1654,6 +1860,17 @@ class ScatteredRevisionApp:
                 pass
         return {}
 
+    @staticmethod
+    def _sanitize_yellow_gap(raw_val) -> int:
+        try:
+            v = int(float(str(raw_val).strip()))
+        except (ValueError, TypeError):
+            return 3
+        return max(0, min(20, v))
+
+    def _get_yellow_gap_words(self) -> int:
+        return self._sanitize_yellow_gap(self.yellow_gap_words_var.get())
+
     def _setup_styles(self):
         style = ttk.Style(self.root)
         if "vista" in style.theme_names():
@@ -1675,26 +1892,39 @@ class ScatteredRevisionApp:
         style.configure("TNotebook.Tab", font=tab_font, padding=(16, 7))
 
     def _init_vars(self):
-        # Global workbench & shared API vars
+        # Global workbench, System Settings & shared API vars
         self.active_section_title_var = tk.StringVar(value=self._SECTION_TITLES["main"])
+        self.top_status_summary_var = tk.StringVar(value="")
         self.api_mode_label = tk.StringVar(value=API_MODES[0][0])
         self.rotation_label = tk.StringVar(value=ROTATION_MODES[0][0])
         self.api_key_var = tk.StringVar(value="")
         self.pool_btn_text_var = tk.StringVar(value="API 密钥池 (0 个)")
+        self.settings_key_count_var = tk.StringVar(value="当前共识别到 0 个不重复的 API Key")
+        self.settings_save_status_var = tk.StringVar(
+            value="提示：修改模型、通道或黄标连片间隔后自动同步至各工作台；点击「保存设置」可立即加密落盘"
+        )
+        self.fav_summary_var = tk.StringVar(value="")
         self.show_key_var = tk.BooleanVar(value=False)
         self.remember_key_var = tk.BooleanVar(value=True)
         self.model_label = tk.StringVar(value=SUPPORTED_MODELS[0][0])
+        self.yellow_gap_words_var = tk.StringVar(
+            value=str(self._sanitize_yellow_gap(self.settings.get("yellow_gap_words", 3)))
+        )
 
         # Tab 1: Scattered Revision (零散改点整理)
         self.input_docx_var = tk.StringVar(value="")
         self.library_dir_var = tk.StringVar(value="")
         self.output_dir_var = tk.StringVar(value="")
+        self.sc1_sync_master_var = tk.BooleanVar(value=bool(self.settings.get("sc1_sync_master", False)))
+        self.sc1_master_path_var = tk.StringVar(value=str(self.settings.get("sc1_master_path", "")))
         self.lang_var = tk.StringVar(value=AUTO_COMBO_LABEL)
         self.sc1_naming_mode_var = tk.StringVar(value=str(self.settings.get("sc1_naming_mode", "scattered")))
         self.sc1_keyword_var = tk.StringVar(value=str(self.settings.get("sc1_keyword", "")))
         self.doc_name_var = tk.StringVar(value="")
         self.dual_outputs_var = tk.BooleanVar(value=True)
         self.sc1_balance_cols_var = tk.BooleanVar(value=bool(self.settings.get("sc1_balance_cols", True)))
+        self.sc1_highlight_colors_var = tk.BooleanVar(value=bool(self.settings.get("sc1_highlight_colors", True)))
+        self.sc1_export_raw_var = tk.BooleanVar(value=bool(self.settings.get("sc1_export_raw", True)))
         self.sc1_enable_ai_var = tk.BooleanVar(value=bool(self.settings.get("sc1_enable_ai", True)))
         self.sc1_enable_dedup_var = tk.BooleanVar(value=bool(self.settings.get("sc1_enable_dedup", False)))
         self.sc1_dedup_dir_var = tk.StringVar(value=str(self.settings.get("sc1_dedup_dir", "")))
@@ -1704,6 +1934,7 @@ class ScatteredRevisionApp:
         self.pct_timer_var = tk.StringVar(value="0%")
 
         # Tab 2: Full-Article Revision (全篇改点整理)
+        self.fa_use_titles_var = tk.BooleanVar(value=bool(self.settings.get("fa_use_titles", True)))
         self.fa_master_dir_var = tk.StringVar(value=str(self.settings.get("fa_master_dir", "")))
         self.fa_library_dir_var = tk.StringVar(value=str(self.settings.get("fa_library_dir", "")))
         self.fa_output_dir_var = tk.StringVar(value=str(self.settings.get("fa_output_dir", "")))
@@ -1712,6 +1943,7 @@ class ScatteredRevisionApp:
         self.fa_lang_var = tk.StringVar(value=AUTO_COMBO_LABEL)
         self.fa_date_var = tk.StringVar(value=datetime.now().strftime("%Y%m%d"))
         self.fa_balance_cols_var = tk.BooleanVar(value=bool(self.settings.get("fa_balance_cols", True)))
+        self.fa_highlight_colors_var = tk.BooleanVar(value=bool(self.settings.get("fa_highlight_colors", True)))
         self.fa_enable_ai_var = tk.BooleanVar(value=bool(self.settings.get("fa_enable_ai", True)))
         self.fa_title_count_var = tk.StringVar(value="当前共输入 0 个待提取篇目标题")
 
@@ -1769,7 +2001,23 @@ class ScatteredRevisionApp:
             return
         keys = parse_api_keys(self.api_key_var.get())
         self._pool_multiline_text = "\n".join(keys)
+        self._sync_settings_editor_from_pool()
         self._refresh_key_pool_badge()
+
+    def _sync_settings_editor_from_pool(self):
+        if self._syncing_settings_editor or self.settings_key_editor is None:
+            return
+        try:
+            if not self.settings_key_editor.winfo_exists():
+                return
+            self._syncing_settings_editor = True
+            self.settings_key_editor.delete("1.0", tk.END)
+            if self._pool_multiline_text.strip():
+                self.settings_key_editor.insert("1.0", self._pool_multiline_text.strip() + "\n")
+        except Exception:
+            pass
+        finally:
+            self._syncing_settings_editor = False
 
     def _set_pool_multiline_and_sync_entry(self, raw_multiline: str):
         self._pool_multiline_text = (raw_multiline or "").strip()
@@ -1779,6 +2027,7 @@ class ScatteredRevisionApp:
             self.api_key_var.set(" | ".join(keys))
         finally:
             self._syncing_key_var = False
+        self._sync_settings_editor_from_pool()
         self._refresh_key_pool_badge()
 
     def _get_all_keys_list(self) -> list[str]:
@@ -1791,6 +2040,75 @@ class ScatteredRevisionApp:
     def _refresh_key_pool_badge(self):
         n = len(self._get_all_keys_list())
         self.pool_btn_text_var.set(f"API 密钥池 ({n} 个)")
+        self.settings_key_count_var.set(f"当前共识别到 {n} 个不重复的 API Key")
+        self._refresh_top_status_summary()
+
+    def _refresh_top_status_summary(self):
+        n = len(self._get_all_keys_list())
+        gap_w = self._get_yellow_gap_words()
+        mid = self._get_model_id()
+        self.top_status_summary_var.set(f"模型: {mid} | Key: {n} 个 | 黄标连片: ≤{gap_w}词")
+
+    def _refresh_fav_summary(self):
+        fav_set = {c.upper() for c in self.favorite_langs if c}
+        fav_labels = [
+            f"★ {e['code']} - {e['name']}"
+            for e in self.languages
+            if e.get("favorite") or str(e.get("code", "")).upper() in fav_set
+        ]
+        rec_labels = []
+        by_code = {str(e.get("code", "")).upper(): e for e in self.languages}
+        for rc in self.recent_langs:
+            rc_u = str(rc).upper()
+            if rc_u not in fav_set and rc_u in by_code:
+                ent = by_code[rc_u]
+                rec_labels.append(f"⏱ {ent['code']} - {ent['name']}")
+
+        if fav_labels:
+            shown_fav = "  |  ".join(fav_labels[:6])
+            if len(fav_labels) > 6:
+                shown_fav += f" 等共 {len(fav_labels)} 个"
+            fav_line = f"常用置顶（{len(fav_labels)} 个）：{shown_fav}"
+        else:
+            fav_line = "常用置顶：暂未设置（点击右侧按钮可将高频语种设为「★ 常用」置顶）"
+
+        if rec_labels:
+            fav_line += f"\n最近使用（自动排前）：{'  |  '.join(rec_labels[:5])}"
+        self.fav_summary_var.set(fav_line)
+
+    def _get_combo_values(self) -> list[str]:
+        return get_prioritized_combo_values(
+            self.languages,
+            recent_codes=self.recent_langs,
+            favorite_codes=self.favorite_langs,
+        )
+
+    def _refresh_all_lang_combos(self):
+        vals = self._get_combo_values()
+        pairs = [
+            (getattr(self, "lang_cb", None), self.lang_var),
+            (getattr(self, "fa_lang_cb", None), self.fa_lang_var),
+            (getattr(self, "wc_lang_cb", None), self.wc_lang_var),
+            (getattr(self, "fel_lang_cb", None), self.fel_lang_var),
+        ]
+        for cb, var in pairs:
+            cur_code = _resolve_combo_code(var.get(), self.languages)
+            if cb is not None:
+                cb.configure(values=vals)
+            var.set(self._code_to_combo_display(cur_code))
+        self._refresh_fav_summary()
+
+    def _record_recent_lang_and_refresh(self, code: str, save: bool = True):
+        c = re.sub(r"^[★☆⏱\s]+", "", str(code or "")).strip().upper()
+        if not c or c in ("AUTO", "XX"):
+            return
+        known = {str(e.get("code", "")).upper() for e in self.languages}
+        if c not in known:
+            return
+        self.recent_langs = record_recent_language(c, self.recent_langs, max_items=5)
+        self._refresh_all_lang_combos()
+        if save:
+            self._save_settings()
 
     def _get_api_mode_code(self) -> str:
         lbl = self.api_mode_label.get().strip()
@@ -1814,16 +2132,16 @@ class ScatteredRevisionApp:
         return lbl or "gemini-3.5-flash-lite"
 
     def _get_selected_lang_code(self) -> str:
-        return resolve_combo_to_code(self.lang_var.get(), self.languages)
+        return _resolve_combo_code(self.lang_var.get(), self.languages)
 
     def _get_fa_lang_code(self) -> str:
-        return resolve_combo_to_code(self.fa_lang_var.get(), self.languages)
+        return _resolve_combo_code(self.fa_lang_var.get(), self.languages)
 
     def _get_wc_lang_code(self) -> str:
-        return resolve_combo_to_code(self.wc_lang_var.get(), self.languages)
+        return _resolve_combo_code(self.wc_lang_var.get(), self.languages)
 
     def _get_fel_lang_code(self) -> str:
-        return resolve_combo_to_code(self.fel_lang_var.get(), self.languages)
+        return _resolve_combo_code(self.fel_lang_var.get(), self.languages)
 
     def _get_fel_quote_mode_code(self) -> str:
         lbl = self.fel_quote_label_var.get().strip()
@@ -1833,9 +2151,12 @@ class ScatteredRevisionApp:
         return "auto"
 
     def _code_to_combo_display(self, code: str) -> str:
-        c = (code or "").strip().upper()
+        c = re.sub(r"^[★☆⏱\s]+", "", str(code or "")).strip().upper()
         if not c or c == "AUTO":
             return AUTO_COMBO_LABEL
+        for item in self._get_combo_values():
+            if item != AUTO_COMBO_LABEL and _resolve_combo_code(item, self.languages) == c:
+                return item
         for e in self.languages:
             if e["code"] == c:
                 return format_combo_label(e)
@@ -1869,10 +2190,36 @@ class ScatteredRevisionApp:
                 saved_model = cfg.get("model_label", "")
                 if saved_model:
                     self.model_label.set(saved_model)
+                self.yellow_gap_words_var.set(str(self._sanitize_yellow_gap(cfg.get("yellow_gap_words", 3))))
+
+                # Favorite & Recent Languages (Item #5)
+                raw_favs = cfg.get("favorite_langs", [])
+                merged_favs: list[str] = []
+                for fc in list(raw_favs if isinstance(raw_favs, list) else []) + [
+                    e.get("code", "") for e in self.languages if e.get("favorite")
+                ]:
+                    cu = str(fc or "").strip().upper()
+                    if cu and cu not in ("AUTO", "XX") and cu not in merged_favs:
+                        merged_favs.append(cu)
+                self.favorite_langs = merged_favs
+                fav_set = set(self.favorite_langs)
+                for e in self.languages:
+                    if str(e.get("code", "")).upper() in fav_set:
+                        e["favorite"] = True
+
+                raw_rec = cfg.get("recent_langs", [])
+                clean_rec: list[str] = []
+                for rc in raw_rec if isinstance(raw_rec, list) else []:
+                    cu = str(rc or "").strip().upper()
+                    if cu and cu not in ("AUTO", "XX") and cu not in clean_rec:
+                        clean_rec.append(cu)
+                self.recent_langs = clean_rec[:5]
 
                 # Tab 1
                 self.library_dir_var.set(cfg.get("library_dir", ""))
                 self.output_dir_var.set(cfg.get("output_dir", ""))
+                self.sc1_sync_master_var.set(bool(cfg.get("sc1_sync_master", False)))
+                self.sc1_master_path_var.set(str(cfg.get("sc1_master_path", "")))
                 saved_lang = cfg.get("lang", "AUTO")
                 self.lang_var.set(self._code_to_combo_display(saved_lang))
                 sc1_nm = str(cfg.get("sc1_naming_mode", "scattered"))
@@ -1881,11 +2228,14 @@ class ScatteredRevisionApp:
                 self.sc1_keyword_var.set(str(cfg.get("sc1_keyword", "")))
                 self.dual_outputs_var.set(bool(cfg.get("dual_outputs", True)))
                 self.sc1_balance_cols_var.set(bool(cfg.get("sc1_balance_cols", True)))
+                self.sc1_highlight_colors_var.set(bool(cfg.get("sc1_highlight_colors", True)))
+                self.sc1_export_raw_var.set(bool(cfg.get("sc1_export_raw", True)))
                 self.sc1_enable_ai_var.set(bool(cfg.get("sc1_enable_ai", True)))
                 self.sc1_enable_dedup_var.set(bool(cfg.get("sc1_enable_dedup", False)))
                 self.sc1_dedup_dir_var.set(str(cfg.get("sc1_dedup_dir", "")))
 
                 # Tab 2
+                self.fa_use_titles_var.set(bool(cfg.get("fa_use_titles", True)))
                 self.fa_master_dir_var.set(str(cfg.get("fa_master_dir", "")))
                 self.fa_library_dir_var.set(str(cfg.get("fa_library_dir", cfg.get("library_dir", ""))))
                 self.fa_output_dir_var.set(str(cfg.get("fa_output_dir", "")))
@@ -1894,6 +2244,7 @@ class ScatteredRevisionApp:
                 saved_fa_lang = cfg.get("fa_lang", saved_lang)
                 self.fa_lang_var.set(self._code_to_combo_display(saved_fa_lang))
                 self.fa_balance_cols_var.set(bool(cfg.get("fa_balance_cols", True)))
+                self.fa_highlight_colors_var.set(bool(cfg.get("fa_highlight_colors", True)))
                 self.fa_enable_ai_var.set(bool(cfg.get("fa_enable_ai", True)))
 
                 # Tab 3
@@ -1956,6 +2307,9 @@ class ScatteredRevisionApp:
             except Exception:
                 enc_token = ""
 
+        gap_val = self._get_yellow_gap_words()
+        self._refresh_top_status_summary()
+
         cfg = dict(self.settings)
         cfg.pop("api_key", None)
         cfg.update(
@@ -1965,16 +2319,24 @@ class ScatteredRevisionApp:
                 "api_mode_label": self.api_mode_label.get(),
                 "rotation_label": self.rotation_label.get(),
                 "model_label": self.model_label.get(),
+                "yellow_gap_words": gap_val,
+                "favorite_langs": list(self.favorite_langs),
+                "recent_langs": list(self.recent_langs),
                 "library_dir": self.library_dir_var.get().strip(),
                 "output_dir": self.output_dir_var.get().strip(),
+                "sc1_sync_master": self.sc1_sync_master_var.get(),
+                "sc1_master_path": self.sc1_master_path_var.get().strip(),
                 "lang": self._get_selected_lang_code(),
                 "sc1_naming_mode": self.sc1_naming_mode_var.get(),
                 "sc1_keyword": self.sc1_keyword_var.get().strip(),
                 "dual_outputs": self.dual_outputs_var.get(),
                 "sc1_balance_cols": self.sc1_balance_cols_var.get(),
+                "sc1_highlight_colors": self.sc1_highlight_colors_var.get(),
+                "sc1_export_raw": self.sc1_export_raw_var.get(),
                 "sc1_enable_ai": self.sc1_enable_ai_var.get(),
                 "sc1_enable_dedup": self.sc1_enable_dedup_var.get(),
                 "sc1_dedup_dir": self.sc1_dedup_dir_var.get().strip(),
+                "fa_use_titles": self.fa_use_titles_var.get(),
                 "fa_master_dir": self.fa_master_dir_var.get().strip(),
                 "fa_library_dir": self.fa_library_dir_var.get().strip(),
                 "fa_output_dir": self.fa_output_dir_var.get().strip(),
@@ -1982,6 +2344,7 @@ class ScatteredRevisionApp:
                 "fa_dedup_dir": self.fa_dedup_dir_var.get().strip(),
                 "fa_lang": self._get_fa_lang_code(),
                 "fa_balance_cols": self.fa_balance_cols_var.get(),
+                "fa_highlight_colors": self.fa_highlight_colors_var.get(),
                 "fa_enable_ai": self.fa_enable_ai_var.get(),
                 "dd_pkg_dir": self.dd_pkg_dir_var.get().strip(),
                 "dd_out_dir": self.dd_out_dir_var.get().strip(),
@@ -2127,65 +2490,53 @@ class ScatteredRevisionApp:
         self.nav_btn_wc = self._create_sidebar_tab(key="wc", title="英文字数统计")
         self.nav_btn_fel = self._create_sidebar_tab(key="fel", title="分part稿整理/合并")
 
+        self._create_sidebar_group_header("全局配置", first=False)
+        self.nav_btn_settings = self._create_sidebar_tab(key="settings", title="系统设置")
+
         # Right Content Area
         self.content_area = ttk.Frame(outer, padding=(12, 8, 12, 10))
         self.content_area.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
         self.content_area.rowconfigure(2, weight=1)
         self.content_area.columnconfigure(0, weight=1)
 
-        # Row 0: Global Compact Top Bar (44px) — shared across ALL modules
+        # Row 0: Sleek Read-Only/Compact Global Top Bar — Active page title on left, compact summary + quick buttons on right
         self.top_toolbar = tk.Frame(
             self.content_area,
             bg="#f8fafc",
             highlightbackground="#e2e8f0",
             highlightthickness=1,
             padx=12,
-            pady=6,
+            pady=5,
         )
         self.top_toolbar.grid(row=0, column=0, sticky=tk.EW, pady=(0, 8))
 
-        # Pack right-side shared controls FIRST so buttons never clip horizontally
+        # Pack right-side compact buttons FIRST so they never clip horizontally
         self.top_lang_btn = ttk.Button(
             self.top_toolbar,
-            text="语种与字体库",
+            text="语种库",
             style="Compact.TButton",
             command=self._open_lang_manager,
         )
         self.top_lang_btn.pack(side=tk.RIGHT)
 
-        self.pool_btn = ttk.Button(
+        self.top_settings_btn = ttk.Button(
             self.top_toolbar,
-            textvariable=self.pool_btn_text_var,
+            text="系统设置",
             style="Compact.TButton",
-            command=self._open_key_pool_dialog,
+            command=lambda: self._switch_tab("settings"),
         )
-        self.pool_btn.pack(side=tk.RIGHT, padx=(0, 6))
+        self.top_settings_btn.pack(side=tk.RIGHT, padx=(0, 6))
 
-        self.test_btn = ttk.Button(
+        self.top_status_lbl = tk.Label(
             self.top_toolbar,
-            text="测试连接",
-            style="Compact.TButton",
-            command=self._on_test_api,
-        )
-        self.test_btn.pack(side=tk.RIGHT, padx=(0, 6))
-
-        self.top_model_cb = ttk.Combobox(
-            self.top_toolbar,
-            textvariable=self.model_label,
-            values=[m[0] for m in SUPPORTED_MODELS],
-            state="readonly",
-            width=31,
-        )
-        self.top_model_cb.pack(side=tk.RIGHT, padx=(0, 8))
-        self.top_model_cb.bind("<<ComboboxSelected>>", lambda _e: self._save_settings())
-
-        tk.Label(
-            self.top_toolbar,
-            text="模型：",
+            textvariable=self.top_status_summary_var,
             font=("Microsoft YaHei UI", 9),
-            fg="#334155",
+            fg="#475569",
             bg="#f8fafc",
-        ).pack(side=tk.RIGHT, padx=(0, 2))
+            cursor="hand2",
+        )
+        self.top_status_lbl.pack(side=tk.RIGHT, padx=(0, 10))
+        self.top_status_lbl.bind("<Button-1>", lambda _e: self._switch_tab("settings"))
 
         tk.Label(
             self.top_toolbar,
@@ -2237,14 +2588,15 @@ class ScatteredRevisionApp:
         )
         self.update_banner_lbl.pack(side=tk.LEFT, fill=tk.X, expand=True)
 
-        # Row 2: 5 Tab Frames
+        # Row 2: 6 Tab Frames
         self.tab_main = ttk.Frame(self.content_area)
         self.tab_fa = ttk.Frame(self.content_area)
         self.tab_dd = ttk.Frame(self.content_area)
         self.tab_wc = ttk.Frame(self.content_area)
         self.tab_fel = ttk.Frame(self.content_area)
+        self.tab_settings = ttk.Frame(self.content_area)
 
-        for tf in (self.tab_main, self.tab_fa, self.tab_dd, self.tab_wc, self.tab_fel):
+        for tf in (self.tab_main, self.tab_fa, self.tab_dd, self.tab_wc, self.tab_fel, self.tab_settings):
             tf.grid(row=2, column=0, sticky=tk.NSEW)
 
         self._build_tab1_pipeline(self.tab_main)
@@ -2252,6 +2604,7 @@ class ScatteredRevisionApp:
         self._build_tab3_dedup(self.tab_dd)
         self._build_tab4_word_counter(self.tab_wc)
         self._build_tab5_part_merge(self.tab_fel)
+        self._build_tab6_settings(self.tab_settings)
 
         self._switch_tab("main")
 
@@ -2323,6 +2676,7 @@ class ScatteredRevisionApp:
             "dd": self.tab_dd,
             "wc": self.tab_wc,
             "fel": self.tab_fel,
+            "settings": self.tab_settings,
         }
         for k, frame in tab_map.items():
             if k == key:
@@ -2402,30 +2756,39 @@ class ScatteredRevisionApp:
 
     def _build_tab1_pipeline(self, main: ttk.Frame):
         _pw, upper, lower = _make_vertical_paned(
-            main, upper_weight=0, lower_weight=1, min_top=220, min_bottom=110
+            main, upper_weight=0, lower_weight=1, min_top=250, min_bottom=100
         )
 
         # 1. Paths, Naming, Column Balance & Dedup Options Frame
         path_frame = ttk.LabelFrame(
             upper,
-            text=" 1. 文档、总库路径与命名/查重设置（支持直接拖拽文件或文件夹到对应输入框） ",
+            text=" 1. 文档、总库路径、最新中英底稿核对与命名/查重设置（支持拖拽文件或文件夹到对应输入框） ",
             padding=8,
         )
         path_frame.pack(side=tk.TOP, fill=tk.X, pady=(0, 6))
         path_frame.columnconfigure(1, weight=1)
 
         self.lbl_input_docx = ttk.Label(path_frame, text="待整理文档 (.docx)：")
-        self.lbl_input_docx.grid(row=0, column=0, sticky=tk.W, pady=3)
+        self.lbl_input_docx.grid(row=0, column=0, sticky=tk.W, pady=2)
         self.ent_input_docx = ttk.Entry(path_frame, textvariable=self.input_docx_var)
-        self.ent_input_docx.grid(row=0, column=1, sticky=tk.EW, pady=3, padx=4)
-        ttk.Button(path_frame, text="浏览...", style="Compact.TButton", command=self._browse_input).grid(
-            row=0, column=2, sticky=tk.W, padx=2
+        self.ent_input_docx.grid(row=0, column=1, sticky=tk.EW, pady=2, padx=4)
+        inp_btns = ttk.Frame(path_frame)
+        inp_btns.grid(row=0, column=2, columnspan=2, sticky=tk.W)
+        ttk.Button(inp_btns, text="浏览...", style="Compact.TButton", command=self._browse_input).pack(
+            side=tk.LEFT, padx=2
         )
+        self.btn_refresh_input = ttk.Button(
+            inp_btns,
+            text="刷新",
+            style="Compact.TButton",
+            command=self._refresh_input_docx_status,
+        )
+        self.btn_refresh_input.pack(side=tk.LEFT, padx=2)
 
         self.lbl_library_dir = ttk.Label(path_frame, text="对应语种总库目录：")
-        self.lbl_library_dir.grid(row=1, column=0, sticky=tk.W, pady=3)
+        self.lbl_library_dir.grid(row=1, column=0, sticky=tk.W, pady=2)
         self.ent_library_dir = ttk.Entry(path_frame, textvariable=self.library_dir_var)
-        self.ent_library_dir.grid(row=1, column=1, sticky=tk.EW, pady=3, padx=4)
+        self.ent_library_dir.grid(row=1, column=1, sticky=tk.EW, pady=2, padx=4)
         self.ent_library_dir.bind("<Return>", self._on_library_entry_committed)
         self.ent_library_dir.bind("<FocusOut>", self._on_library_entry_committed)
         lib_btns = ttk.Frame(path_frame)
@@ -2442,9 +2805,9 @@ class ScatteredRevisionApp:
         self.btn_refresh_lib.pack(side=tk.LEFT, padx=2)
 
         self.lbl_output_dir = ttk.Label(path_frame, text="输出保存目录：")
-        self.lbl_output_dir.grid(row=2, column=0, sticky=tk.W, pady=3)
+        self.lbl_output_dir.grid(row=2, column=0, sticky=tk.W, pady=2)
         self.ent_output_dir = ttk.Entry(path_frame, textvariable=self.output_dir_var)
-        self.ent_output_dir.grid(row=2, column=1, sticky=tk.EW, pady=3, padx=4)
+        self.ent_output_dir.grid(row=2, column=1, sticky=tk.EW, pady=2, padx=4)
         out_btns = ttk.Frame(path_frame)
         out_btns.grid(row=2, column=2, columnspan=2, sticky=tk.W)
         ttk.Button(out_btns, text="浏览...", style="Compact.TButton", command=self._browse_output).pack(
@@ -2454,6 +2817,31 @@ class ScatteredRevisionApp:
             side=tk.LEFT, padx=2
         )
 
+        # Item #6: Sync Pending Manuscript with Latest CN-EN Master (File or Folder)
+        self.chk_sc1_master = ttk.Checkbutton(
+            path_frame,
+            text="核对最新中英底稿：",
+            variable=self.sc1_sync_master_var,
+            command=self._save_settings,
+        )
+        self.chk_sc1_master.grid(row=3, column=0, sticky=tk.W, pady=2)
+        self.ent_sc1_master_path = ttk.Entry(path_frame, textvariable=self.sc1_master_path_var)
+        self.ent_sc1_master_path.grid(row=3, column=1, sticky=tk.EW, pady=2, padx=4)
+        master_btns = ttk.Frame(path_frame)
+        master_btns.grid(row=3, column=2, columnspan=2, sticky=tk.W)
+        ttk.Button(
+            master_btns,
+            text="选文件...",
+            style="Compact.TButton",
+            command=self._browse_sc1_master_file,
+        ).pack(side=tk.LEFT, padx=2)
+        ttk.Button(
+            master_btns,
+            text="选文件夹...",
+            style="Compact.TButton",
+            command=self._browse_sc1_master_dir,
+        ).pack(side=tk.LEFT, padx=2)
+
         # Optional Dedup Package Row
         self.chk_sc1_dedup = ttk.Checkbutton(
             path_frame,
@@ -2461,52 +2849,69 @@ class ScatteredRevisionApp:
             variable=self.sc1_enable_dedup_var,
             command=self._save_settings,
         )
-        self.chk_sc1_dedup.grid(row=3, column=0, sticky=tk.W, pady=3)
+        self.chk_sc1_dedup.grid(row=4, column=0, sticky=tk.W, pady=2)
         self.ent_sc1_dedup_dir = ttk.Entry(path_frame, textvariable=self.sc1_dedup_dir_var)
-        self.ent_sc1_dedup_dir.grid(row=3, column=1, sticky=tk.EW, pady=3, padx=4)
+        self.ent_sc1_dedup_dir.grid(row=4, column=1, sticky=tk.EW, pady=2, padx=4)
         dedup_btns = ttk.Frame(path_frame)
-        dedup_btns.grid(row=3, column=2, columnspan=2, sticky=tk.W)
+        dedup_btns.grid(row=4, column=2, columnspan=2, sticky=tk.W)
         ttk.Button(dedup_btns, text="浏览...", style="Compact.TButton", command=self._browse_sc1_dedup_dir).pack(
             side=tk.LEFT, padx=2
         )
         ttk.Label(dedup_btns, text="自动剔除发译者版重复段", foreground="#475569").pack(side=tk.LEFT, padx=4)
 
-        # Target Language + Output Options Row
+        # Target Language + Core Output Options Row
         opt_row1 = ttk.Frame(path_frame)
-        opt_row1.grid(row=4, column=0, columnspan=4, sticky=tk.EW, pady=(5, 2))
+        opt_row1.grid(row=5, column=0, columnspan=4, sticky=tk.EW, pady=(4, 1))
 
         ttk.Label(opt_row1, text="目标语种：").pack(side=tk.LEFT)
         self.lang_cb = ttk.Combobox(
             opt_row1,
             textvariable=self.lang_var,
-            values=get_combo_values(self.languages),
+            values=self._get_combo_values(),
             width=28,
         )
         self.lang_cb.pack(side=tk.LEFT, padx=(4, 6))
+        self.lang_cb.bind("<<ComboboxSelected>>", self._on_tab1_lang_selected)
         ttk.Button(
             opt_row1,
             text="管理语种...",
             style="Compact.TButton",
             command=self._open_lang_manager,
-        ).pack(side=tk.LEFT, padx=(0, 14))
+        ).pack(side=tk.LEFT, padx=(0, 12))
 
         ttk.Checkbutton(
             opt_row1,
             text="三语列宽自动拉齐",
             variable=self.sc1_balance_cols_var,
             command=self._save_settings,
-        ).pack(side=tk.LEFT, padx=(0, 14))
+        ).pack(side=tk.LEFT, padx=(0, 12))
 
         ttk.Checkbutton(
             opt_row1,
-            text="同时输出三份定稿（发译者版 + 完整留底版 + 无改点版）",
+            text="同时输出完整留底版与无改点版",
             variable=self.dual_outputs_var,
+            command=self._save_settings,
+        ).pack(side=tk.LEFT)
+
+        # Items #2 & #4: Highlight Colors Toggle + Raw Trilingual Export Checkbox
+        opt_row_hl = ttk.Frame(path_frame)
+        opt_row_hl.grid(row=6, column=0, columnspan=4, sticky=tk.EW, pady=1)
+        ttk.Checkbutton(
+            opt_row_hl,
+            text="对比标记高亮颜色（中/英/外三列同步标黄/青；取消勾选则仅输出对比修订痕迹）",
+            variable=self.sc1_highlight_colors_var,
+            command=self._save_settings,
+        ).pack(side=tk.LEFT, padx=(0, 14))
+        ttk.Checkbutton(
+            opt_row_hl,
+            text="导出对比前的「提取三语原稿」供核对",
+            variable=self.sc1_export_raw_var,
             command=self._save_settings,
         ).pack(side=tk.LEFT)
 
         # Naming Mode Selector Row
         opt_row_name = ttk.Frame(path_frame)
-        opt_row_name.grid(row=5, column=0, columnspan=4, sticky=tk.EW, pady=2)
+        opt_row_name.grid(row=7, column=0, columnspan=4, sticky=tk.EW, pady=1)
 
         ttk.Label(opt_row_name, text="命名模式：").pack(side=tk.LEFT)
         ttk.Radiobutton(
@@ -2533,10 +2938,10 @@ class ScatteredRevisionApp:
         ent_custom.bind("<KeyRelease>", self._on_sc1_custom_name_typed)
 
         opt_row3 = ttk.Frame(path_frame)
-        opt_row3.grid(row=6, column=0, columnspan=4, sticky=tk.EW, pady=(2, 0))
+        opt_row3.grid(row=8, column=0, columnspan=4, sticky=tk.EW, pady=(1, 0))
         ttk.Checkbutton(
             opt_row3,
-            text="使用 AI 辅助分级与第 3 列精准对齐（若未填 Key 或额度受限，自动切换本地位置估算标色）",
+            text="使用 AI 辅助分级与中/外双列精准对齐（若未填 Key 或额度受限，自动切换本地位置估算标色）",
             variable=self.sc1_enable_ai_var,
             command=self._save_settings,
         ).pack(side=tk.LEFT)
@@ -2544,7 +2949,7 @@ class ScatteredRevisionApp:
         # 2. One-Click Primary Action & Determinate Progress Frame
         act_frame = ttk.LabelFrame(
             upper,
-            text=" 2. 一键执行与实时进度（双列自动扩三列 · 同篇重复段自动合并 · 批注无损保留 · 0词自动省略） ",
+            text=" 2. 一键执行与实时进度（最新底稿无损核对 · 三列同步标色 · 原稿蓝/红字逐字保留 · 单文件平铺输出） ",
             padding=8,
         )
         act_frame.pack(side=tk.TOP, fill=tk.X, pady=(0, 4))
@@ -2604,18 +3009,18 @@ class ScatteredRevisionApp:
         ).pack(side=tk.RIGHT)
         ttk.Label(
             log_top,
-            text="后台总库索引、同篇段落合并、未入库查重、多 Key 轮换及输出路径实时显示：",
+            text="后台总库索引、最新中英底稿同步、未入库查重、多 Key 轮换及输出路径实时显示：",
             foreground="#475569",
         ).pack(side=tk.LEFT)
 
         log_body = ttk.Frame(log_frame)
         log_body.pack(fill=tk.BOTH, expand=True)
 
-        self.log_text = self._create_styled_log_text(log_body, height=7)
+        self.log_text = self._create_styled_log_text(log_body, height=6)
 
         key_cnt = len(self._get_all_keys_list())
         self._append_log(
-            f"欢迎使用多语种整理工作台 {APP_VERSION}！已载入 {key_cnt} 个 API Key、{len(self.languages)} 种语言；顶部工具栏可在任意板块快速切换模型与管理密钥池。",
+            f"欢迎使用多语种整理工作台 {APP_VERSION}！已载入 {key_cnt} 个 API Key、{len(self.languages)} 种语言；可在左侧「系统设置」配置密钥池、模型与黄标连片间隔。",
             target_tab="main",
         )
 
@@ -2623,13 +3028,13 @@ class ScatteredRevisionApp:
 
     def _build_tab2_full_article(self, parent: ttk.Frame):
         _pw, upper, lower = _make_vertical_paned(
-            parent, upper_weight=0, lower_weight=1, min_top=290, min_bottom=100
+            parent, upper_weight=0, lower_weight=1, min_top=300, min_bottom=95
         )
 
         # Anchor Step 3 & Step 2 at bottom of `upper` so dragging sash down expands `fa_titles_text` cleanly
         act_frame = ttk.LabelFrame(
             upper,
-            text=" 3. 全篇提取对比执行（自动取首行第 2 列加粗英文标题命名 · 逐篇独立导出完整版 + 仅改点版） ",
+            text=" 3. 全篇对比执行（单篇平铺输出 / 多篇自动分包 · 无改点篇目自动汇总报告） ",
             padding=8,
         )
         act_frame.pack(side=tk.BOTTOM, fill=tk.X, pady=(0, 4))
@@ -2679,17 +3084,26 @@ class ScatteredRevisionApp:
         cfg_frame.columnconfigure(1, weight=1)
 
         self.lbl_fa_master_dir = ttk.Label(cfg_frame, text="最新中英底稿目录：")
-        self.lbl_fa_master_dir.grid(row=0, column=0, sticky=tk.W, pady=3)
+        self.lbl_fa_master_dir.grid(row=0, column=0, sticky=tk.W, pady=2)
         self.ent_fa_master_dir = ttk.Entry(cfg_frame, textvariable=self.fa_master_dir_var)
-        self.ent_fa_master_dir.grid(row=0, column=1, sticky=tk.EW, pady=3, padx=4)
-        ttk.Button(cfg_frame, text="浏览...", style="Compact.TButton", command=self._fa_browse_master_dir).grid(
-            row=0, column=2, sticky=tk.W, padx=2
+        self.ent_fa_master_dir.grid(row=0, column=1, sticky=tk.EW, pady=2, padx=4)
+        fa_master_btns = ttk.Frame(cfg_frame)
+        fa_master_btns.grid(row=0, column=2, columnspan=2, sticky=tk.W)
+        ttk.Button(fa_master_btns, text="浏览...", style="Compact.TButton", command=self._fa_browse_master_dir).pack(
+            side=tk.LEFT, padx=2
         )
+        self.btn_fa_refresh_master = ttk.Button(
+            fa_master_btns,
+            text="刷新底稿",
+            style="Compact.TButton",
+            command=self._refresh_master_index_manual,
+        )
+        self.btn_fa_refresh_master.pack(side=tk.LEFT, padx=2)
 
         self.lbl_fa_library_dir = ttk.Label(cfg_frame, text="外文三语总库目录：")
-        self.lbl_fa_library_dir.grid(row=1, column=0, sticky=tk.W, pady=3)
+        self.lbl_fa_library_dir.grid(row=1, column=0, sticky=tk.W, pady=2)
         self.ent_fa_library_dir = ttk.Entry(cfg_frame, textvariable=self.fa_library_dir_var)
-        self.ent_fa_library_dir.grid(row=1, column=1, sticky=tk.EW, pady=3, padx=4)
+        self.ent_fa_library_dir.grid(row=1, column=1, sticky=tk.EW, pady=2, padx=4)
         self.ent_fa_library_dir.bind("<Return>", self._on_fa_library_entry_committed)
         self.ent_fa_library_dir.bind("<FocusOut>", self._on_fa_library_entry_committed)
         fa_lib_btns = ttk.Frame(cfg_frame)
@@ -2706,9 +3120,9 @@ class ScatteredRevisionApp:
         self.btn_fa_refresh_lib.pack(side=tk.LEFT, padx=2)
 
         self.lbl_fa_output_dir = ttk.Label(cfg_frame, text="输出保存目录：")
-        self.lbl_fa_output_dir.grid(row=2, column=0, sticky=tk.W, pady=3)
+        self.lbl_fa_output_dir.grid(row=2, column=0, sticky=tk.W, pady=2)
         self.ent_fa_output_dir = ttk.Entry(cfg_frame, textvariable=self.fa_output_dir_var)
-        self.ent_fa_output_dir.grid(row=2, column=1, sticky=tk.EW, pady=3, padx=4)
+        self.ent_fa_output_dir.grid(row=2, column=1, sticky=tk.EW, pady=2, padx=4)
         fa_out_btns = ttk.Frame(cfg_frame)
         fa_out_btns.grid(row=2, column=2, columnspan=2, sticky=tk.W)
         ttk.Button(fa_out_btns, text="浏览...", style="Compact.TButton", command=self._fa_browse_output_dir).pack(
@@ -2724,9 +3138,9 @@ class ScatteredRevisionApp:
             variable=self.fa_enable_dedup_var,
             command=self._save_settings,
         )
-        self.chk_fa_dedup.grid(row=3, column=0, sticky=tk.W, pady=3)
+        self.chk_fa_dedup.grid(row=3, column=0, sticky=tk.W, pady=2)
         self.ent_fa_dedup_dir = ttk.Entry(cfg_frame, textvariable=self.fa_dedup_dir_var)
-        self.ent_fa_dedup_dir.grid(row=3, column=1, sticky=tk.EW, pady=3, padx=4)
+        self.ent_fa_dedup_dir.grid(row=3, column=1, sticky=tk.EW, pady=2, padx=4)
         fa_dd_btns = ttk.Frame(cfg_frame)
         fa_dd_btns.grid(row=3, column=2, columnspan=2, sticky=tk.W)
         ttk.Button(fa_dd_btns, text="浏览...", style="Compact.TButton", command=self._fa_browse_dedup_dir).pack(
@@ -2735,15 +3149,16 @@ class ScatteredRevisionApp:
         ttk.Label(fa_dd_btns, text="仅改点版自动去重", foreground="#475569").pack(side=tk.LEFT, padx=4)
 
         opt_row1 = ttk.Frame(cfg_frame)
-        opt_row1.grid(row=4, column=0, columnspan=4, sticky=tk.EW, pady=(5, 2))
+        opt_row1.grid(row=4, column=0, columnspan=4, sticky=tk.EW, pady=(4, 1))
         ttk.Label(opt_row1, text="目标语种：").pack(side=tk.LEFT)
         self.fa_lang_cb = ttk.Combobox(
             opt_row1,
             textvariable=self.fa_lang_var,
-            values=get_combo_values(self.languages),
-            width=24,
+            values=self._get_combo_values(),
+            width=28,
         )
         self.fa_lang_cb.pack(side=tk.LEFT, padx=(4, 6))
+        self.fa_lang_cb.bind("<<ComboboxSelected>>", self._on_fa_lang_selected)
         ttk.Button(opt_row1, text="管理语种...", style="Compact.TButton", command=self._open_lang_manager).pack(
             side=tk.LEFT, padx=(0, 14)
         )
@@ -2759,48 +3174,61 @@ class ScatteredRevisionApp:
         ).pack(side=tk.LEFT)
 
         opt_row2 = ttk.Frame(cfg_frame)
-        opt_row2.grid(row=5, column=0, columnspan=4, sticky=tk.EW, pady=(2, 0))
+        opt_row2.grid(row=5, column=0, columnspan=4, sticky=tk.EW, pady=(1, 0))
         ttk.Checkbutton(
             opt_row2,
-            text="使用 AI 辅助分级与第 3 列精准对齐（无 Key 或超额时自动切换本地位置估算标色）",
+            text="对比标记高亮颜色（取消勾选则仅输出英文对比修订痕迹）",
+            variable=self.fa_highlight_colors_var,
+            command=self._save_settings,
+        ).pack(side=tk.LEFT, padx=(0, 14))
+        ttk.Checkbutton(
+            opt_row2,
+            text="使用 AI 辅助分级与双列精准对齐（无 Key 自动本地标色）",
             variable=self.fa_enable_ai_var,
             command=self._save_settings,
         ).pack(side=tk.LEFT)
 
-        # 1. Multiline Titles Input Frame (expands when sash is dragged down)
+        # 1. Mode Switch & Multiline Titles Input Frame (expands when sash is dragged down)
         title_frame = ttk.LabelFrame(
             upper,
-            text=" 1. 待提取对比的篇目标题（一行一个标题；支持粘贴，或直接拖入/导入标题清单 .docx / .txt） ",
+            text=" 1. 全篇对比模式与待提取篇目标题（支持粘贴/导入标题清单，或取消勾选直接对比两个现成文件包） ",
             padding=8,
         )
         title_frame.pack(side=tk.TOP, fill=tk.BOTH, expand=True, pady=(0, 6))
 
+        mode_bar = ttk.Frame(title_frame)
+        mode_bar.pack(side=tk.TOP, fill=tk.X, pady=(0, 4))
+        self.chk_fa_use_titles = ttk.Checkbutton(
+            mode_bar,
+            text="按标题列表提取篇目（取消勾选则直接将「最新中英底稿包」与「外文三语文件包」按顺序逐篇对比）",
+            variable=self.fa_use_titles_var,
+            command=self._on_fa_mode_toggled,
+        )
+        self.chk_fa_use_titles.pack(side=tk.LEFT)
+
         t_bar = ttk.Frame(title_frame)
-        t_bar.pack(side=tk.TOP, fill=tk.X, pady=(0, 5))
-        ttk.Button(
+        t_bar.pack(side=tk.TOP, fill=tk.X, pady=(0, 4))
+        self.btn_fa_import_titles = ttk.Button(
             t_bar,
             text="导入标题文档 (.docx / .txt)...",
             style="Action.TButton",
             command=self._fa_import_titles_file,
-        ).pack(side=tk.LEFT, padx=(0, 8))
-        ttk.Button(t_bar, text="清空", command=self._fa_clear_titles).pack(side=tk.LEFT, padx=(0, 12))
+        )
+        self.btn_fa_import_titles.pack(side=tk.LEFT, padx=(0, 8))
+        self.btn_fa_clear_titles = ttk.Button(t_bar, text="清空", command=self._fa_clear_titles)
+        self.btn_fa_clear_titles.pack(side=tk.LEFT, padx=(0, 12))
         ttk.Label(
             t_bar,
             textvariable=self.fa_title_count_var,
             font=("Microsoft YaHei UI", 9, "bold"),
             foreground="#1d4ed8",
         ).pack(side=tk.LEFT)
-        ttk.Label(
-            t_bar,
-            text="兼容单篇与合集拆篇；同名标题自动弹窗确认",
-            foreground="#475569",
-        ).pack(side=tk.RIGHT)
 
         ed_wrap = ttk.Frame(title_frame)
         ed_wrap.pack(side=tk.TOP, fill=tk.BOTH, expand=True)
         self.fa_titles_text = tk.Text(
             ed_wrap,
-            height=4,
+            height=3,
             wrap=tk.WORD,
             font=("Microsoft YaHei UI", 9),
             bg="#ffffff",
@@ -2831,17 +3259,18 @@ class ScatteredRevisionApp:
         ).pack(side=tk.RIGHT)
         ttk.Label(
             log_top,
-            text="底稿拆篇定位、同名标题消歧、逐篇全段对比与双版本导出详情：",
+            text="底稿定位、同名消歧、逐篇全段对比、无改点篇目汇总报告与分包导出详情：",
             foreground="#475569",
         ).pack(side=tk.LEFT)
         log_body = ttk.Frame(log_frame)
         log_body.pack(fill=tk.BOTH, expand=True)
-        self.fa_log_text = self._create_styled_log_text(log_body, height=6)
+        self.fa_log_text = self._create_styled_log_text(log_body, height=5)
         self.fa_log_text.insert(
             tk.END,
-            "提示：可在上方粘贴篇目标题（每行一个，如“只有末后的基督才能赐给人永生的道”或“1-01 追求真理的重要性与路途”），或直接拖入标题 .docx / .txt 文档。\n",
+            "提示：支持粘贴带编号标题（如“3-1-39 032 七雷巨响——预言国度的福音将扩展全宇（审判）”）提取对比，或取消勾选上方模式直接对比两个现成文件夹。\n",
             "dim",
         )
+        self._apply_fa_mode_ui()
 
     # ---------------- Tab 3: 改点稿查重 ----------------
 
@@ -3094,11 +3523,11 @@ class ScatteredRevisionApp:
         self.wc_lang_cb = ttk.Combobox(
             row_lang,
             textvariable=self.wc_lang_var,
-            values=get_combo_values(self.languages),
-            width=25,
+            values=self._get_combo_values(),
+            width=28,
         )
         self.wc_lang_cb.pack(side=tk.LEFT, padx=(4, 6))
-        self.wc_lang_cb.bind("<<ComboboxSelected>>", lambda _e: self._wc_refresh_previews())
+        self.wc_lang_cb.bind("<<ComboboxSelected>>", self._on_wc_lang_selected)
 
         ttk.Button(row_lang, text="管理语种...", style="Compact.TButton", command=self._open_lang_manager).pack(
             side=tk.LEFT, padx=(0, 14)
@@ -3285,7 +3714,7 @@ class ScatteredRevisionApp:
         self.fel_lang_cb = ttk.Combobox(
             opt_row,
             textvariable=self.fel_lang_var,
-            values=get_combo_values(self.languages),
+            values=self._get_combo_values(),
             width=20,
         )
         self.fel_lang_cb.pack(side=tk.LEFT, padx=(4, 4))
@@ -3436,6 +3865,220 @@ class ScatteredRevisionApp:
             "dim",
         )
 
+    # ---------------- Tab 6: 系统设置 ----------------
+
+    def _build_tab6_settings(self, parent: ttk.Frame):
+        # Pack Area 3 & Area 2 at BOTTOM first so fixed sections NEVER clip, while Area 1's key editor expands smoothly
+        lang_box = ttk.LabelFrame(
+            parent,
+            text=" 3. 常用语种置顶与标准字体库（常用与最近使用语种自动排在所有板块下拉框顶部） ",
+            padding=10,
+        )
+        lang_box.pack(side=tk.BOTTOM, fill=tk.X)
+
+        lang_row = ttk.Frame(lang_box)
+        lang_row.pack(fill=tk.X)
+        ttk.Button(
+            lang_row,
+            text="管理常用语种与标准字体库...",
+            style="Action.TButton",
+            command=self._open_lang_manager,
+        ).pack(side=tk.RIGHT, padx=(12, 0))
+        self.lbl_fav_summary = ttk.Label(
+            lang_row,
+            textvariable=self.fav_summary_var,
+            foreground="#334155",
+            justify=tk.LEFT,
+            wraplength=640,
+        )
+        self.lbl_fav_summary.pack(side=tk.LEFT, fill=tk.X, expand=True)
+        lang_row.bind(
+            "<Configure>",
+            lambda e: self.lbl_fav_summary.configure(wraplength=max(260, int(e.width) - 230)),
+        )
+
+        rule_box = ttk.LabelFrame(
+            parent,
+            text=" 2. 改点高亮与排版规则参数 ",
+            padding=10,
+        )
+        rule_box.pack(side=tk.BOTTOM, fill=tk.X, pady=(0, 8))
+
+        gap_row = ttk.Frame(rule_box)
+        gap_row.pack(fill=tk.X)
+        ttk.Label(
+            gap_row,
+            text="两处黄色高亮自动连片最大间隔词数：",
+            font=("Microsoft YaHei UI", 9, "bold"),
+            foreground="#0f172a",
+        ).pack(side=tk.LEFT)
+        self.spin_yellow_gap = ttk.Spinbox(
+            gap_row,
+            from_=0,
+            to=20,
+            textvariable=self.yellow_gap_words_var,
+            width=8,
+            command=self._on_yellow_gap_changed,
+        )
+        self.spin_yellow_gap.pack(side=tk.LEFT, padx=(6, 12))
+        self.spin_yellow_gap.bind("<KeyRelease>", lambda _e: self._refresh_top_status_summary())
+        self.spin_yellow_gap.bind("<FocusOut>", self._on_yellow_gap_changed)
+        self.spin_yellow_gap.bind("<Return>", self._on_yellow_gap_changed)
+
+        ttk.Label(
+            rule_box,
+            text="同一段内两处黄色高亮之间未标色英文词数 ≤ 此数值时自动连起来标记高亮（默认 3，填 0 则不自动连片）",
+            foreground="#475569",
+        ).pack(fill=tk.X, pady=(5, 0))
+
+        # Area 1: API Key Pool, Channel & Model Settings
+        api_box = ttk.LabelFrame(
+            parent,
+            text=" 1. API 密钥池、通道与模型设置（跨所有工作台共享生效） ",
+            padding=10,
+        )
+        api_box.pack(side=tk.TOP, fill=tk.BOTH, expand=True, pady=(0, 8))
+
+        combo_grid = ttk.Frame(api_box)
+        combo_grid.pack(side=tk.TOP, fill=tk.X, pady=(0, 8))
+        combo_grid.columnconfigure(1, weight=1)
+        combo_grid.columnconfigure(3, weight=1)
+
+        ttk.Label(combo_grid, text="选择模型：").grid(row=0, column=0, sticky=tk.W, pady=3)
+        self.settings_model_cb = ttk.Combobox(
+            combo_grid,
+            textvariable=self.model_label,
+            values=[m[0] for m in SUPPORTED_MODELS],
+            state="readonly",
+            width=28,
+        )
+        self.settings_model_cb.grid(row=0, column=1, sticky=tk.EW, pady=3, padx=(4, 16))
+        self.settings_model_cb.bind("<<ComboboxSelected>>", lambda _e: self._save_settings())
+
+        ttk.Label(combo_grid, text="接口通道：").grid(row=0, column=2, sticky=tk.W, pady=3)
+        self.settings_api_mode_cb = ttk.Combobox(
+            combo_grid,
+            textvariable=self.api_mode_label,
+            values=[m[0] for m in API_MODES],
+            state="readonly",
+            width=26,
+        )
+        self.settings_api_mode_cb.grid(row=0, column=3, sticky=tk.EW, pady=3, padx=(4, 0))
+        self.settings_api_mode_cb.bind("<<ComboboxSelected>>", lambda _e: self._save_settings())
+
+        ttk.Label(combo_grid, text="多 Key 调度策略：").grid(row=1, column=0, sticky=tk.W, pady=3)
+        self.settings_rotation_cb = ttk.Combobox(
+            combo_grid,
+            textvariable=self.rotation_label,
+            values=[m[0] for m in ROTATION_MODES],
+            state="readonly",
+            width=28,
+        )
+        self.settings_rotation_cb.grid(row=1, column=1, sticky=tk.EW, pady=3, padx=(4, 16))
+        self.settings_rotation_cb.bind("<<ComboboxSelected>>", lambda _e: self._save_settings())
+
+        ttk.Checkbutton(
+            combo_grid,
+            text="本机加密记住密钥池 (Windows DPAPI)",
+            variable=self.remember_key_var,
+            command=self._save_settings,
+        ).grid(row=1, column=2, columnspan=2, sticky=tk.W, pady=3)
+
+        # Pack bottom buttons & status inside Area 1 BEFORE flexible Text editor so buttons NEVER clip
+        api_btns = ttk.Frame(api_box)
+        api_btns.pack(side=tk.BOTTOM, fill=tk.X, pady=(6, 0))
+
+        self.btn_settings_save = _make_primary_btn(
+            api_btns,
+            text="保存设置",
+            command=self._on_save_settings_clicked,
+        )
+        self.btn_settings_save.pack(side=tk.LEFT, padx=(0, 8))
+
+        self.btn_settings_test = ttk.Button(
+            api_btns,
+            text="测试连接",
+            style="Action.TButton",
+            command=self._on_test_api,
+        )
+        self.btn_settings_test.pack(side=tk.LEFT, padx=(0, 8))
+        self.test_btn = self.btn_settings_test
+
+        self.btn_settings_test_all = ttk.Button(
+            api_btns,
+            text="批量检测全部 Key",
+            style="Action.TButton",
+            command=self._open_key_pool_dialog,
+        )
+        self.btn_settings_test_all.pack(side=tk.LEFT, padx=(0, 8))
+        self.pool_btn = self.btn_settings_test_all
+
+        self.btn_settings_clear_keys = ttk.Button(
+            api_btns,
+            text="清空输入",
+            command=self._on_clear_settings_keys,
+        )
+        self.btn_settings_clear_keys.pack(side=tk.LEFT)
+
+        self.settings_status_lbl = ttk.Label(
+            api_box,
+            textvariable=self.settings_save_status_var,
+            foreground="#475569",
+        )
+        self.settings_status_lbl.pack(side=tk.BOTTOM, fill=tk.X, pady=(4, 0))
+
+        key_hdr = ttk.Frame(api_box)
+        key_hdr.pack(side=tk.TOP, fill=tk.X, pady=(0, 4))
+        ttk.Label(
+            key_hdr,
+            textvariable=self.settings_key_count_var,
+            font=("Microsoft YaHei UI", 9, "bold"),
+            foreground="#1d4ed8",
+        ).pack(side=tk.RIGHT)
+        ttk.Label(
+            key_hdr,
+            text="API Key 池列表（每行 1 个 Key，支持 # 备注，与弹窗实时同步）：",
+            font=("Microsoft YaHei UI", 9, "bold"),
+            foreground="#0f172a",
+        ).pack(side=tk.LEFT)
+
+        ed_outer = ttk.Frame(api_box)
+        ed_outer.pack(side=tk.TOP, fill=tk.BOTH, expand=True)
+
+        ed_hsb = ttk.Scrollbar(
+            ed_outer,
+            orient=tk.HORIZONTAL,
+            command=lambda *a: self.settings_key_editor.xview(*a) if self.settings_key_editor else None,
+        )
+        ed_hsb.pack(side=tk.BOTTOM, fill=tk.X)
+
+        ed_inner = ttk.Frame(ed_outer)
+        ed_inner.pack(side=tk.TOP, fill=tk.BOTH, expand=True)
+
+        self.settings_key_editor = tk.Text(
+            ed_inner,
+            height=5,
+            wrap=tk.NONE,
+            font=("Consolas", 9),
+            bg="#ffffff",
+            fg="#0f172a",
+            relief=tk.SOLID,
+            borderwidth=1,
+            padx=8,
+            pady=6,
+            undo=True,
+        )
+        ed_vsb = ttk.Scrollbar(ed_inner, orient=tk.VERTICAL, command=self.settings_key_editor.yview)
+        self.settings_key_editor.configure(yscrollcommand=ed_vsb.set, xscrollcommand=ed_hsb.set)
+        self.settings_key_editor.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+        ed_vsb.pack(side=tk.RIGHT, fill=tk.Y)
+
+        if self._pool_multiline_text.strip():
+            self.settings_key_editor.insert("1.0", self._pool_multiline_text.strip() + "\n")
+
+        self.settings_key_editor.bind("<KeyRelease>", self._on_settings_key_editor_modified)
+        self.settings_key_editor.bind("<<Paste>>", lambda _e: self.root.after(20, self._on_settings_key_editor_modified))
+
     @staticmethod
     def _create_styled_log_text(parent: tk.Misc, height: int = 8) -> tk.Text:
         tw = tk.Text(
@@ -3563,7 +4206,7 @@ class ScatteredRevisionApp:
             self._warm_library_index_async(str(rp), target_tab="fa")
 
     def _setup_drag_and_drop(self):
-        # Left sidebar 5 navigation buttons
+        # Left sidebar navigation buttons
         self.dnd.register_target(self.nav_btn_main, lambda ps: (self._switch_tab("main"), self._handle_tab1_drop(ps)))
         self.dnd.register_target(self.nav_btn_fa, lambda ps: (self._switch_tab("fa"), self._handle_tab2_drop(ps)))
         self.dnd.register_target(self.nav_btn_dd, lambda ps: (self._switch_tab("dd"), self._handle_tab3_drop(ps)))
@@ -3577,6 +4220,8 @@ class ScatteredRevisionApp:
             self.dnd.register_target(w, self._on_drop_library_dir)
         for w in (self.lbl_output_dir, self.ent_output_dir):
             self.dnd.register_target(w, self._on_drop_output_dir)
+        for w in (self.chk_sc1_master, self.ent_sc1_master_path):
+            self.dnd.register_target(w, self._on_drop_sc1_master_path)
         for w in (self.chk_sc1_dedup, self.ent_sc1_dedup_dir):
             self.dnd.register_target(w, self._on_drop_sc1_dedup_dir)
 
@@ -3616,6 +4261,8 @@ class ScatteredRevisionApp:
             self._wc_ingest_paths(paths)
         elif self.active_tab_key == "fel":
             self._fel_ingest_paths(paths)
+        elif self.active_tab_key == "settings":
+            return
         else:
             self._handle_tab1_drop(paths)
 
@@ -3638,6 +4285,72 @@ class ScatteredRevisionApp:
         return out
 
     # ---- Tab 1 Drop & Helpers ----
+
+    def _on_tab1_lang_selected(self, _event=None):
+        code = self._get_selected_lang_code()
+        if code and code != "AUTO":
+            self._record_recent_lang_and_refresh(code, save=True)
+        else:
+            self._save_settings()
+
+    def _refresh_input_docx_status(self):
+        raw = self.input_docx_var.get().strip()
+        if not raw:
+            messagebox.showinfo("提示", "请先选择或拖入【待整理文档 (.docx)】。")
+            return
+        try:
+            p = Path(raw).resolve()
+        except Exception as ex:
+            messagebox.showwarning("路径无效", _format_exception_concise(ex))
+            return
+        if not p.is_file():
+            msg = f"未在磁盘找到待整理文档：{p}"
+            self._append_log(f"⚠️ {msg}", target_tab="main")
+            messagebox.showwarning("文件不存在", msg)
+            return
+        st = p.stat()
+        mtime_str = datetime.fromtimestamp(st.st_mtime).strftime("%Y-%m-%d %H:%M:%S")
+        size_kb = max(1, int(round(st.st_size / 1024.0)))
+        log_msg = (
+            f"🔄 已刷新待整理文档状态：{p.name}（最后修改：{mtime_str}，大小：{size_kb} KB；每次点击运行均自动读取磁盘最新内容）"
+        )
+        self._append_log(log_msg, target_tab="main")
+        self.stage_var.set(f"已刷新待整理文档状态：{p.name}（最后修改 {mtime_str}）")
+
+    def _browse_sc1_master_file(self):
+        p = filedialog.askopenfilename(
+            title="选择最新中英底稿 Word 文档 (.docx)",
+            filetypes=[("Word 文档", "*.docx")],
+        )
+        if p:
+            self.sc1_master_path_var.set(p)
+            self.sc1_sync_master_var.set(True)
+            self._save_settings()
+            self._append_log(f"📥 已选择【最新中英底稿文件】：{p}", target_tab="main")
+
+    def _browse_sc1_master_dir(self):
+        d = filedialog.askdirectory(title="选择包含最新中英底稿的文件夹")
+        if d:
+            self.sc1_master_path_var.set(d)
+            self.sc1_sync_master_var.set(True)
+            self._save_settings()
+            self._append_log(f"📥 已选择【最新中英底稿文件夹】：{d}", target_tab="main")
+
+    def _on_drop_sc1_master_path(self, paths: list[Path]):
+        for raw_p in paths:
+            try:
+                rp = raw_p.resolve()
+            except Exception:
+                continue
+            if rp.is_dir() or (rp.is_file() and rp.suffix.lower() == ".docx" and not rp.name.startswith("~$")):
+                self.sc1_master_path_var.set(str(rp))
+                self.sc1_sync_master_var.set(True)
+                self._save_settings()
+                kind = "文件夹" if rp.is_dir() else "文件"
+                self._append_log(f"📥 已拖入【最新中英底稿{kind}】：{rp}", target_tab="main")
+                self.stage_var.set(f"📥 已设定最新中英底稿：{rp.name}")
+                return
+        messagebox.showinfo("拖拽提示", "【核对最新中英底稿】请拖入最新中英底稿 .docx 文件或所在文件夹。")
 
     def _on_sc1_keyword_typed(self, _event=None):
         if self.sc1_keyword_var.get().strip():
@@ -3713,13 +4426,20 @@ class ScatteredRevisionApp:
                 continue
 
         applied = []
-        if docx_files:
-            df = docx_files[0]
-            self.input_docx_var.set(str(df))
-            if not self.output_dir_var.get().strip():
-                self.output_dir_var.set(str(df.parent))
-            applied.append(f"待整理文档={df.name}")
-            self._append_log(f"📥 已载入【待整理文档】：{df}", target_tab="main")
+        for df in docx_files:
+            if any(tok in df.name for tok in ("最新中英", "标you")) and (
+                self.input_docx_var.get().strip() or len(docx_files) >= 2
+            ):
+                self.sc1_master_path_var.set(str(df))
+                self.sc1_sync_master_var.set(True)
+                applied.append(f"最新中英底稿={df.name}")
+                self._append_log(f"📥 已识别并载入【最新中英底稿】：{df}", target_tab="main")
+            else:
+                self.input_docx_var.set(str(df))
+                if not self.output_dir_var.get().strip():
+                    self.output_dir_var.set(str(df.parent))
+                applied.append(f"待整理文档={df.name}")
+                self._append_log(f"📥 已载入【待整理文档】：{df}", target_tab="main")
 
         if len(dirs) == 1:
             d = dirs[0]
@@ -3728,6 +4448,11 @@ class ScatteredRevisionApp:
                 self.sc1_enable_dedup_var.set(True)
                 applied.append(f"未入库改点包={d.name}")
                 self._append_log(f"📥 已识别并载入【未入库改点包目录】：{d}", target_tab="main")
+            elif any(tok in d.name for tok in ("最新中英", "中英底稿", "标you")):
+                self.sc1_master_path_var.set(str(d))
+                self.sc1_sync_master_var.set(True)
+                applied.append(f"最新中英底稿目录={d.name}")
+                self._append_log(f"📥 已识别并载入【最新中英底稿目录】：{d}", target_tab="main")
             else:
                 self.library_dir_var.set(str(d))
                 applied.append(f"总库目录={d.name}")
@@ -3740,6 +4465,11 @@ class ScatteredRevisionApp:
                     self.sc1_dedup_dir_var.set(str(d))
                     self.sc1_enable_dedup_var.set(True)
                     applied.append(f"未入库改点包={d.name}")
+                    continue
+                if any(tok in d.name for tok in ("最新中英", "中英底稿", "标you")):
+                    self.sc1_master_path_var.set(str(d))
+                    self.sc1_sync_master_var.set(True)
+                    applied.append(f"最新中英底稿目录={d.name}")
                     continue
                 if not lib_assigned:
                     self.library_dir_var.set(str(d))
@@ -3763,11 +4493,109 @@ class ScatteredRevisionApp:
 
     # ---- Tab 2 (Full-Article) Methods & Drop Handlers ----
 
+    def _on_fa_lang_selected(self, _event=None):
+        code = self._get_fa_lang_code()
+        if code and code != "AUTO":
+            self._record_recent_lang_and_refresh(code, save=True)
+        else:
+            self._save_settings()
+
+    def _apply_fa_mode_ui(self):
+        use_titles = bool(self.fa_use_titles_var.get())
+        if use_titles:
+            self.btn_fa_import_titles.configure(state=tk.NORMAL)
+            self.btn_fa_clear_titles.configure(state=tk.NORMAL)
+            self.fa_titles_text.configure(state=tk.NORMAL, bg="#ffffff", fg="#0f172a")
+            self._fa_update_title_count()
+            if not self.is_running:
+                self.fa_stage_var.set("状态：就绪（粘贴或导入篇目标题并设定目录后点击开始）")
+        else:
+            self.btn_fa_import_titles.configure(state=tk.DISABLED)
+            self.btn_fa_clear_titles.configure(state=tk.DISABLED)
+            self.fa_titles_text.configure(state=tk.DISABLED, bg="#f1f5f9", fg="#64748b")
+            self.fa_title_count_var.set(
+                "当前为【现成双文件夹直连对比模式】：无需输入标题，点击开始即按顺序逐篇对比并以中英底稿命名"
+            )
+            if not self.is_running:
+                self.fa_stage_var.set(
+                    "状态：现成双文件夹直连对比模式（无需输入标题，点击开始即按顺序逐篇对比并以中英底稿命名）"
+                )
+
+    def _on_fa_mode_toggled(self):
+        self._apply_fa_mode_ui()
+        self._save_settings()
+
+    def _refresh_master_index_manual(self):
+        raw = self.fa_master_dir_var.get().strip()
+        if not raw:
+            messagebox.showinfo("提示", "请先选择【最新中英底稿目录】，再点击「刷新底稿」。")
+            return
+        try:
+            rp = Path(raw).resolve()
+        except Exception:
+            messagebox.showwarning("提示", "【最新中英底稿目录】路径格式无效。")
+            return
+        if not rp.is_dir():
+            messagebox.showwarning("提示", "请先选择真实存在的【最新中英底稿目录】。")
+            return
+
+        self._save_settings()
+        norm_key = f"master::{os.path.normcase(str(rp))}"
+        with self._indexing_lock:
+            if norm_key in self._indexing_inflight:
+                self._log("⏳ 中英底稿目录正在后台刷新中，请稍候...", target_tab="fa")
+                return
+            self._indexing_inflight.add(norm_key)
+
+        self._log(f"🔄 正在强制重新扫描并刷新最新中英底稿索引：{rp} ...", target_tab="fa")
+
+        def _bg():
+            t0 = time.perf_counter()
+            try:
+                if callable(refresh_master_index):
+                    info = _call_compatible(
+                        refresh_master_index,
+                        str(rp),
+                        log_fn=lambda m: self._log(m, target_tab="fa"),
+                        force_rebuild=True,
+                    )
+                    elapsed_sec = float(
+                        info.get("elapsed_sec", time.perf_counter() - t0) if isinstance(info, dict) else (time.perf_counter() - t0)
+                    )
+                    total_files = info.get("total_files", 0) if isinstance(info, dict) else 0
+                    total_arts = info.get("total_articles", info.get("article_count", 0)) if isinstance(info, dict) else 0
+                    extra = f"，解析篇目 {total_arts} 篇" if total_arts else ""
+                    self._log(
+                        f"✅ 最新中英底稿索引已强制刷新：共扫描 {total_files} 份底稿文件{extra}（耗时 {elapsed_sec:.1f}s）",
+                        target_tab="fa",
+                    )
+                else:
+                    docxs = [x for x in rp.rglob("*.docx") if not x.name.startswith("~$")]
+                    for dx in docxs:
+                        dx.stat()
+                    elapsed_sec = time.perf_counter() - t0
+                    self._log(
+                        f"✅ 最新中英底稿目录已刷新校验：共发现 {len(docxs)} 份底稿文档（耗时 {elapsed_sec:.1f}s，每次运行均实时校验磁盘最新内容）",
+                        target_tab="fa",
+                    )
+            except Exception as ex:
+                self._log(f"⚠️ 刷新中英底稿索引出错：{_format_exception_concise(ex)}", target_tab="fa")
+            finally:
+                with self._indexing_lock:
+                    self._indexing_inflight.discard(norm_key)
+
+        threading.Thread(target=_bg, daemon=True).start()
+
     def _fa_get_titles_list(self) -> list[str]:
         raw = self.fa_titles_text.get("1.0", tk.END)
         return _fallback_parse_titles_multiline(raw)
 
     def _fa_update_title_count(self):
+        if not self.fa_use_titles_var.get():
+            self.fa_title_count_var.set(
+                "当前为【现成双文件夹直连对比模式】：无需输入标题，点击开始即按顺序逐篇对比并以中英底稿命名"
+            )
+            return
         titles = self._fa_get_titles_list()
         self.fa_title_count_var.set(f"当前共输入 {len(titles)} 个待提取篇目标题")
 
@@ -3775,6 +4603,9 @@ class ScatteredRevisionApp:
         if not new_titles:
             messagebox.showinfo("提示", "未在所选文件中识别到非空标题行。")
             return
+        if not self.fa_use_titles_var.get():
+            self.fa_use_titles_var.set(True)
+            self._apply_fa_mode_ui()
         existing = self._fa_get_titles_list()
         seen = set(existing)
         merged = list(existing)
@@ -3784,6 +4615,7 @@ class ScatteredRevisionApp:
                 seen.add(t)
                 merged.append(t)
                 added += 1
+        self.fa_titles_text.configure(state=tk.NORMAL)
         self.fa_titles_text.delete("1.0", tk.END)
         self.fa_titles_text.insert("1.0", "\n".join(merged) + "\n")
         self._fa_update_title_count()
@@ -3808,6 +4640,8 @@ class ScatteredRevisionApp:
             messagebox.showerror("导入失败", _format_exception_concise(ex))
 
     def _fa_clear_titles(self):
+        if not self.fa_use_titles_var.get():
+            return
         self.fa_titles_text.delete("1.0", tk.END)
         self._fa_update_title_count()
 
@@ -3941,9 +4775,10 @@ class ScatteredRevisionApp:
 
     def _on_run_full_article(self):
         self._save_settings()
-        titles = self._fa_get_titles_list()
-        if not titles:
-            messagebox.showwarning("提示", "请先输入或导入至少 1 个待提取对比的篇目标题。")
+        use_titles = bool(self.fa_use_titles_var.get())
+        titles = self._fa_get_titles_list() if use_titles else []
+        if use_titles and not titles:
+            messagebox.showwarning("提示", "请先输入或导入至少 1 个待提取对比的篇目标题（或取消勾选切换为双文件夹直连对比模式）。")
             return
         master_dir = self.fa_master_dir_var.get().strip()
         foreign_lib = self.fa_library_dir_var.get().strip()
@@ -3951,53 +4786,84 @@ class ScatteredRevisionApp:
         if not master_dir or not foreign_lib or not out_dir:
             messagebox.showwarning("提示", "请完整指定【最新中英底稿目录】、【外文三语总库目录】和【输出保存目录】。")
             return
+        if not Path(master_dir).is_dir() or not Path(foreign_lib).is_dir():
+            messagebox.showwarning("提示", "请确保【最新中英底稿目录】与【外文三语总库目录】均为真实存在的文件夹。")
+            return
 
         dedup_dir = self.fa_dedup_dir_var.get().strip() if self.fa_enable_dedup_var.get() else ""
         if self.fa_enable_dedup_var.get() and (not dedup_dir or not Path(dedup_dir).is_dir()):
             messagebox.showwarning("提示", "已勾选关联「未入库改点包」查重，请选择有效的未入库改点包文件夹（或取消勾选）。")
             return
 
-        if not callable(resolve_full_articles) or not callable(run_full_article_pipeline):
+        if not callable(run_full_article_pipeline) or (use_titles and not callable(resolve_full_articles)):
             messagebox.showerror("组件未就绪", "未找到 full_article_processor 模块，请确认程序文件完整。")
             return
+        if not use_titles and not callable(resolve_direct_folder_articles):
+            messagebox.showerror("组件未就绪", "未找到 full_article_processor.resolve_direct_folder_articles，请确认已合并 v1.8.0 引擎模块。")
+            return
 
+        highlight_colors = bool(self.fa_highlight_colors_var.get())
+        yellow_gap_words = self._get_yellow_gap_words()
         want_ai = bool(self.fa_enable_ai_var.get())
         keys = self._get_all_keys_list()
-        effective_ai = bool(want_ai and keys)
+        effective_ai = bool(want_ai and keys and highlight_colors)
         model = self._get_model_id()
         api_mode = self._get_api_mode_code()
         rot_mode = self._get_rotation_mode_code()
         lang_code = self._get_fa_lang_code()
+        if lang_code and lang_code != "AUTO":
+            self._record_recent_lang_and_refresh(lang_code, save=True)
         dt_str = self.fa_date_var.get().strip()
         balance_cols = bool(self.fa_balance_cols_var.get())
         pool = ApiKeyPool(keys, rotation_mode=rot_mode) if effective_ai else ""
 
-        self._set_running(True, final_stage=f"正在扫描中英底稿库并解析 {len(titles)} 个篇目标题...", tab_key="fa")
+        init_stage = (
+            f"正在扫描中英底稿库并解析 {len(titles)} 个篇目标题..."
+            if use_titles
+            else "正在按现成双文件夹直连模式扫描并配对全部篇目..."
+        )
+        self._set_running(True, final_stage=init_stage, tab_key="fa")
         self._log("=" * 64, target_tab="fa")
-        mode_desc = f"AI 辅助（{model} | {len(keys)} 个 Key）" if effective_ai else "本地位置估算模式（免 API Key）"
+        if not highlight_colors:
+            mode_desc = "仅输出英文对比修订痕迹（不标黄/青高亮，免调 AI）"
+        elif effective_ai:
+            mode_desc = f"AI 辅助（{model} | {len(keys)} 个 Key | 黄标连片 ≤{yellow_gap_words}词）"
+        else:
+            mode_desc = f"本地位置估算模式（免 API Key | 黄标连片 ≤{yellow_gap_words}词）"
+        src_desc = f"按标题提取 {len(titles)} 篇" if use_titles else "现成双文件夹直连对比"
         self._log(
-            f"⚡ 启动【全篇改点整理】 | 待对比标题：{len(titles)} 篇 | {mode_desc} | 语种：{lang_code}",
+            f"⚡ 启动【全篇改点整理】 | {src_desc} | {mode_desc} | 语种：{lang_code}",
             target_tab="fa",
         )
-        if want_ai and not keys:
-            self._log("ℹ️ 未填写 API Key，本次自动使用「本地位置估算模式」完成分级与第 3 列标色", target_tab="fa")
+        if highlight_colors and want_ai and not keys:
+            self._log("ℹ️ 未填写 API Key，本次自动使用「本地位置估算模式」完成分级与标色", target_tab="fa")
 
         def worker():
             try:
-                self._progress(5.0, f"正在中英底稿目录中检索 {len(titles)} 个篇目标题...")
-                res_lookup = resolve_full_articles(
-                    titles=titles,
-                    cn_en_master_dir=master_dir,
-                    foreign_lib_dir=foreign_lib,
-                    log_fn=lambda m: self._log(m, target_tab="fa"),
-                )
-                resolved_list = list(res_lookup.get("resolved") or [])
+                if use_titles:
+                    self._progress(5.0, f"正在中英底稿目录中检索 {len(titles)} 个篇目标题...")
+                    res_lookup = _call_compatible(
+                        resolve_full_articles,
+                        titles=titles,
+                        cn_en_master_dir=master_dir,
+                        foreign_lib_dir=foreign_lib,
+                        log_fn=lambda m: self._log(m, target_tab="fa"),
+                    )
+                else:
+                    self._progress(5.0, "正在按顺序配对「最新中英底稿包」与「外文三语文件包」...")
+                    res_lookup = _call_compatible(
+                        resolve_direct_folder_articles,
+                        cn_en_master_dir=master_dir,
+                        foreign_lib_dir=foreign_lib,
+                        log_fn=lambda m: self._log(m, target_tab="fa"),
+                    )
+                resolved_list = list(res_lookup.get("resolved") or res_lookup.get("articles") or [])
                 ambiguous_list = list(res_lookup.get("ambiguous") or [])
                 unmatched_list = list(res_lookup.get("unmatched") or [])
 
                 if unmatched_list:
                     self._log(
-                        f"⚠️ 以下 {len(unmatched_list)} 个标题未在中英底稿库匹配到：{', '.join(unmatched_list)}",
+                        f"⚠️ 以下 {len(unmatched_list)} 项未匹配到对应篇目：{', '.join(str(x) for x in unmatched_list)}",
                         target_tab="fa",
                     )
 
@@ -4021,7 +4887,7 @@ class ScatteredRevisionApp:
 
                 selected_articles = resolved_list + chosen_amb
                 if not selected_articles:
-                    unm_hint = f"（未命中标题：{', '.join(unmatched_list)}）" if unmatched_list else ""
+                    unm_hint = f"（未命中：{', '.join(str(x) for x in unmatched_list)}）" if unmatched_list else ""
                     msg = f"未找到可对比的篇目{unm_hint}"
                     self._log(f"❌ {msg}", target_tab="fa")
                     self.log_queue.put(("done", (False, msg, "fa")))
@@ -4042,30 +4908,56 @@ class ScatteredRevisionApp:
                     balance_columns=balance_cols,
                     dedup_pkg_dir=dedup_dir,
                     date_str=dt_str,
+                    use_title_list=use_titles,
+                    highlight_colors=highlight_colors,
+                    yellow_gap_words=yellow_gap_words,
                     log_fn=lambda m: self._log(m, target_tab="fa"),
                     progress_fn=self._progress,
                 )
                 saved_files = list(pipe_res.get("saved_files") or [])
                 dup_reports = list(pipe_res.get("duplicate_reports") or [])
+                unchanged_articles = list(pipe_res.get("unchanged_articles") or [])
+                unchanged_report = str(
+                    pipe_res.get("unchanged_report") or pipe_res.get("unchanged_report_path") or ""
+                )
+                if not unchanged_report:
+                    for sf in saved_files:
+                        if "无改点篇目汇总报告" in str(sf):
+                            unchanged_report = str(sf)
+                            break
+
                 det_lang = pipe_res.get("lang_code") or lang_code
+                if det_lang and str(det_lang).upper() not in ("AUTO", "XX"):
+                    self.log_queue.put(("record_recent_lang", str(det_lang)))
                 det_disp = find_lang_display_name(det_lang, self.languages)
 
                 files_str = "\n".join(saved_files)
                 extra_lines: list[str] = []
+                if unchanged_articles or unchanged_report:
+                    unch_cnt = len(unchanged_articles)
+                    rep_note = f"\n   汇总报告：{unchanged_report}" if unchanged_report else ""
+                    unch_msg = f"ℹ️ 英文对比无改点篇目：共 {unch_cnt} 篇（已自动跳过单篇导出并归入汇总报告）{rep_note}"
+                    self._log(unch_msg, target_tab="fa")
+                    extra_lines.append(unch_msg)
                 if dup_reports:
                     extra_lines.append(f"🔍 已同步输出未入库查重明细报告：{len(dup_reports)} 份")
                 if unmatched_list:
-                    extra_lines.append(f"⚠️ 未命中标题（{len(unmatched_list)} 个）：{', '.join(unmatched_list)}")
+                    extra_lines.append(f"⚠️ 未命中项（{len(unmatched_list)} 个）：{', '.join(str(x) for x in unmatched_list)}")
                 extra_txt = ("\n\n" + "\n".join(extra_lines)) if extra_lines else ""
 
+                unch_tag = f"（含无改点 {len(unchanged_articles)} 篇）" if unchanged_articles else ""
                 self._log(
-                    f"🎉 全篇改点整理完成！（{det_disp}）共处理 {len(selected_articles)} 篇，独立导出 {len(saved_files)} 份文档：\n{files_str}",
+                    f"🎉 全篇改点整理完成！（{det_disp}）共处理 {len(selected_articles)} 篇{unch_tag}，导出 {len(saved_files)} 份文档：\n{files_str}",
                     target_tab="fa",
                 )
                 self.log_queue.put(
                     (
                         "done",
-                        (True, f"全篇对比完成！共处理 {len(selected_articles)} 篇，输出 {len(saved_files)} 份文档", "fa"),
+                        (
+                            True,
+                            f"全篇对比完成！共处理 {len(selected_articles)} 篇{unch_tag}，输出 {len(saved_files)} 份文档",
+                            "fa",
+                        ),
                     )
                 )
                 self.log_queue.put(
@@ -4073,8 +4965,8 @@ class ScatteredRevisionApp:
                         "popup_info",
                         (
                             "全篇改点整理完成",
-                            f"语种：{det_disp}  |  完成篇数：{len(selected_articles)} 篇\n"
-                            f"已逐篇独立导出完整版 + 仅改点版（共 {len(saved_files)} 份）：\n\n{files_str}{extra_txt}",
+                            f"语种：{det_disp}  |  完成篇数：{len(selected_articles)} 篇{unch_tag}\n"
+                            f"共输出 {len(saved_files)} 份文档：\n\n{files_str}{extra_txt}",
                         ),
                     )
                 )
@@ -4341,6 +5233,9 @@ class ScatteredRevisionApp:
             self.fel_tri_prefix_var.set(get_tri_prefix(sel_code, self.languages))
 
     def _fel_on_lang_changed(self, _event=None):
+        code = self._get_fel_lang_code()
+        if code and code != "AUTO":
+            self._record_recent_lang_and_refresh(code, save=False)
         self._fel_auto_sync_prefix(force=True)
         self._fel_refresh_previews()
 
@@ -4507,6 +5402,8 @@ class ScatteredRevisionApp:
         api_mode = self._get_api_mode_code()
         rot_mode = self._get_rotation_mode_code()
         lang_code = self._get_fel_lang_code()
+        if lang_code and lang_code != "AUTO":
+            self._record_recent_lang_and_refresh(lang_code, save=True)
         tri_pfx = self.fel_tri_prefix_var.get().strip()
         quote_mode = self._get_fel_quote_mode_code()
         out_mode = self.fel_output_mode_var.get()
@@ -4575,6 +5472,12 @@ class ScatteredRevisionApp:
         threading.Thread(target=worker, daemon=True).start()
 
     # ---------------- Tab 4: Word Counter Methods ----------------
+
+    def _on_wc_lang_selected(self, _event=None):
+        code = self._get_wc_lang_code()
+        if code and code != "AUTO":
+            self._record_recent_lang_and_refresh(code, save=False)
+        self._wc_refresh_previews()
 
     def _on_wc_keyword_typed(self, _event=None):
         if self.wc_keyword_var.get().strip() and self.wc_naming_mode_var.get() != "scattered":
@@ -4739,6 +5642,8 @@ class ScatteredRevisionApp:
                 )
                 if copy_dir is None:
                     self.wc_files[idx] = str(final_p)
+                if info.get("lang_code") and str(info["lang_code"]).upper() not in ("AUTO", "XX"):
+                    self._record_recent_lang_and_refresh(str(info["lang_code"]), save=False)
                 ok_cnt += 1
                 self.wc_tree.insert(
                     "",
@@ -4763,6 +5668,7 @@ class ScatteredRevisionApp:
                     values=(p.name, "-", "-", "-", clean_ex, "❌ 失败"),
                 )
 
+        self._save_settings()
         self.wc_summary_var.set(
             f"处理完成：成功 {ok_cnt}/{len(self.wc_files)} 份  |  合计：UP {sum_up} words, RV {sum_rv} words"
         )
@@ -4779,7 +5685,52 @@ class ScatteredRevisionApp:
                 f"第 2 列英文总计：UP {sum_up} words, RV {sum_rv} words。{hdr_note}",
             )
 
-    # ---------------- Tab 1 Shared & Pipeline Methods ----------------
+    # ---------------- System Settings & Shared Methods ----------------
+
+    def _on_settings_key_editor_modified(self, _event=None):
+        if self._syncing_settings_editor or self.settings_key_editor is None:
+            return
+        raw_txt = self.settings_key_editor.get("1.0", tk.END).strip()
+        self._pool_multiline_text = raw_txt
+        keys = parse_api_keys(raw_txt)
+        self._syncing_key_var = True
+        try:
+            self.api_key_var.set(" | ".join(keys))
+        finally:
+            self._syncing_key_var = False
+        self._refresh_key_pool_badge()
+
+    def _on_yellow_gap_changed(self, _event=None):
+        val = self._get_yellow_gap_words()
+        self.yellow_gap_words_var.set(str(val))
+        self._save_settings()
+
+    def _on_save_settings_clicked(self):
+        if self.settings_key_editor is not None and self.settings_key_editor.winfo_exists():
+            self._on_settings_key_editor_modified()
+        val = self._get_yellow_gap_words()
+        self.yellow_gap_words_var.set(str(val))
+        self._save_settings()
+        key_cnt = len(self._get_all_keys_list())
+        ts = datetime.now().strftime("%H:%M:%S")
+        msg = f"✅ 全局设置已保存生效（{ts}  |  Key: {key_cnt} 个  |  黄标连片: ≤{val}词）"
+        self.settings_save_status_var.set(msg)
+        if hasattr(self, "settings_status_lbl"):
+            self.settings_status_lbl.configure(foreground="#15803d")
+        self._append_log(msg, target_tab="main")
+
+    def _on_clear_settings_keys(self):
+        if self._get_all_keys_list() and not messagebox.askyesno(
+            "确认清空",
+            "确定要清空当前输入的所有 API Key 吗？",
+            parent=self.root,
+        ):
+            return
+        self._set_pool_multiline_and_sync_entry("")
+        self._save_settings()
+        self.settings_save_status_var.set("已清空输入框中的所有 API Key 并保存")
+        if hasattr(self, "settings_status_lbl"):
+            self.settings_status_lbl.configure(foreground="#475569")
 
     def _on_paste_into_key_entry(self, _event=None):
         try:
@@ -4816,6 +5767,8 @@ class ScatteredRevisionApp:
         return "break"
 
     def _open_key_pool_dialog(self):
+        if self.settings_key_editor is not None and self.settings_key_editor.winfo_exists():
+            self._on_settings_key_editor_modified()
         init_txt = self._pool_multiline_text.strip() or "\n".join(self._get_all_keys_list())
 
         def _on_saved(new_raw_txt: str, new_rot_label: str):
@@ -4823,10 +5776,11 @@ class ScatteredRevisionApp:
             self._set_pool_multiline_and_sync_entry(new_raw_txt)
             self._save_settings()
             cnt = len(self._get_all_keys_list())
-            self._append_log(
-                f"✅ 密钥池已更新：当前共 {cnt} 个 API Key | 通道：{self.api_mode_label.get()} | 策略：{new_rot_label}",
-                target_tab=self.active_tab_key,
-            )
+            status_txt = f"✅ 密钥池已同步保存：当前共 {cnt} 个 API Key | 通道：{self.api_mode_label.get()} | 策略：{new_rot_label}"
+            self.settings_save_status_var.set(status_txt)
+            if hasattr(self, "settings_status_lbl"):
+                self.settings_status_lbl.configure(foreground="#15803d")
+            self._append_log(status_txt, target_tab=self.active_tab_key)
 
         ApiKeyPoolDialog(
             self.root,
@@ -4840,15 +5794,25 @@ class ScatteredRevisionApp:
         )
 
     def _open_lang_manager(self):
-        self.languages = load_languages()
+        loaded = load_languages()
+        fav_set = {c.upper() for c in self.favorite_langs if c}
+        for e in loaded:
+            if e.get("favorite"):
+                fav_set.add(str(e.get("code", "")).upper())
+            elif str(e.get("code", "")).upper() in fav_set:
+                e["favorite"] = True
+        self.languages = loaded
 
         def _on_saved(updated_list: list, selected_code=None):
             self.languages = [dict(x) for x in updated_list]
-            combo_vals = get_combo_values(self.languages)
-            self.lang_cb.configure(values=combo_vals)
-            self.fa_lang_cb.configure(values=combo_vals)
-            self.wc_lang_cb.configure(values=combo_vals)
-            self.fel_lang_cb.configure(values=combo_vals)
+            self.favorite_langs = [
+                str(e.get("code", "")).strip().upper()
+                for e in self.languages
+                if e.get("favorite") and str(e.get("code", "")).strip()
+            ]
+            if selected_code:
+                self.recent_langs = record_recent_language(selected_code, self.recent_langs, max_items=5)
+            self._refresh_all_lang_combos()
             if selected_code:
                 disp = self._code_to_combo_display(selected_code)
                 self.lang_var.set(disp)
@@ -4856,11 +5820,15 @@ class ScatteredRevisionApp:
                 self.wc_lang_var.set(disp)
                 self.fel_lang_var.set(disp)
                 self._fel_auto_sync_prefix(force=True)
+            self._save_settings()
             self._wc_refresh_previews()
             self._fel_refresh_previews()
-            self._append_log(f"✅ 语种与标准字体库已更新，当前共 {len(self.languages)} 个语种。", target_tab=self.active_tab_key)
+            self._append_log(
+                f"✅ 语种与标准字体库已更新：共 {len(self.languages)} 个语种（常用置顶 {len(self.favorite_langs)} 个）。",
+                target_tab=self.active_tab_key,
+            )
 
-        LanguageManagerDialog(self.root, self.languages, _on_saved)
+        LanguageManagerDialog(self.root, self.languages, _on_saved, favorite_codes=self.favorite_langs)
 
     def _clear_log(self):
         self.log_text.delete("1.0", tk.END)
@@ -5036,6 +6004,13 @@ class ScatteredRevisionApp:
                         st_lbl = "✅ 已完成查重" if dup_cnt == 0 else f"✅ 已查重(共 {dup_cnt} 处重复)"
                         smap = {os.path.normcase(str(Path(x))): st_lbl for x in self.dd_files}
                         self._dd_refresh_tree(status_map=smap)
+                    elif kind == "record_recent_lang":
+                        self._record_recent_lang_and_refresh(str(payload), save=True)
+                    elif kind == "settings_status":
+                        st_txt, st_color = payload
+                        self.settings_save_status_var.set(str(st_txt))
+                        if hasattr(self, "settings_status_lbl"):
+                            self.settings_status_lbl.configure(foreground=str(st_color))
                     elif kind == "update_available":
                         if isinstance(payload, dict) and payload.get("has_update"):
                             self._show_update_banner(payload)
@@ -5060,13 +6035,17 @@ class ScatteredRevisionApp:
             self.btn_oneclick,
             self.test_btn,
             self.pool_btn,
+            self.btn_refresh_input,
             self.btn_refresh_lib,
             self.btn_fa_run,
             self.fa_pool_btn,
+            self.btn_fa_refresh_master,
             self.btn_fa_refresh_lib,
             self.btn_dd_run,
             self.btn_fel_run,
             self.fel_pool_btn,
+            self.btn_settings_test,
+            self.btn_settings_test_all,
         ):
             if b is not None:
                 b.configure(state=state)
@@ -5094,15 +6073,21 @@ class ScatteredRevisionApp:
             tvar.set(self._format_pct_timer())
 
     def _on_test_api(self):
+        if self.settings_key_editor is not None and self.settings_key_editor.winfo_exists():
+            self._on_settings_key_editor_modified()
         self._save_settings()
         keys = self._get_all_keys_list()
         model = self._get_model_id()
         mode = self._get_api_mode_code()
         if not keys:
-            messagebox.showwarning("提示", "请先点击顶部工具栏「API 密钥池」填入至少 1 个 Gemini 或 Vertex API Key。")
+            self._switch_tab("settings")
+            messagebox.showwarning("提示", "请先在「系统设置」的 API Key 池列表中填入至少 1 个 Gemini 或 Vertex API Key。")
             return
 
         log_tab = self.active_tab_key if self.active_tab_key in ("main", "fa", "dd", "fel") else "main"
+        self.settings_save_status_var.set(f"⏳ 正在测试 {len(keys)} 个 API Key 与模型 {model} ...")
+        if hasattr(self, "settings_status_lbl"):
+            self.settings_status_lbl.configure(foreground="#1d4ed8")
         self._set_running(True, final_stage=f"正在测试 {len(keys)} 个 API Key 与模型 {model} ...", tab_key=log_tab)
         self._progress(25.0, f"正在验证密钥池（共 {len(keys)} 个 Key）与模型 {model} ...")
         self._log(f"▶ 开始测试 API 密钥池（共 {len(keys)} 个 Key | 模型：{model}）...", target_tab=log_tab)
@@ -5111,11 +6096,13 @@ class ScatteredRevisionApp:
             try:
                 msg = test_api_connection(keys, model, mode, log_fn=lambda m: self._log(m, target_tab=log_tab))
                 self._log(f"✅ {msg}", target_tab=log_tab)
+                self.log_queue.put(("settings_status", (f"✅ 连接测试通过：{msg}", "#15803d")))
                 self.log_queue.put(("done", (True, msg, log_tab)))
                 self.log_queue.put(("popup_info", ("连接测试通过", msg)))
             except Exception as ex:
                 friendly = _format_exception_concise(ex, keys=keys, api_related=True)
                 self._log(f"❌ {friendly}", target_tab=log_tab)
+                self.log_queue.put(("settings_status", (f"❌ 连接测试失败：{friendly}", "#b91c1c")))
                 self.log_queue.put(("done", (False, friendly, log_tab)))
                 self.log_queue.put(("popup_error", ("API 连接失败", friendly)))
 
@@ -5129,21 +6116,40 @@ class ScatteredRevisionApp:
         if not inp or not lib or not out:
             messagebox.showwarning("提示", "请先选择【待整理文档】、【对应语种总库目录】和【输出保存目录】。")
             return
+        if not Path(inp).is_file():
+            messagebox.showwarning("提示", f"未在磁盘找到待整理文档：\n{inp}")
+            return
         if run_oneclick_pipeline is None:
             messagebox.showerror("组件未就绪", "未找到 pipeline.run_oneclick_pipeline，请检查程序文件完整性。")
             return
+
+        sync_master = bool(self.sc1_sync_master_var.get())
+        latest_master_path = self.sc1_master_path_var.get().strip() if sync_master else ""
+        if sync_master:
+            mp = Path(latest_master_path) if latest_master_path else None
+            if mp is None or not (mp.is_dir() or (mp.is_file() and mp.suffix.lower() == ".docx")):
+                messagebox.showwarning(
+                    "提示",
+                    "已勾选「核对最新中英底稿」，请选择真实存在的最新中英底稿 .docx 文件或所在文件夹（或取消勾选）。",
+                )
+                return
 
         dedup_dir = self.sc1_dedup_dir_var.get().strip() if self.sc1_enable_dedup_var.get() else ""
         if self.sc1_enable_dedup_var.get() and (not dedup_dir or not Path(dedup_dir).is_dir()):
             messagebox.showwarning("提示", "已勾选关联「未入库改点包」查重，请先选择有效的未入库改点包文件夹（或取消勾选）。")
             return
 
+        highlight_colors = bool(self.sc1_highlight_colors_var.get())
+        export_raw_trilingual = bool(self.sc1_export_raw_var.get())
+        yellow_gap_words = self._get_yellow_gap_words()
         want_ai = bool(self.sc1_enable_ai_var.get())
         keys = self._get_all_keys_list()
         model = self._get_model_id()
         mode = self._get_api_mode_code()
         rot_mode = self._get_rotation_mode_code()
         lang = self._get_selected_lang_code()
+        if lang and lang != "AUTO":
+            self._record_recent_lang_and_refresh(lang, save=True)
         naming_mode = self.sc1_naming_mode_var.get()
         sc_kw = self.sc1_keyword_var.get().strip()
         doc_name = self.doc_name_var.get().strip() if naming_mode == "keep" else ""
@@ -5151,7 +6157,9 @@ class ScatteredRevisionApp:
         balance_cols = bool(self.sc1_balance_cols_var.get())
 
         auto_no_key_local = False
-        if want_ai and not keys:
+        if not highlight_colors:
+            effective_enable_ai = False
+        elif want_ai and not keys:
             effective_enable_ai = False
             auto_no_key_local = True
         else:
@@ -5161,16 +6169,25 @@ class ScatteredRevisionApp:
 
         self._set_running(True, final_stage="正在启动一键输出定稿...", tab_key="main")
         self._log("=" * 64, target_tab="main")
-        mode_summary = (
-            f"AI 辅助（模型：{model} | 密钥池：{len(keys)} 个 Key）"
-            if effective_enable_ai
-            else "本地位置估算模式（免 API Key）"
-        )
+        if not highlight_colors:
+            mode_summary = "仅输出对比修订痕迹（不标黄/青高亮，免调 AI）"
+        elif effective_enable_ai:
+            mode_summary = f"AI 辅助（模型：{model} | 密钥池：{len(keys)} 个 Key | 黄标连片 ≤{yellow_gap_words}词）"
+        else:
+            mode_summary = f"本地位置估算模式（免 API Key | 黄标连片 ≤{yellow_gap_words}词）"
         name_desc = (
-            f"God's words in {sc_kw}" if (naming_mode == "scattered" and sc_kw) else ("God's words" if naming_mode == "scattered" else (doc_name or "原文档名"))
+            f"God's words in {sc_kw}"
+            if (naming_mode == "scattered" and sc_kw)
+            else ("God's words" if naming_mode == "scattered" else (doc_name or "原文档名"))
         )
-        self._log(f"⚡ 启动【一键输出定稿】 | {mode_summary} | 语种：{lang} | 命名：{name_desc}", target_tab="main")
-        if auto_no_key_local:
+        master_tag = f" | 核对最新底稿：{Path(latest_master_path).name}" if latest_master_path else ""
+        self._log(
+            f"⚡ 启动【一键输出定稿】 | {mode_summary} | 语种：{lang} | 命名：{name_desc}{master_tag}",
+            target_tab="main",
+        )
+        if not highlight_colors:
+            self._log("ℹ️ 已取消勾选「对比标记高亮颜色」：本次仅保留第 2 列修订痕迹，不输出黄/青高亮颜色", target_tab="main")
+        elif auto_no_key_local:
             self._log("ℹ️ 未填写 API Key，本次自动使用「本地位置估算模式」完成标色并导出定稿", target_tab="main")
         elif not want_ai:
             self._log("ℹ️ 已关闭 AI 辅助开关，本次使用「本地位置估算模式」离线完成标色并导出定稿", target_tab="main")
@@ -5195,11 +6212,17 @@ class ScatteredRevisionApp:
                     balance_columns=balance_cols,
                     dedup_pkg_dir=dedup_dir,
                     date_str="",
+                    latest_master_path=latest_master_path,
+                    highlight_colors=highlight_colors,
+                    yellow_gap_words=yellow_gap_words,
+                    export_raw_trilingual=export_raw_trilingual,
                     log_fn=lambda m: self._log(m, target_tab="main"),
                     progress_fn=self._progress,
                 )
                 saved_files = list(res.get("saved_files") or [])
                 det_lang = res.get("lang_code") or lang
+                if det_lang and str(det_lang).upper() not in ("AUTO", "XX"):
+                    self.log_queue.put(("record_recent_lang", str(det_lang)))
                 det_disp = find_lang_display_name(det_lang, self.languages)
                 skipped_count = int(res.get("skipped_count") or 0)
                 used_local_fallback = bool(res.get("used_local_fallback", False))
@@ -5210,9 +6233,11 @@ class ScatteredRevisionApp:
 
                 files_str = "\n".join(saved_files)
                 extra_notes: list[str] = []
-                if effective_enable_ai and used_local_fallback:
+                if not highlight_colors:
+                    extra_notes.append("ℹ️ 输出模式：仅保留第 2 列英文对比修订痕迹（未标记黄/青高亮）")
+                elif effective_enable_ai and used_local_fallback:
                     fb_note = (
-                        "⚠️ 标色说明：因 API Key 失效、额度受限或网络异常，已自动切换「本地位置估算模式」完成第 3 列外文标色。"
+                        "⚠️ 标色说明：因 API Key 失效、额度受限或网络异常，已自动切换「本地位置估算模式」完成多列标色。"
                     )
                     self._log(fb_note, target_tab="main")
                     extra_notes.append(fb_note)
@@ -5235,7 +6260,7 @@ class ScatteredRevisionApp:
                     extra_notes.append(dup_note)
 
                 wc_line = ""
-                if up_words is not None and rv_words is not None:
+                if up_words is not None and rv_words is not None and highlight_colors:
                     wc_line = f"\n第 2 列统计：UP {up_words} words, RV {rv_words} words"
 
                 self._log(
@@ -5244,7 +6269,9 @@ class ScatteredRevisionApp:
                 )
 
                 stage_flags = []
-                if effective_enable_ai and used_local_fallback:
+                if not highlight_colors:
+                    stage_flags.append("仅修订痕迹")
+                elif effective_enable_ai and used_local_fallback:
                     stage_flags.append("已自动切换本地估算标色")
                 elif not effective_enable_ai:
                     stage_flags.append("本地估算标色")
@@ -5312,6 +6339,9 @@ def _run_frozen_self_test() -> int:
     from ai_client import format_friendly_api_error as _ai_friendly_err
     from ai_client import local_align_col3_spans
 
+    if RAW_APP_VERSION != "1.8.0":
+        raise RuntimeError(f"RAW_APP_VERSION expected '1.8.0', got {RAW_APP_VERSION!r}")
+
     is_frozen = bool(getattr(sys, "frozen", False))
     if is_frozen and hasattr(sys, "_MEIPASS"):
         bundled_cfg = Path(sys._MEIPASS) / "resources" / "config.json"
@@ -5327,6 +6357,22 @@ def _run_frozen_self_test() -> int:
     langs = load_languages()
     if not langs:
         raise RuntimeError("Empty language registry in self-test")
+
+    # Verify v1.8.0 favorite + recent language prioritization & code resolution
+    prio_vals = get_prioritized_combo_values(langs, recent_codes=["BG", "PL"], favorite_codes=["PL"])
+    if (
+        len(prio_vals) < 4
+        or prio_vals[0] != AUTO_COMBO_LABEL
+        or not prio_vals[1].startswith("★ PL - ")
+        or not prio_vals[2].startswith("⏱ BG - ")
+    ):
+        raise RuntimeError(f"get_prioritized_combo_values self-test failed: {prio_vals[:5]!r}")
+    if _resolve_combo_code(prio_vals[1], langs) != "PL" or _resolve_combo_code(prio_vals[2], langs) != "BG":
+        raise RuntimeError("Prioritized combo code resolution self-test failed")
+    rec_updated = record_recent_language("TH", ["BG", "TH", "PL"], max_items=5)
+    if rec_updated[:3] != ["TH", "BG", "PL"] or record_recent_language("AUTO", rec_updated, max_items=5) != rec_updated:
+        raise RuntimeError(f"record_recent_language self-test failed: {rec_updated!r}")
+
     pool = ApiKeyPool(["self_test_placeholder_1", "self_test_placeholder_2"])
     if len(pool) != 2:
         raise RuntimeError("ApiKeyPool self-test failed")
@@ -5365,7 +6411,7 @@ def _run_frozen_self_test() -> int:
     if not aligned_sub or docx_xml_utils.find_fuzzy_substring_span(sample_col3, aligned_sub) is None:
         raise RuntimeError(f"local_align_col3_spans self-test failed: {local_res!r}")
 
-    # Verify word_counter filename parser & formatter (including v1.7.0 0-word omission)
+    # Verify word_counter filename parser & formatter (including 0-word omission)
     p1 = parse_doc_filename("GR_God’s Words_(UP 10 words, RV 20 words)_20261114", known_codes={"GR"})
     if p1["orig_name"] != "God’s Words" or p1["existing_lang"] != "GR" or not p1["had_word_count"]:
         raise RuntimeError(f"Filename parser self-test failed: {p1}")
@@ -5373,9 +6419,10 @@ def _run_frozen_self_test() -> int:
     if fn_both != "GR_God’s Words_(UP 128 words, RV 64 words)_20261115.docx":
         raise RuntimeError(f"Filename formatter (both>0) self-test failed: {fn_both}")
 
-    # Determine whether full v1.7.0 sibling modules are present (always True in frozen EXE & merged repo)
+    # Determine whether full v1.7.0 / v1.8.0 sibling modules are present (always True in frozen EXE & merged repo)
     base_d = _app_base_dir()
     require_v17_siblings = is_frozen or (base_d / "full_article_processor.py").is_file()
+    require_v18_siblings = is_frozen or (base_d / "master_sync.py").is_file()
 
     if require_v17_siblings:
         fn_up_only = format_counted_docx_name("GR", "God’s Words", 96, 0, "20261115")
@@ -5402,12 +6449,31 @@ def _run_frozen_self_test() -> int:
         if not callable(getattr(_dd_test, "check_and_export_duplicates", None)):
             raise RuntimeError("dedup_checker.check_and_export_duplicates missing in self-test")
 
-        if str(getattr(_upd_test, "APP_VERSION", "")).lstrip("vV") != "1.7.0":
+        upd_ver = str(getattr(_upd_test, "APP_VERSION", "")).lstrip("vV")
+        expected_vers = ("1.8.0",) if require_v18_siblings else ("1.7.0", "1.8.0")
+        if upd_ver not in expected_vers:
             raise RuntimeError(f"updater.APP_VERSION mismatch: {getattr(_upd_test, 'APP_VERSION', None)!r}")
         if not callable(getattr(_upd_test, "check_for_updates", None)) or not callable(
             getattr(_upd_test, "download_and_apply_update", None)
         ):
             raise RuntimeError("updater functions missing in self-test")
+
+    if require_v18_siblings:
+        import master_sync as _ms_test
+        import full_article_processor as _fap_v18
+
+        if not callable(getattr(_ms_test, "sync_pending_with_latest_master", None)):
+            raise RuntimeError("master_sync.sync_pending_with_latest_master missing in self-test")
+        for req_v18_fn in ("refresh_master_index", "resolve_direct_folder_articles"):
+            if not callable(getattr(_fap_v18, req_v18_fn, None)):
+                raise RuntimeError(f"full_article_processor.{req_v18_fn} missing in self-test")
+        if is_frozen:
+            import ai_client as _ai_v18
+
+            if not callable(getattr(_lang_reg_mod, "get_prioritized_combo_values", None)):
+                raise RuntimeError("lang_registry.get_prioritized_combo_values missing in frozen self-test")
+            if not callable(getattr(_ai_v18, "local_align_col1_spans", None)):
+                raise RuntimeError("ai_client.local_align_col1_spans missing in frozen self-test")
 
     if require_v17_siblings or callable(get_lang_typography):
         from lang_registry import get_lang_typography as _get_typo
