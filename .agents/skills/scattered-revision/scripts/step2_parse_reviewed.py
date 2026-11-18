@@ -6,6 +6,7 @@ from docx_xml_utils import (
     NS,
     SKIPPED_ROW_MARKER,
     W,
+    accept_all_revisions_in_cell,
     get_cell_plain_text,
     load_docx_xml,
 )
@@ -60,8 +61,22 @@ def extract_col2_spans(tc2):
     return merged
 
 
+def _is_full_cell_rv_segments(segments: list) -> bool:
+    """Return True when every visible/non-whitespace segment in Col 2 is highlighted `rv` (whole-cell RV)."""
+    has_rv = False
+    for seg in segments:
+        has_visible_or_old = bool(seg["new_en"].strip() or seg["old_en"].strip())
+        if not has_visible_or_old:
+            continue
+        if seg["hl_group"] == "rv":
+            has_rv = True
+        else:
+            return False
+    return has_rv
+
+
 def main():
-    parser = argparse.ArgumentParser(description="Step 2a: Parse reviewed Step 1 .docx and output Col 3 alignment tasks.")
+    parser = argparse.ArgumentParser(description="Step 2a: Parse reviewed Step 1 .docx and output Col 1 & Col 3 alignment tasks.")
     parser.add_argument("--draft", required=True, help="Path to reviewed Step 1 draft .docx")
     parser.add_argument("--workdir", required=True, help="Working directory for JSON files")
     args = parser.parse_args()
@@ -93,7 +108,11 @@ def main():
                     global_row_idx += 1
                     continue
 
+                accept_all_revisions_in_cell(tcs[0])
+                col1_text = get_cell_plain_text(tcs[0])
+
                 segments = extract_col2_spans(tcs[1])
+                is_full_cell_rv = _is_full_cell_rv_segments(segments)
                 old_en_full = "".join(seg["old_en"] for seg in segments)
                 spans_to_align = []
                 char_cursor = 0
@@ -119,7 +138,7 @@ def main():
                         right_ctx = old_en_full[c_end : c_end + 45]
                         spans_to_align.append({
                             "span_id": f"R{global_row_idx}_S{len(spans_to_align)}",
-                            "type": seg["hl_group"],  # 'up' -> Col3 yellow, 'rv' -> Col3 lightGray
+                            "type": seg["hl_group"],  # 'up' -> Col1 yellow / Col3 yellow; 'rv' -> Col1 cyan / Col3 lightGray
                             "old_en_in_col3": stripped_old,
                             "old_en_char_start": c_start,
                             "old_en_char_end": c_end,
@@ -134,8 +153,10 @@ def main():
                         "body_idx": body_idx,
                         "row_idx": r_idx,
                         "article_title": cur_title,
+                        "col1_text": col1_text,
                         "col3_text": col3_text,
                         "old_en_full": old_en_full,
+                        "is_full_cell_rv": is_full_cell_rv,
                         "spans": spans_to_align,
                     })
                 global_row_idx += 1
@@ -149,7 +170,7 @@ def main():
 
     total_spans = sum(len(rt["spans"]) for rt in row_tasks)
     print(f"Alignment tasks written to: {out_json}")
-    print(f"Total rows with highlights: {len(row_tasks)}, total spans to align to Col 3: {total_spans}")
+    print(f"Total rows with highlights: {len(row_tasks)}, total spans to align to Col 1 & Col 3: {total_spans}")
 
 
 if __name__ == "__main__":

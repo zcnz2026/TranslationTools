@@ -9,18 +9,24 @@ from typing import Dict, List, Optional, Set, Tuple
 from docx_xml_utils import (
     NS,
     W,
+    accept_all_revisions_in_cell,
     diff_tokens,
     ensure_three_column_tables_and_landscape,
+    extract_cell_char_inline_styles,
     extract_char_shading,
+    extract_ops_inline_styles,
     get_cell_plain_text,
+    is_strict_rv_sentence,
     load_config,
     load_docx_comments_xml,
     load_docx_xml,
     merge_same_doc_duplicate_rows,
+    project_unquoted_inline_styles,
     save_docx_xml,
     segment_diff_into_sentences,
     sentence_unit_stats,
     split_into_bg_regions,
+    split_into_bg_regions_with_offsets,
 )
 from library_index import (
     LibraryIndex,
@@ -844,12 +850,18 @@ def main():
     inp_root, _, inp_ns_pairs = load_docx_xml(inp_path)
     inp_comments_root = load_docx_comments_xml(inp_path)
 
-    # Preprocess input: auto-expand 2-column tables -> 3 columns + Landscape A4, and merge duplicate paragraphs
+    # Preprocess input: accept Col 1 Chinese track changes, auto-expand 2-col -> 3-col + Landscape A4, and merge duplicate rows
     xml_before_preproc = ET.tostring(inp_root, encoding="unicode")
     exp_cnt = ensure_three_column_tables_and_landscape(inp_root)
+    col1_accepted_cnt = 0
+    for tr_pre in inp_root.findall(".//w:tbl/w:tr", NS):
+        tcs_pre = tr_pre.findall("w:tc", NS)
+        if tcs_pre:
+            col1_accepted_cnt += accept_all_revisions_in_cell(tcs_pre[0])
     merged_cnt = merge_same_doc_duplicate_rows(inp_root, log_fn=print, comments_root=inp_comments_root)
     preproc_modified = (
         exp_cnt > 0
+        or col1_accepted_cnt > 0
         or merged_cnt > 0
         or (ET.tostring(inp_root, encoding="unicode") != xml_before_preproc)
     )
@@ -862,6 +874,8 @@ def main():
         inp_root, _, _ = load_docx_xml(effective_inp_path)
         if exp_cnt > 0:
             print(f"📐 已自动将 {exp_cnt} 个两列表格扩展为三列表格并设为横向 A4 页面。")
+        if col1_accepted_cnt > 0:
+            print(f"✅ 已自动接受第 1 列中文中的 {col1_accepted_cnt} 处修订痕迹。")
 
     body = inp_root.find("w:body", NS)
 
@@ -973,39 +987,55 @@ def main():
                 if src_file not in matched_lib_paths:
                     matched_lib_paths.append(src_file)
 
-                src_en = get_cell_plain_text(live_tcs[1])
+                _, inp_styles = extract_cell_char_inline_styles(tcs[1])
+                src_en, src_styles = extract_cell_char_inline_styles(live_tcs[1])
                 col3_preview = get_cell_plain_text(live_tcs[2])[:120]
 
-                regions = split_into_bg_regions(src_en, inp_en, inp_fills)
+                regions = split_into_bg_regions_with_offsets(src_en, inp_en, inp_fills)
                 region_entries = []
-                for reg_idx, (fill_hex, src_seg, inp_seg) in enumerate(regions):
+                for reg_idx, (fill_hex, s_c1, s_c2, t_c1, t_c2) in enumerate(regions):
+                    src_seg = src_en[s_c1:s_c2]
+                    inp_seg = inp_en[t_c1:t_c2]
+                    s_st_slice = src_styles[s_c1:s_c2]
+                    i_st_slice = inp_styles[t_c1:t_c2]
                     if fill_hex is None:
-                        region_entries.append({
+                        unq_entry = {
                             "region_idx": reg_idx,
                             "is_quoted": False,
                             "fill_hex": None,
                             "src_text": src_seg,
-                        })
+                        }
+                        st_spans = project_unquoted_inline_styles(src_seg, s_st_slice, inp_seg, i_st_slice)
+                        if st_spans:
+                            unq_entry["style_spans"] = st_spans
+                        region_entries.append(unq_entry)
                     else:
                         actual_fill = None if fill_hex == "NONE_FULL" else fill_hex
                         ops = diff_tokens(src_seg, inp_seg)
+                        all_op_styles = extract_ops_inline_styles(ops, src_seg, s_st_slice, inp_seg, i_st_slice)
                         sent_op_lists = segment_diff_into_sentences(ops)
                         sent_items = []
+                        op_cursor = 0
                         for s_i, s_ops in enumerate(sent_op_lists):
+                            s_op_styles = all_op_styles[op_cursor : op_cursor + len(s_ops)]
+                            op_cursor += len(s_ops)
                             stats = sentence_unit_stats(s_ops)
                             sent_id = f"T{tbl_counter}_R{r_idx}_G{reg_idx}_S{s_i}"
                             if not stats["has_edit"]:
                                 suggested = "none"
-                            elif stats["change_ratio"] >= rv_threshold or (stats["change_ratio"] >= 0.32 and stats["edit_hunks"] >= 4):
+                            elif is_strict_rv_sentence(stats):
                                 suggested = "cyan"
                             else:
                                 suggested = "yellow"
-                            sent_items.append({
+                            s_entry = {
                                 "sent_id": sent_id,
                                 "suggested_action": suggested,
                                 **stats,
                                 "ops": s_ops,
-                            })
+                            }
+                            if any(s_op_styles):
+                                s_entry["op_styles"] = s_op_styles
+                            sent_items.append(s_entry)
                         region_entries.append({
                             "region_idx": reg_idx,
                             "is_quoted": True,
@@ -1061,6 +1091,9 @@ def main():
                         "suggested": s["suggested_action"],
                         "change_ratio": s["change_ratio"],
                         "edit_hunks": s["edit_hunks"],
+                        "eq_words": s.get("eq_words", 0),
+                        "shared_content_words": s.get("shared_content_words", 0),
+                        "max_consec_eq_words": s.get("max_consec_eq_words", 0),
                         "new_words": s["new_words"],
                         "diff_preview": s["diff_preview"],
                     })

@@ -1,5 +1,7 @@
 import argparse
+import difflib
 import json
+import re
 from datetime import datetime
 from pathlib import Path
 import xml.etree.ElementTree as ET
@@ -8,9 +10,12 @@ from docx_xml_utils import (
     NS,
     SKIPPED_ROW_MARKER,
     W,
+    _is_top_instruction_paragraph_text,
+    accept_all_revisions_in_cell,
     apply_highlights_to_col3_cell,
     balance_trilingual_table_widths,
     compute_col2_up_rv_words,
+    count_msword_en_words,
     find_fuzzy_substring_span,
     format_up_rv_count_tag,
     get_cell_plain_text,
@@ -21,10 +26,13 @@ from docx_xml_utils import (
     safe_join_output_file,
     sanitize_filename_part,
     save_docx_xml,
+    strip_all_highlights_in_cell,
     update_top_highlight_instruction_lines,
 )
 
 RV_HIGHLIGHT_VALS = {"cyan", "blue", "darkCyan"}
+_CN_SENT_END_RE = re.compile(r"[。？！!?；;\n]+(?:[”’\"'」』）\)]*)")
+_CN_CLAUSE_END_RE = re.compile(r"[，,、：:；;。？！!?\n]+(?:[”’\"'」』）\)]*)")
 
 
 def is_skipped_row(tr: ET.Element) -> bool:
@@ -133,31 +141,55 @@ def accept_rv_revisions_in_col2(tc2: ET.Element, target_rv_color: str = "cyan"):
             p.append(ch)
 
 
-def table_has_col2_changes(tbl_el: ET.Element, active_hl_vals: set) -> bool:
-    for tr in tbl_el.findall("w:tr", NS):
-        if is_skipped_row(tr):
-            continue
-        tcs = tr.findall("w:tc", NS)
-        if len(tcs) < 2:
-            continue
-        tc2 = tcs[1]
-        if tc2.find(".//w:del", NS) is not None or tc2.find(".//w:ins", NS) is not None:
-            return True
+def row_has_col2_changes(tr: ET.Element, active_hl_vals: set = None) -> bool:
+    """Return True if table row `tr` is non-skipped and has Col 2 track changes (`<w:ins>`/`<w:del>`) or active highlights."""
+    if is_skipped_row(tr):
+        return False
+    tcs = tr.findall("w:tc", NS)
+    if len(tcs) < 2:
+        return False
+    tc2 = tcs[1]
+    if tc2.find(".//w:del", NS) is not None or tc2.find(".//w:ins", NS) is not None:
+        return True
+    if active_hl_vals:
         for hl in tc2.findall(".//w:rPr/w:highlight", NS):
             if hl.attrib.get(f"{W}val") in active_hl_vals:
                 return True
     return False
 
 
-def filter_tables_in_body(body: ET.Element, up_color: str, rv_color: str, keep_changed: bool) -> tuple[int, int]:
+def _is_blank_row(tr: ET.Element, active_hl_vals: set = None) -> bool:
+    if row_has_col2_changes(tr, active_hl_vals):
+        return False
+    for tc in tr.findall("w:tc", NS):
+        if get_cell_plain_text(tc).strip():
+            return False
+    return True
+
+
+def table_has_col2_changes(tbl_el: ET.Element, active_hl_vals: set = None) -> bool:
+    return any(row_has_col2_changes(tr, active_hl_vals) for tr in tbl_el.findall("w:tr", NS))
+
+
+def filter_tables_in_body(
+    body: ET.Element,
+    up_color: str,
+    rv_color: str,
+    keep_changed: bool,
+    keep_first_title_row: bool = False,
+    no_highlight_colors: bool = False,
+) -> tuple[int, int]:
     """
-    Filter tables in `body` along with each removed table's preceding title paragraph(s) and trailing blank separator(s).
-    - Tables with 0 remaining rows (e.g. all rows were skipped) are ALWAYS removed!
-    - keep_changed=True  -> keep ONLY tables with Col 2 changes/highlights (translator version)
-    - keep_changed=False -> keep ONLY tables with ZERO Col 2 changes/highlights (unchanged-only version)
-    Returns (kept_tables, removed_tables).
+    Row-level & table-level filtering in `body`:
+      - `keep_changed=True` (`给译者版` `--remove-unchanged-tables`):
+          Inside EVERY `<w:tbl>`, delete every `<w:tr>` where `not row_has_col2_changes(tr, active_hl_vals)`
+          (keeping Row 0 + optional blank Row 1 ONLY if `keep_first_title_row=True` AND at least one row in that table has changes)!
+          If 0 changed rows exist in `<w:tbl>`, remove the entire `<w:tbl>` + preceding title `<w:p>`(s) + blank `<w:p>`(s).
+      - `keep_changed=False` (`无改点版` `--only-unchanged-tables`):
+          Inside EVERY `<w:tbl>`, delete changed `<w:tr>`s so only unchanged rows remain (and remove emptied tables + titles).
+    Returns `(kept_tables, removed_tables)`.
     """
-    active_hl_vals = {up_color, rv_color} | RV_HIGHLIGHT_VALS
+    active_hl_vals = set() if no_highlight_colors else ({up_color, rv_color} | RV_HIGHLIGHT_VALS)
     children = list(body)
     n = len(children)
     to_remove = set()
@@ -169,10 +201,11 @@ def filter_tables_in_body(body: ET.Element, up_color: str, rv_color: str, keep_c
             return False
         return "".join(t.text or "" for t in el.findall(".//w:t", NS)).strip() == ""
 
-    def _is_nonempty_p(el: ET.Element) -> bool:
+    def _is_title_p(el: ET.Element) -> bool:
         if el.tag.split("}")[-1] != "p":
             return False
-        return "".join(t.text or "" for t in el.findall(".//w:t", NS)).strip() != ""
+        ptxt = "".join(t.text or "" for t in el.findall(".//w:t", NS)).strip()
+        return bool(ptxt) and not _is_top_instruction_paragraph_text(ptxt)
 
     for idx, ch in enumerate(children):
         if ch.tag.split("}")[-1] != "tbl":
@@ -181,20 +214,54 @@ def filter_tables_in_body(body: ET.Element, up_color: str, rv_color: str, keep_c
         if not rem_trs:
             should_remove = True
         else:
-            has_change = table_has_col2_changes(ch, active_hl_vals)
-            should_remove = (not has_change) if keep_changed else has_change
+            header_idxs = set()
+            if keep_first_title_row and len(rem_trs) >= 1:
+                header_idxs.add(0)
+                if len(rem_trs) >= 2 and _is_blank_row(rem_trs[1], active_hl_vals):
+                    header_idxs.add(1)
+
+            if keep_changed:
+                changed_idxs = {i for i, tr in enumerate(rem_trs) if row_has_col2_changes(tr, active_hl_vals)}
+                if not changed_idxs:
+                    should_remove = True
+                else:
+                    keep_idxs = changed_idxs | header_idxs
+                    for i, tr in enumerate(rem_trs):
+                        if i not in keep_idxs:
+                            ch.remove(tr)
+                    should_remove = len(ch.findall("w:tr", NS)) == 0
+            else:
+                for tr in rem_trs:
+                    if row_has_col2_changes(tr, active_hl_vals):
+                        ch.remove(tr)
+                surviving = ch.findall("w:tr", NS)
+                if keep_first_title_row:
+                    surviving_set = set(surviving)
+                    body_unchanged = [
+                        rem_trs[i]
+                        for i in range(len(rem_trs))
+                        if i not in header_idxs and rem_trs[i] in surviving_set and not _is_blank_row(rem_trs[i], active_hl_vals)
+                    ]
+                    should_remove = len(body_unchanged) == 0
+                else:
+                    has_nonblank = any(not _is_blank_row(tr, active_hl_vals) for tr in surviving)
+                    should_remove = (not surviving) or (not has_nonblank)
 
         if should_remove:
             removed_tables += 1
             to_remove.add(idx)
             b_idx = idx - 1
-            # Also handle optional single blank paragraph between title <w:p> and <w:tbl>
-            if b_idx >= 1 and _is_blank_p(children[b_idx]) and _is_nonempty_p(children[b_idx - 1]):
-                to_remove.add(b_idx)
+            # Remove optional blank paragraph(s) between title <w:p> and <w:tbl>
+            tmp_blanks = []
+            while b_idx >= 0 and _is_blank_p(children[b_idx]):
+                tmp_blanks.append(b_idx)
                 b_idx -= 1
-            while b_idx >= 0 and _is_nonempty_p(children[b_idx]):
-                to_remove.add(b_idx)
-                b_idx -= 1
+            if b_idx >= 0 and _is_title_p(children[b_idx]):
+                for bi in tmp_blanks:
+                    to_remove.add(bi)
+                while b_idx >= 0 and _is_title_p(children[b_idx]):
+                    to_remove.add(b_idx)
+                    b_idx -= 1
             f_idx = idx + 1
             while f_idx < n and _is_blank_p(children[f_idx]):
                 to_remove.add(f_idx)
@@ -220,20 +287,120 @@ def filter_tables_in_body(body: ET.Element, up_color: str, rv_color: str, keep_c
     return kept_tables, removed_tables
 
 
+def _full_nonws_char_spans(text: str, hl_color: str) -> list:
+    if not text or not text.strip():
+        return []
+    lead = len(text) - len(text.lstrip())
+    trail = len(text) - len(text.rstrip())
+    end = max(lead, len(text) - trail)
+    return [(lead, end, hl_color)] if end > lead else []
+
+
+def _split_ranges_by_regex(text: str, sep_re: re.Pattern) -> list[tuple[int, int]]:
+    ranges = []
+    cur = 0
+    for m in sep_re.finditer(text):
+        end_p = m.end()
+        if text[cur:end_p].strip():
+            ranges.append((cur, end_p))
+            cur = end_p
+    if cur < len(text) and text[cur:].strip():
+        ranges.append((cur, len(text)))
+    return ranges or [(0, len(text))]
+
+
+def _fallback_col1_span_range(
+    col1_text: str,
+    old_en_full: str,
+    sp: dict,
+    search_from: int = 0,
+    failed_target: str = "",
+) -> tuple[int, int] | None:
+    """
+    Resilient local Col 1 Chinese span locator used when `col1_substring` was omitted (e.g. legacy string map)
+    or had minor quote/character divergence from `col1_text`.
+    """
+    n_cn = len(col1_text)
+    if n_cn == 0 or not col1_text.strip():
+        return None
+
+    # 1. If a non-empty target missed exact/regex fuzzy match, try bounded SequenceMatcher alignment first
+    clean_t = (failed_target or "").strip()
+    if len(clean_t) >= 2:
+        sub_h = col1_text[search_from:] if search_from < n_cn else col1_text
+        base_off = search_from if search_from < n_cn else 0
+        sm = difflib.SequenceMatcher(None, clean_t, sub_h, autojunk=False)
+        blocks = [b for b in sm.get_matching_blocks() if b.size > 0]
+        matched = sum(b.size for b in blocks)
+        if blocks and matched >= max(2, int(len(clean_t) * 0.65)):
+            s_i = base_off + blocks[0].b
+            e_i = base_off + blocks[-1].b + blocks[-1].size
+            if e_i > s_i:
+                return (s_i, e_i)
+
+    # 2. Proportional sentence / clause mapping from Col 2 English offsets onto Col 1 Chinese
+    en_total = max(1, len(old_en_full))
+    c_start = int(sp.get("old_en_char_start", 0))
+    c_end = int(sp.get("old_en_char_end", c_start))
+    r_start = max(0.0, min(1.0, c_start / en_total))
+    r_end = max(r_start, min(1.0, c_end / en_total))
+    est_center = max(search_from, min(n_cn - 1, round(((r_start + r_end) * 0.5) * n_cn)))
+    est_start = max(search_from, min(n_cn - 1, round(r_start * n_cn)))
+    est_end = max(est_start + 1, min(n_cn, round(r_end * n_cn)))
+
+    if sp.get("type") == "rv":
+        sents = _split_ranges_by_regex(col1_text, _CN_SENT_END_RE)
+        chosen = [
+            (s_a, s_b)
+            for (s_a, s_b) in sents
+            if s_b > search_from and (
+                (s_a < est_end and s_b > est_start)
+                or (s_a <= est_center < s_b)
+            )
+        ]
+        if not chosen:
+            avail = [(s_a, s_b) for (s_a, s_b) in sents if s_b > search_from] or sents
+            best_s = min(avail, key=lambda pair: abs(((pair[0] + pair[1]) * 0.5) - est_center))
+            chosen = [best_s]
+        s_out = max(search_from, chosen[0][0])
+        e_out = chosen[-1][1]
+        while s_out < e_out and col1_text[s_out].isspace():
+            s_out += 1
+        return (s_out, e_out) if e_out > s_out else None
+
+    clauses = _split_ranges_by_regex(col1_text, _CN_CLAUSE_END_RE)
+    avail_cl = [(c_a, c_b) for (c_a, c_b) in clauses if c_b > search_from] or clauses
+    best_cl = min(avail_cl, key=lambda pair: abs(((pair[0] + pair[1]) * 0.5) - est_center))
+    cl_a, cl_b = max(search_from, best_cl[0]), best_cl[1]
+    en_words = max(1, count_msword_en_words(sp.get("new_en") or sp.get("old_en_in_col3") or "word"))
+    if en_words <= 4 and (cl_b - cl_a) > 12:
+        win_len = min(cl_b - cl_a, max(4, en_words * 2 + 2))
+        rel = (est_center - cl_a) / max(1, cl_b - cl_a)
+        s_out = cl_a + max(0, min((cl_b - cl_a) - win_len, round(rel * ((cl_b - cl_a) - win_len))))
+        e_out = min(cl_b, s_out + win_len)
+    else:
+        s_out, e_out = cl_a, cl_b
+    while s_out < e_out and col1_text[s_out].isspace():
+        s_out += 1
+    return (s_out, e_out) if e_out > s_out else None
+
+
 def compute_final_col2_word_counts(root: ET.Element, up_color: str, rv_color: str):
     return compute_col2_up_rv_words(root, up_color=up_color, rv_color=rv_color)
 
 
 def main():
-    parser = argparse.ArgumentParser(description="Step 2b: Highlight Col 3 (UP+RV), count Col 2 English words & output final docx.")
+    parser = argparse.ArgumentParser(description="Step 2b: Highlight Col 1 & Col 3 (UP+RV), count Col 2 English words & output final docx.")
     parser.add_argument("--tasks", required=True, help="Path to step2_align_tasks.json")
-    parser.add_argument("--alignments", required=True, help="Path to step2_alignments.json (span_id -> target Col 3 text)")
+    parser.add_argument("--alignments", required=True, help="Path to step2_alignments.json")
     parser.add_argument("--outdir", required=True, help="Output directory for final .docx")
     parser.add_argument("--lang", required=True, help="Language code, e.g. GR, FR, PT")
     parser.add_argument("--doc-name", required=True, help="Original document name for filename")
     parser.add_argument("--date", default="", help="Optional YYYYMMDD string, defaults to current local YYYYMMDD")
-    parser.add_argument("--remove-unchanged-tables", action="store_true", help="Keep only tables that have Col 2 highlights/revisions")
-    parser.add_argument("--only-unchanged-tables", action="store_true", help="Keep only tables that have ZERO Col 2 highlights/revisions")
+    parser.add_argument("--remove-unchanged-tables", action="store_true", help="Keep only changed rows/tables (translator version)")
+    parser.add_argument("--only-unchanged-tables", action="store_true", help="Keep only unchanged rows/tables (unchanged-only version)")
+    parser.add_argument("--keep-first-title-row", action="store_true", help="Full-article mode: preserve Row 0 chapter title row in changed tables")
+    parser.add_argument("--no-highlight-colors", action="store_true", help="Skip Col 1/Col 3 highlights and top instruction lines")
     parser.add_argument("--no-balance-columns", action="store_true", help="Disable automatic adaptive 3-column width balancing")
     parser.add_argument("--no-header-lines", action="store_true", help="Disable automatic top Blue/Yellow highlight instruction lines")
     args = parser.parse_args()
@@ -243,6 +410,7 @@ def main():
     col2_rv = cfg.get("col2_rv_highlight", "cyan")
     col3_up = cfg.get("col3_up_highlight", "yellow")
     col3_rv = cfg.get("col3_rv_highlight", "lightGray")
+    use_hl = not bool(args.no_highlight_colors)
 
     with open(args.tasks, "r", encoding="utf-8") as f:
         tasks_data = json.load(f)
@@ -253,77 +421,147 @@ def main():
     root, _, ns_pairs = load_docx_xml(draft_path)
     body = root.find("w:body", NS)
 
-    # 1. Handle RV highlights/revisions in ALL non-skipped Col 2 cells (default: retain Track Changes inside cyan!)
+    # 1. Accept any unaccepted Col 1 Chinese track changes; normalize/accept Col 2 RV highlights (or strip highlights when --no-highlight-colors)
     accept_rv = cfg.get("accept_col2_rv_revisions", False)
     for tbl in body.findall("w:tbl", NS):
         for tr in tbl.findall("w:tr", NS):
+            tcs = tr.findall("w:tc", NS)
+            if tcs:
+                accept_all_revisions_in_cell(tcs[0])
+            if not use_hl:
+                for tc_c in tcs:
+                    strip_all_highlights_in_cell(tc_c)
+                continue
             if is_skipped_row(tr):
                 continue
-            tcs = tr.findall("w:tc", NS)
             if len(tcs) >= 2:
                 if accept_rv:
                     accept_rv_revisions_in_col2(tcs[1], target_rv_color=col2_rv)
                 else:
                     normalize_rv_highlights_in_col2(tcs[1], target_rv_color=col2_rv)
 
-    # 2. Apply Col 3 highlights (yellow for UP, lightGray for RV, NO extra line breaks)
+    # 2. Apply Col 1 Chinese highlights (yellow=UP, cyan=RV) & Col 3 Foreign highlights (yellow=UP, lightGray=RV)
     unmatched = []
     matched_count = 0
-    for rt in tasks_data.get("row_tasks", []):
-        tbl_el = body[rt["body_idx"]]
-        tr = tbl_el.findall("w:tr", NS)[rt["row_idx"]]
-        if is_skipped_row(tr):
-            continue
-        tc3 = tr.findall("w:tc", NS)[2]
-        col3_text = get_cell_plain_text(tc3)
+    if use_hl:
+        for rt in tasks_data.get("row_tasks", []):
+            tbl_el = body[rt["body_idx"]]
+            tr = tbl_el.findall("w:tr", NS)[rt["row_idx"]]
+            if is_skipped_row(tr):
+                continue
+            tcs = tr.findall("w:tc", NS)
+            tc1, tc3 = tcs[0], tcs[2]
+            col1_text = get_cell_plain_text(tc1)
+            col3_text = get_cell_plain_text(tc3)
 
-        char_spans = []
-        cursor = 0
-        for sp in rt["spans"]:
-            sid = sp["span_id"]
-            target_str = align_map.get(sid, "")
-            if isinstance(target_str, dict):
-                target_str = target_str.get("col3_substring", "")
-            if not target_str or not target_str.strip():
-                unmatched.append((sid, "EMPTY_ALIGNMENT", sp["old_en_in_col3"][:60]))
+            if rt.get("is_full_cell_rv"):
+                c1_full = _full_nonws_char_spans(col1_text, col2_rv)
+                c3_full = _full_nonws_char_spans(col3_text, col3_rv)
+                apply_highlights_to_col3_cell(tc1, c1_full)
+                apply_highlights_to_col3_cell(tc3, c3_full)
+                matched_count += len(rt.get("spans", []))
                 continue
 
-            loc = find_fuzzy_substring_span(col3_text, target_str, search_from=cursor)
-            if loc is None:
-                unmatched.append((sid, target_str, sp["old_en_in_col3"][:60]))
-                continue
+            col1_char_spans = []
+            col3_char_spans = []
+            col1_cursor = 0
+            col3_cursor = 0
+            old_en_full = rt.get("old_en_full", "")
 
-            s_idx, e_idx = loc
-            hl_color = col3_rv if sp["type"] == "rv" else col3_up
-            char_spans.append((s_idx, e_idx, hl_color))
-            cursor = e_idx
-            matched_count += 1
+            for sp in rt["spans"]:
+                sid = sp["span_id"]
+                entry = align_map.get(sid, "")
+                if isinstance(entry, dict):
+                    col1_target = entry.get("col1_substring") or ""
+                    col3_target = entry.get("col3_substring") or ""
+                else:
+                    col1_target = ""
+                    col3_target = str(entry or "")
 
-        apply_highlights_to_col3_cell(tc3, char_spans)
+                # Synchronous Col 1 Chinese highlight (yellow for 'up', cyan for 'rv')
+                if col1_text.strip():
+                    hl_c1 = col2_rv if sp["type"] == "rv" else col2_up
+                    loc1 = (
+                        find_fuzzy_substring_span(col1_text, col1_target, search_from=col1_cursor)
+                        if col1_target.strip()
+                        else None
+                    )
+                    if loc1 is None:
+                        loc1 = _fallback_col1_span_range(
+                            col1_text=col1_text,
+                            old_en_full=old_en_full,
+                            sp=sp,
+                            search_from=col1_cursor,
+                            failed_target=col1_target,
+                        )
+                    if loc1 is not None:
+                        s1, e1 = loc1
+                        col1_char_spans.append((s1, e1, hl_c1))
+                        col1_cursor = e1
+
+                # Synchronous Col 3 Foreign highlight (yellow for 'up', lightGray for 'rv')
+                if not col3_target or not col3_target.strip():
+                    unmatched.append((sid, "EMPTY_ALIGNMENT", sp["old_en_in_col3"][:60]))
+                    continue
+
+                loc3 = find_fuzzy_substring_span(col3_text, col3_target, search_from=col3_cursor)
+                if loc3 is None:
+                    unmatched.append((sid, col3_target, sp["old_en_in_col3"][:60]))
+                    continue
+
+                s3, e3 = loc3
+                hl_c3 = col3_rv if sp["type"] == "rv" else col3_up
+                col3_char_spans.append((s3, e3, hl_c3))
+                col3_cursor = e3
+                matched_count += 1
+
+            apply_highlights_to_col3_cell(tc1, col1_char_spans)
+            apply_highlights_to_col3_cell(tc3, col3_char_spans)
 
     if unmatched:
         print(f"WARNING: {len(unmatched)} span(s) failed to match in Col 3 and were skipped:")
         for sid, tstr, oen in unmatched:
             print(f"  - {sid}: target={tstr!r} (from old_en={oen!r})")
 
-    # 2.5 Skipped-row removal + table filtering for translator / unchanged-only outputs
+    # 2.5 Skipped-row removal + row-level & table-level filtering for translator / unchanged-only outputs
     if args.only_unchanged_tables:
         rem_skip = remove_skipped_rows_in_body(body)
-        kept_cnt, removed_cnt = filter_tables_in_body(body, col2_up, col2_rv, keep_changed=False)
+        kept_cnt, removed_cnt = filter_tables_in_body(
+            body,
+            col2_up,
+            col2_rv,
+            keep_changed=False,
+            keep_first_title_row=bool(args.keep_first_title_row),
+            no_highlight_colors=not use_hl,
+        )
         print(f"Kept {kept_cnt} unchanged tables (removed {removed_cnt} changed/empty tables, {rem_skip} skipped rows).")
     elif args.remove_unchanged_tables:
         rem_skip = remove_skipped_rows_in_body(body)
-        kept_cnt, removed_cnt = filter_tables_in_body(body, col2_up, col2_rv, keep_changed=True)
+        kept_cnt, removed_cnt = filter_tables_in_body(
+            body,
+            col2_up,
+            col2_rv,
+            keep_changed=True,
+            keep_first_title_row=bool(args.keep_first_title_row),
+            no_highlight_colors=not use_hl,
+        )
         print(f"Kept {kept_cnt} changed tables (removed {removed_cnt} unchanged/empty tables, {rem_skip} skipped rows).")
 
     # 3. Compute exact UP & RV English word counts from Col 2 (punctuation & skipped rows excluded)
-    up_words, rv_words = compute_final_col2_word_counts(root, col2_up, col2_rv)
+    up_words, rv_words = (compute_final_col2_word_counts(root, col2_up, col2_rv) if use_hl else (0, 0))
 
     # 3.5 Adaptive trilingual 3-column width balancing & top highlight instruction lines
     if not args.no_balance_columns:
         balance_trilingual_table_widths(root)
 
-    if not args.no_header_lines:
+    if not use_hl:
+        update_top_highlight_instruction_lines(root, has_up=False, has_rv=False)
+        for p_top in body.findall("w:p", NS):
+            for rpr_top in p_top.findall(f".//{W}rPr"):
+                if rpr_top.find(f"{W}highlight") is not None:
+                    for hl_el in list(rpr_top.findall(f"{W}highlight")):
+                        rpr_top.remove(hl_el)
+    elif not args.no_header_lines:
         update_top_highlight_instruction_lines(root, has_up=(up_words > 0), has_rv=(rv_words > 0))
     else:
         header_paras = cfg.get("header_paragraphs", [])
@@ -333,7 +571,7 @@ def main():
                 p_el.append(make_run(hp_text))
                 body.insert(idx, p_el)
 
-    count_tag = format_up_rv_count_tag(up_words, rv_words)
+    count_tag = format_up_rv_count_tag(up_words, rv_words) if use_hl else ""
 
     date_str = sanitize_filename_part(
         args.date.strip() or datetime.now().strftime("%Y%m%d"),

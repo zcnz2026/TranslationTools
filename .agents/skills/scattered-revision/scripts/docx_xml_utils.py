@@ -1975,8 +1975,29 @@ def remove_rpr_child(rPr: ET.Element, local_name: str):
             rPr.remove(existing)
 
 
-def build_rpr(base_rPr: ET.Element = None, highlight: str = None, shd_fill: str = None) -> ET.Element:
+DEFAULT_INLINE_STYLE = (None, False, False, None)
+
+
+def build_rpr(
+    base_rPr: ET.Element = None,
+    highlight: str = None,
+    shd_fill: str = None,
+    inline_style: tuple = None,
+) -> ET.Element:
     rPr = copy.deepcopy(base_rPr) if base_rPr is not None else ET.Element(f"{W}rPr")
+    if inline_style is not None:
+        col_hex, is_b, is_i, u_val = inline_style
+        if col_hex:
+            insert_rpr_child_ordered(rPr, ET.Element(f"{W}color", {f"{W}val": col_hex}))
+        if is_b:
+            insert_rpr_child_ordered(rPr, ET.Element(f"{W}b"))
+            insert_rpr_child_ordered(rPr, ET.Element(f"{W}bCs"))
+        if is_i:
+            insert_rpr_child_ordered(rPr, ET.Element(f"{W}i"))
+            insert_rpr_child_ordered(rPr, ET.Element(f"{W}iCs"))
+        if u_val:
+            insert_rpr_child_ordered(rPr, ET.Element(f"{W}u", {f"{W}val": u_val}))
+
     if highlight:
         hl_el = ET.Element(f"{W}highlight", {f"{W}val": highlight})
         insert_rpr_child_ordered(rPr, hl_el)
@@ -1991,9 +2012,16 @@ def build_rpr(base_rPr: ET.Element = None, highlight: str = None, shd_fill: str 
     return rPr
 
 
-def make_run(text: str, base_rPr: ET.Element = None, highlight: str = None, shd_fill: str = None, is_del: bool = False) -> ET.Element:
+def make_run(
+    text: str,
+    base_rPr: ET.Element = None,
+    highlight: str = None,
+    shd_fill: str = None,
+    is_del: bool = False,
+    inline_style: tuple = None,
+) -> ET.Element:
     r = ET.Element(f"{W}r")
-    rPr = build_rpr(base_rPr, highlight=highlight, shd_fill=shd_fill)
+    rPr = build_rpr(base_rPr, highlight=highlight, shd_fill=shd_fill, inline_style=inline_style)
     if len(rPr) > 0:
         r.append(rPr)
     t_tag = f"{W}delText" if is_del else f"{W}t"
@@ -2013,6 +2041,105 @@ def make_track_el(kind: str, rev_id: int, author: str, date_iso: str, run_el: ET
     })
     el.append(run_el)
     return el
+
+
+_ACCEPT_DROP_REV_TAGS = frozenset({
+    "del", "moveFrom",
+    "rPrChange", "pPrChange", "tcPrChange", "trPrChange", "tblPrChange",
+    "sectPrChange", "numberingChange", "tblGridChange",
+    "moveFromRangeStart", "moveFromRangeEnd", "moveToRangeStart", "moveToRangeEnd",
+    "customXmlDelRangeStart", "customXmlDelRangeEnd",
+    "customXmlInsRangeStart", "customXmlInsRangeEnd",
+    "customXmlMoveFromRangeStart", "customXmlMoveFromRangeEnd",
+    "customXmlMoveToRangeStart", "customXmlMoveToRangeEnd",
+    "cellIns", "cellDel", "cellMerge",
+})
+_ACCEPT_UNWRAP_REV_TAGS = frozenset({"ins", "moveTo"})
+
+
+def accept_all_revisions_in_cell(tc: ET.Element) -> int:
+    """
+    Accept 100% of Word Track Changes inside table cell `tc`:
+      - Merges paragraphs across deleted paragraph marks (<w:pPr>/<w:rPr>/<w:del>);
+      - Unwraps <w:ins> and <w:moveTo>;
+      - Removes <w:del>, <w:moveFrom>, <w:rPrChange>, <w:pPrChange>, <w:tcPrChange>, and range markers.
+    Returns count of revision elements accepted/removed.
+    """
+    if tc is None:
+        return 0
+
+    accepted_count = 0
+
+    # 1. Handle deleted paragraph marks (<w:pPr>/<w:rPr>/<w:del>) by merging with following paragraph
+    idx_p = 0
+    while True:
+        paras = tc.findall(f"{W}p")
+        if idx_p >= len(paras):
+            break
+        p_cur = paras[idx_p]
+        p_rpr = p_cur.find(f"./{W}pPr/{W}rPr")
+        has_p_del = p_rpr is not None and (
+            p_rpr.find(f"{W}del") is not None or p_rpr.find(f"{W}moveFrom") is not None
+        )
+        if has_p_del:
+            for dtag in ("del", "moveFrom"):
+                for d_el in list(p_rpr.findall(f"{W}{dtag}")):
+                    p_rpr.remove(d_el)
+                    accepted_count += 1
+            if idx_p + 1 < len(paras):
+                p_nxt = paras[idx_p + 1]
+                for ch_n in list(p_nxt):
+                    if _local_name(ch_n.tag) != "pPr":
+                        p_cur.append(ch_n)
+                tc.remove(p_nxt)
+                continue
+        idx_p += 1
+
+    # 2. Recursively unwrap <w:ins>/<w:moveTo> and remove <w:del>/<w:moveFrom>/*PrChange
+    def _clean_node(node: ET.Element) -> int:
+        cnt = 0
+        node_loc = _local_name(node.tag) if _ns_uri(node.tag) == W_URI else ""
+        new_children = []
+        changed = False
+        for ch in list(node):
+            ns = _ns_uri(ch.tag)
+            loc = _local_name(ch.tag)
+            if ns == W_URI and loc in _ACCEPT_DROP_REV_TAGS:
+                cnt += 1
+                changed = True
+                continue
+            if ns == W_URI and loc in _ACCEPT_UNWRAP_REV_TAGS:
+                cnt += 1
+                changed = True
+                if node_loc == "rPr":
+                    continue
+                cnt += _clean_node(ch)
+                for sub in list(ch):
+                    new_children.append(sub)
+                continue
+            sub_cnt = _clean_node(ch)
+            cnt += sub_cnt
+            if ns == W_URI and loc == "r":
+                for dt_tag in ("delText", "delInstrText"):
+                    for dt_el in list(ch.findall(f"{W}{dt_tag}")):
+                        ch.remove(dt_el)
+                        cnt += 1
+                        changed = True
+                if len(ch) == 0 or all(_local_name(x.tag) == "rPr" for x in ch):
+                    if sub_cnt > 0 or changed:
+                        changed = True
+                        continue
+            new_children.append(ch)
+
+        if changed:
+            for ch in list(node):
+                node.remove(ch)
+            for ch in new_children:
+                node.append(ch)
+        return cnt
+
+    accepted_count += _clean_node(tc)
+    return accepted_count
 
 
 def get_cell_plain_text(tc: ET.Element) -> str:
@@ -2076,6 +2203,37 @@ def get_first_run_rpr(tc: ET.Element, fallback_tc: ET.Element = None) -> ET.Elem
     return cp
 
 
+_COL2_STRIP_INLINE_RPR_TAGS = (
+    "color", "b", "bCs", "i", "iCs", "u", "highlight", "shd",
+    "rStyle", "rPrChange", "strike", "dstrike", "vertAlign",
+)
+
+
+def get_clean_col2_base_rpr(tc: ET.Element, fallback_tc: ET.Element = None) -> ET.Element:
+    """
+    Build paragraph/cell base <w:rPr> for Col 2 English with ALL inline emphasis/color/shading tags stripped
+    so default run style is clean black unbolded unitalicized Georgia (never bleeding run 0's blue/bold!).
+    """
+    cp = get_first_run_rpr(tc, fallback_tc=fallback_tc)
+    for tag_name in _COL2_STRIP_INLINE_RPR_TAGS:
+        remove_rpr_child(cp, tag_name)
+    return cp
+
+
+def clean_col2_ppr(pPr: ET.Element) -> ET.Element:
+    """Clone a Col 2 <w:pPr> stripping paragraph shading, pPrChange, and inline color/bold on paragraph-mark <w:rPr>."""
+    if pPr is None:
+        return None
+    cp = copy.deepcopy(pPr)
+    remove_ppr_child(cp, "shd")
+    remove_ppr_child(cp, "pPrChange")
+    p_rPr = cp.find("w:rPr", NS)
+    if p_rPr is not None:
+        for tag_name in _COL2_STRIP_INLINE_RPR_TAGS:
+            remove_rpr_child(p_rPr, tag_name)
+    return cp
+
+
 def get_cell_template_ppr(tc: ET.Element, fallback_tc: ET.Element = None) -> ET.Element:
     """Extract clean template <w:pPr> from target cell (or fallback cell) to preserve original spacing/indent/font."""
     p = tc.find("w:p", NS)
@@ -2092,32 +2250,390 @@ def get_cell_template_ppr(tc: ET.Element, fallback_tc: ET.Element = None) -> ET.
     return cp
 
 
-def extract_char_shading(tc: ET.Element):
-    """Return (full_text, list_of_fill_hex_or_None_per_char)."""
+def _iter_visible_runs_in_p(node: ET.Element):
+    """Yield all non-deleted <w:r> elements inside a paragraph in exact document order matching get_cell_plain_text."""
+    for ch in node:
+        ns = _ns_uri(ch.tag)
+        loc = _local_name(ch.tag)
+        if ns == W_URI and loc in ("del", "moveFrom", "rPrChange", "pPrChange", "tcPrChange", "trPrChange", "tblPrChange"):
+            continue
+        if ns == W_URI and loc == "r":
+            yield ch
+        else:
+            yield from _iter_visible_runs_in_p(ch)
+
+
+def bridge_unshaded_islands(text: str, fills: list, max_words: int = 6) -> list:
+    """
+    Defensively bridge tiny accidental unshaded holes (`<= max_words` English words with `fill=None`
+    surrounded on BOTH left and right by the exact same non-None `fill_hex`) so accidental white holes
+    inside a shaded block never revert to old library English!
+    """
+    if not fills or len(fills) != len(text) or max_words < 0:
+        return list(fills)
+    spans = []
+    cur_f = fills[0]
+    s_idx = 0
+    for idx in range(1, len(fills)):
+        if fills[idx] != cur_f:
+            spans.append((cur_f, s_idx, idx))
+            cur_f = fills[idx]
+            s_idx = idx
+    spans.append((cur_f, s_idx, len(fills)))
+
+    if len(spans) < 3:
+        return list(fills)
+
+    out = list(fills)
+    word_re = re.compile(r"[A-Za-z0-9]+(?:[’'][A-Za-z0-9]+)*")
+    for idx in range(1, len(spans) - 1):
+        f_val, c1, c2 = spans[idx]
+        if f_val is not None:
+            continue
+        left_f = spans[idx - 1][0]
+        right_f = spans[idx + 1][0]
+        if left_f is not None and left_f == right_f:
+            sub = text[c1:c2]
+            if "\n" not in sub and len(word_re.findall(sub)) <= max_words:
+                for k in range(c1, c2):
+                    out[k] = left_f
+    return out
+
+
+def extract_char_shading(tc: ET.Element, bridge_max_words: int = 6):
+    """Return (full_text, list_of_fill_hex_or_None_per_char) with accidental tiny white holes bridged."""
     chars = []
     fills = []
+    tcPr = tc.find("w:tcPr", NS)
+    tc_fill = _normalize_shd_fill_val(tcPr.find("w:shd", NS) if tcPr is not None else None)
+
     for p_i, p in enumerate(tc.findall("w:p", NS)):
         if p_i > 0:
             chars.append("\n")
             fills.append(None)
-        for r in p.findall("w:r", NS):
+        pPr = p.find("w:pPr", NS)
+        p_fill = _normalize_shd_fill_val(pPr.find("w:shd", NS) if pPr is not None else None) or tc_fill
+        for r in _iter_visible_runs_in_p(p):
             txt = "".join(x.text or "" for x in r.findall("w:t", NS))
             if not txt:
                 continue
-            shd = r.find("./w:rPr/w:shd", NS)
-            fill = shd.attrib.get(f"{W}fill") if shd is not None else None
-            if fill in (None, "auto", "FFFFFF", "ffffff"):
-                fill = None
+            rPr = r.find("w:rPr", NS)
+            shd = rPr.find("w:shd", NS) if rPr is not None else None
+            fill = _normalize_shd_fill_val(shd) or p_fill
             for ch in txt:
                 chars.append(ch)
                 fills.append(fill)
-    return "".join(chars), fills
+    full_text = "".join(chars)
+    if bridge_max_words >= 0:
+        fills = bridge_unshaded_islands(full_text, fills, max_words=bridge_max_words)
+    return full_text, fills
 
 
-def split_into_bg_regions(src_text: str, inp_text: str, inp_char_fills: list):
+def _parse_rpr_inline_style(rPr: ET.Element = None) -> tuple:
+    """Extract (color_hex_or_None, is_bold, is_italic, underline_val_or_None) from a <w:rPr> element."""
+    if rPr is None:
+        return DEFAULT_INLINE_STYLE
+    col_val = _normalize_color_val(rPr.find("w:color", NS))
+    b_el = rPr.find("w:b", NS)
+    is_b = b_el is not None and (b_el.attrib.get(f"{W}val", "1").strip().lower() not in ("0", "false", "off"))
+    i_el = rPr.find("w:i", NS)
+    is_i = i_el is not None and (i_el.attrib.get(f"{W}val", "1").strip().lower() not in ("0", "false", "off"))
+    u_el = rPr.find("w:u", NS)
+    if u_el is not None:
+        u_raw = (u_el.attrib.get(f"{W}val") or "single").strip()
+        u_val = None if u_raw.lower() in ("", "none", "0", "false") else u_raw
+    else:
+        u_val = None
+    return (col_val, is_b, is_i, u_val)
+
+
+def extract_cell_char_inline_styles(tc: ET.Element):
     """
-    Align old library English (src_text) with new input English (inp_text)
-    and partition into [(fill_hex_or_None, src_segment, inp_segment), ...].
+    Return (full_text, list_of_(color_hex_or_None, is_bold, is_italic, underline_val_or_None)_per_char)
+    from run-level <w:rPr> in `tc` (never inheriting paragraph-mark <w:pPr>/<w:rPr> colors).
+    """
+    chars = []
+    styles = []
+    for p_i, p in enumerate(tc.findall("w:p", NS)):
+        if p_i > 0:
+            chars.append("\n")
+            styles.append(DEFAULT_INLINE_STYLE)
+        for r in _iter_visible_runs_in_p(p):
+            txt = "".join(x.text or "" for x in r.findall("w:t", NS))
+            if not txt:
+                continue
+            st = _parse_rpr_inline_style(r.find("w:rPr", NS))
+            for ch in txt:
+                chars.append(ch)
+                styles.append(st)
+
+    # Normalize pure horizontal-whitespace color glitches when underline is None so stray colored spaces don't fragment runs
+    n = len(chars)
+    i = 0
+    while i < n:
+        if chars[i] != "\n" and chars[i].isspace() and styles[i][3] is None:
+            j = i + 1
+            while j < n and chars[j] != "\n" and chars[j].isspace() and styles[j][3] is None:
+                j += 1
+            left_st = styles[i - 1] if (i > 0 and chars[i - 1] != "\n") else DEFAULT_INLINE_STYLE
+            right_st = styles[j] if (j < n and chars[j] != "\n") else DEFAULT_INLINE_STYLE
+            norm_col = left_st[0] if (left_st[0] is not None and left_st[0] == right_st[0]) else None
+            norm_b = left_st[1] and right_st[1]
+            norm_i = left_st[2] and right_st[2]
+            rep_st = (norm_col, norm_b, norm_i, None)
+            for k in range(i, j):
+                styles[k] = rep_st
+            i = j
+        else:
+            i += 1
+
+    return "".join(chars), styles
+
+
+def encode_inline_style_spans(char_styles: list) -> list:
+    """Encode per-character inline style tuples into compact RLE [[start, end, col, b, i, u], ...]."""
+    if not char_styles:
+        return []
+    spans = []
+    n = len(char_styles)
+    i = 0
+    while i < n:
+        st = char_styles[i]
+        if st == DEFAULT_INLINE_STYLE:
+            i += 1
+            continue
+        j = i + 1
+        while j < n and char_styles[j] == st:
+            j += 1
+        spans.append([i, j, st[0], bool(st[1]), bool(st[2]), st[3]])
+        i = j
+    return spans
+
+
+def decode_inline_style_spans(length: int, spans: list) -> list:
+    """Decode RLE style spans back into a per-character inline style list of length `length`."""
+    out = [DEFAULT_INLINE_STYLE] * max(0, int(length))
+    if not spans:
+        return out
+    for item in spans:
+        s, e, col, is_b, is_i, u_val = item
+        st = (col, bool(is_b), bool(is_i), u_val)
+        s_c = max(0, min(len(out), int(s)))
+        e_c = max(s_c, min(len(out), int(e)))
+        for k in range(s_c, e_c):
+            out[k] = st
+    return out
+
+
+def split_text_by_style_spans(text: str, spans: list) -> list:
+    """Split `text` into contiguous `[(sub_text, inline_style_tuple), ...]` according to RLE `spans`."""
+    if not text:
+        return []
+    if not spans:
+        return [(text, DEFAULT_INLINE_STYLE)]
+    char_styles = decode_inline_style_spans(len(text), spans)
+    out = []
+    s_i = 0
+    cur_st = char_styles[0]
+    for idx in range(1, len(text)):
+        if char_styles[idx] != cur_st:
+            out.append((text[s_i:idx], cur_st))
+            s_i = idx
+            cur_st = char_styles[idx]
+    out.append((text[s_i:], cur_st))
+    return out
+
+
+def _union_inline_style(pref_st: tuple, fallback_st: tuple) -> tuple:
+    return (
+        pref_st[0] or fallback_st[0],
+        bool(pref_st[1] or fallback_st[1]),
+        bool(pref_st[2] or fallback_st[2]),
+        pref_st[3] or fallback_st[3],
+    )
+
+
+def project_unquoted_inline_styles(
+    src_seg: str,
+    src_seg_styles: list,
+    inp_seg: str,
+    inp_seg_styles: list,
+) -> list:
+    """
+    Project `inp_seg_styles` (e.g. `0000FF` blue scripture quotes, `FF0000`, `0432FF`, bold, italic)
+    onto matching substrings of unquoted `src_seg` via token-level SequenceMatcher alignment,
+    unioned with `src_seg_styles`. Returns compact RLE style spans for `src_seg`.
+    """
+    if not src_seg:
+        return []
+    s_styles = list(src_seg_styles) if len(src_seg_styles) == len(src_seg) else [DEFAULT_INLINE_STYLE] * len(src_seg)
+    has_inp_style = bool(inp_seg and inp_seg_styles and any(st != DEFAULT_INLINE_STYLE for st in inp_seg_styles))
+    if not has_inp_style:
+        return encode_inline_style_spans(s_styles)
+
+    tok_re = re.compile(
+        r"[A-Za-z0-9]+(?:[’'][A-Za-z0-9]+)*(?:-[A-Za-z0-9]+)*(?:\([A-Za-z]+\))?"
+        r"|[^\w\s]"
+    )
+    pron_norm_re = re.compile(r"^(you|your|yours)\((?:s|pl)\)$", re.IGNORECASE)
+
+    def _norm_tok(t: str) -> str:
+        m = pron_norm_re.match(t)
+        if m:
+            return m.group(1).lower()
+        if t in ("“", "”", '"'):
+            return '"'
+        if t in ("‘", "’", "'"):
+            return "'"
+        return t.lower()
+
+    s_matches = list(tok_re.finditer(src_seg))
+    i_matches = list(tok_re.finditer(inp_seg))
+    if not s_matches or not i_matches:
+        return encode_inline_style_spans(s_styles)
+
+    s_keys = [_norm_tok(m.group(0)) for m in s_matches]
+    i_keys = [_norm_tok(m.group(0)) for m in i_matches]
+
+    proj = [DEFAULT_INLINE_STYLE] * len(src_seg)
+    sm = difflib.SequenceMatcher(None, s_keys, i_keys, autojunk=False)
+
+    for tag, i1, i2, j1, j2 in sm.get_opcodes():
+        if tag == "equal":
+            for k in range(i2 - i1):
+                sm_tok = s_matches[i1 + k]
+                im_tok = i_matches[j1 + k]
+                s_a, s_b = sm_tok.start(), sm_tok.end()
+                t_a, t_b = im_tok.start(), im_tok.end()
+                if (s_b - s_a) == (t_b - t_a):
+                    for off in range(s_b - s_a):
+                        proj[s_a + off] = inp_seg_styles[t_a + off]
+                else:
+                    dom_st = inp_seg_styles[t_a]
+                    for off in range(t_a, t_b):
+                        if inp_seg_styles[off] != DEFAULT_INLINE_STYLE:
+                            dom_st = inp_seg_styles[off]
+                            break
+                    for pos in range(s_a, s_b):
+                        proj[pos] = dom_st
+        elif tag == "replace" and i1 < i2 and j1 < j2:
+            t_a, t_b = i_matches[j1].start(), i_matches[j2 - 1].end()
+            non_ws_inp_styles = {
+                inp_seg_styles[p]
+                for p in range(t_a, t_b)
+                if not inp_seg[p].isspace()
+            }
+            if len(non_ws_inp_styles) == 1:
+                only_st = next(iter(non_ws_inp_styles))
+                if only_st != DEFAULT_INLINE_STYLE:
+                    s_a, s_b = s_matches[i1].start(), s_matches[i2 - 1].end()
+                    for pos in range(s_a, s_b):
+                        if not src_seg[pos].isspace():
+                            proj[pos] = only_st
+
+    n_s = len(src_seg)
+    idx_c = 0
+    while idx_c < n_s:
+        if src_seg[idx_c] != "\n" and src_seg[idx_c].isspace():
+            j_c = idx_c + 1
+            while j_c < n_s and src_seg[j_c] != "\n" and src_seg[j_c].isspace():
+                j_c += 1
+            l_st = proj[idx_c - 1] if idx_c > 0 else DEFAULT_INLINE_STYLE
+            r_st = proj[j_c] if j_c < n_s else DEFAULT_INLINE_STYLE
+            if l_st != DEFAULT_INLINE_STYLE and l_st == r_st:
+                for p in range(idx_c, j_c):
+                    proj[p] = l_st
+            idx_c = j_c
+        else:
+            idx_c += 1
+
+    merged = [_union_inline_style(proj[k], s_styles[k]) for k in range(n_s)]
+    return encode_inline_style_spans(merged)
+
+
+def extract_ops_inline_styles(
+    ops_list: list,
+    src_seg: str,
+    src_seg_styles: list,
+    inp_seg: str,
+    inp_seg_styles: list,
+) -> list:
+    """
+    Compute per-op RLE inline style spans across `ops_list` (`[(kind, text), ...]`):
+      - `'eq'` and `'ins'` inherit `inp_seg_styles` at their exact character positions in `inp_seg`;
+      - `'del'` inherits `src_seg_styles` at its exact character position in `src_seg` (or the enclosing
+        `inp_seg` inline style if `src_seg` had plain black while both surrounding `inp_seg` chars share a quote color).
+    """
+    s_styles = list(src_seg_styles) if len(src_seg_styles) == len(src_seg) else [DEFAULT_INLINE_STYLE] * len(src_seg)
+    i_styles = list(inp_seg_styles) if len(inp_seg_styles) == len(inp_seg) else [DEFAULT_INLINE_STYLE] * len(inp_seg)
+    if not any(st != DEFAULT_INLINE_STYLE for st in s_styles) and not any(st != DEFAULT_INLINE_STYLE for st in i_styles):
+        return [[] for _ in ops_list]
+
+    src_pos = 0
+    inp_pos = 0
+    out = []
+
+    for kind, txt in ops_list:
+        if not txt:
+            out.append([])
+            continue
+        if kind in ("eq", "ins"):
+            found_i = inp_seg.find(txt, inp_pos)
+            if found_i == -1:
+                found_i = inp_pos
+            sl = i_styles[found_i : found_i + len(txt)]
+            if len(sl) < len(txt):
+                sl = sl + [DEFAULT_INLINE_STYLE] * (len(txt) - len(sl))
+            inp_pos = min(len(inp_seg), found_i + len(txt))
+
+            if kind == "eq":
+                if src_seg.startswith(txt, src_pos):
+                    src_pos += len(txt)
+                else:
+                    m_pr = PRON_TAG_RE.match(txt)
+                    advanced = False
+                    if m_pr:
+                        stem = m_pr.group(1)
+                        for cand in (f"{stem}(pl)", f"{stem}(s)", stem):
+                            if src_seg[src_pos : src_pos + len(cand)].lower() == cand.lower():
+                                src_pos += len(cand)
+                                advanced = True
+                                break
+                    if not advanced:
+                        f_s = src_seg.find(txt, src_pos)
+                        if f_s != -1 and f_s - src_pos <= 8:
+                            src_pos = f_s + len(txt)
+            out.append(encode_inline_style_spans(sl))
+        elif kind == "del":
+            found_s = src_seg.find(txt, src_pos)
+            if found_s == -1:
+                found_s = src_pos
+            sl = s_styles[found_s : found_s + len(txt)]
+            if len(sl) < len(txt):
+                sl = sl + [DEFAULT_INLINE_STYLE] * (len(txt) - len(sl))
+            src_pos = min(len(src_seg), found_s + len(txt))
+
+            if all(st == DEFAULT_INLINE_STYLE for st in sl) and 0 < inp_pos < len(i_styles):
+                l_idx = inp_pos - 1
+                while l_idx > 0 and inp_seg[l_idx].isspace():
+                    l_idx -= 1
+                r_idx = inp_pos
+                while r_idx + 1 < len(inp_seg) and inp_seg[r_idx].isspace():
+                    r_idx += 1
+                l_st = i_styles[l_idx]
+                r_st = i_styles[r_idx]
+                if l_st != DEFAULT_INLINE_STYLE and l_st == r_st:
+                    sl = [l_st] * len(txt)
+            out.append(encode_inline_style_spans(sl))
+        else:
+            out.append([])
+    return out
+
+
+def split_into_bg_regions_with_offsets(src_text: str, inp_text: str, inp_char_fills: list):
+    """
+    Align old library English (`src_text`) with new input English (`inp_text`)
+    and return `[(fill_hex_or_None, s_c1, s_c2, t_c1, t_c2), ...]`.
     """
     inp_matches = list(re.finditer(r"\S+", inp_text))
     src_matches = list(re.finditer(r"\S+", src_text))
@@ -2125,13 +2641,11 @@ def split_into_bg_regions(src_text: str, inp_text: str, inp_char_fills: list):
     src_words = [m.group() for m in src_matches]
     inp_w_fills = [inp_char_fills[m.start()] for m in inp_matches]
 
-    if not inp_w_fills:
-        return [(None, src_text, inp_text)]
-    if all(f is None for f in inp_w_fills):
-        return [(None, src_text, inp_text)]
+    if not inp_w_fills or all(f is None for f in inp_w_fills):
+        return [(None, 0, len(src_text), 0, len(inp_text))]
     if all(f is not None for f in inp_w_fills):
         dom_fill = next(f for f in inp_w_fills if f is not None)
-        return [(dom_fill, src_text, inp_text)]
+        return [(dom_fill, 0, len(src_text), 0, len(inp_text))]
 
     sm = difflib.SequenceMatcher(None, src_words, inp_words, autojunk=False)
     opcodes = sm.get_opcodes()
@@ -2149,7 +2663,7 @@ def split_into_bg_regions(src_text: str, inp_text: str, inp_char_fills: list):
                     return i1
                 if j == j2:
                     return i2
-                # Shading boundaries occur at sentence boundaries: align sentence-ending words inside replace blocks
+
                 def _ends_sent(w: str) -> bool:
                     s = w.rstrip("”’\"')")
                     return bool(s) and s[-1] in ".?!"
@@ -2174,7 +2688,7 @@ def split_into_bg_regions(src_text: str, inp_text: str, inp_char_fills: list):
             start_j = j
     runs.append((cur_f, start_j, len(inp_w_fills)))
 
-    regions = []
+    out = []
     for idx, (fill_val, j1, j2) in enumerate(runs):
         i1 = map_j_to_i(j1)
         i2 = map_j_to_i(j2)
@@ -2182,8 +2696,19 @@ def split_into_bg_regions(src_text: str, inp_text: str, inp_char_fills: list):
         s_c2 = len(src_text) if idx == len(runs) - 1 else (src_matches[i2].start() if i2 < len(src_matches) else len(src_text))
         t_c1 = 0 if idx == 0 else (inp_matches[j1].start() if j1 < len(inp_matches) else len(inp_text))
         t_c2 = len(inp_text) if idx == len(runs) - 1 else (inp_matches[j2].start() if j2 < len(inp_matches) else len(inp_text))
-        regions.append((fill_val, src_text[s_c1:s_c2], inp_text[t_c1:t_c2]))
-    return regions
+        out.append((fill_val, s_c1, s_c2, t_c1, t_c2))
+    return out
+
+
+def split_into_bg_regions(src_text: str, inp_text: str, inp_char_fills: list):
+    """
+    Align old library English (src_text) with new input English (inp_text)
+    and partition into [(fill_hex_or_None, src_segment, inp_segment), ...].
+    """
+    return [
+        (fill_val, src_text[s_c1:s_c2], inp_text[t_c1:t_c2])
+        for fill_val, s_c1, s_c2, t_c1, t_c2 in split_into_bg_regions_with_offsets(src_text, inp_text, inp_char_fills)
+    ]
 
 
 # Fine-grained tokenizer keeping you(pl)/you(s)/God's together while splitting punctuation & spaces
@@ -2275,8 +2800,25 @@ WORD_EXTRACT_RE = re.compile(r"[A-Za-z0-9]+(?:[’'][A-Za-z0-9]+)*(?:-[A-Za-z0-9
 HARD_DELIMS = {",", ";", ":", ".", "?", "!", "—", "”"}
 OPEN_BRACKETS = {"(", "（", "["}
 CLOSE_BRACKETS = {")", "）", "]"}
-SUBCLAUSE_CONJ = {"and", "or", "but", "yet", "while", "nor"}
+SUBCLAUSE_CONJ = {
+    "and", "or", "but", "yet", "while", "nor",
+    "because", "since", "although", "though", "unless", "whereas",
+}
+CLAUSE_PIVOT_WORDS = {
+    "that", "why", "because", "whether", "how", "where", "when",
+    "who", "whom", "whose", "which", "what",
+    "if", "unless", "since", "although", "though", "while", "whereas",
+}
 PREPOSITIONS = {"of", "in", "to", "for", "with", "on", "at", "from", "by", "between", "among", "into"}
+_RV_FUNC_STOPWORDS = frozenset({
+    "a", "an", "the", "is", "are", "was", "were", "be", "been", "being",
+    "to", "of", "in", "on", "at", "for", "with", "by", "from", "as", "into",
+    "it", "its", "this", "that", "these", "those", "he", "him", "his", "she", "her",
+    "they", "them", "their", "you", "your", "yours", "we", "us", "our", "i", "me", "my",
+    "and", "or", "but", "not", "no", "nor", "so", "if", "when", "than", "up", "out",
+    "do", "does", "did", "has", "have", "had", "will", "would", "can", "could",
+    "shall", "should", "may", "might", "must", "there", "here", "who", "whom", "which",
+})
 
 
 def segment_diff_into_sentences(ops: list) -> list:
@@ -2329,6 +2871,19 @@ def segment_diff_into_sentences(ops: list) -> list:
     return sentences
 
 
+def _extract_content_word_set(s: str) -> set:
+    pron_re = PRON_TAG_RE
+    out = set()
+    for m in WORD_EXTRACT_RE.finditer(s or ""):
+        w = m.group(0).lower()
+        pm = pron_re.match(w)
+        if pm:
+            w = pm.group(1).lower()
+        if len(w) >= 3 and w not in _RV_FUNC_STOPWORDS:
+            out.add(w)
+    return out
+
+
 def sentence_unit_stats(sent_ops: list) -> dict:
     has_edit = any(k in ("del", "ins") and not t.isspace() for k, t in sent_ops)
     old_txt = "".join(t for k, t in sent_ops if k in ("eq", "del"))
@@ -2343,17 +2898,52 @@ def sentence_unit_stats(sent_ops: list) -> dict:
     total_new_words = max(1, eq_words + ins_words)
     change_ratio = round(max(del_words, ins_words) / total_new_words, 3)
     edit_hunks = sum(1 for idx, (k, _) in enumerate(sent_ops) if k in ("del", "ins") and (idx == 0 or sent_ops[idx - 1][0] == "eq"))
+
+    # Compute max consecutive unchanged ('eq') words (unbroken by any non-space edit)
+    max_consec_eq_words = 0
+    cur_consec_eq = 0
+    for k, t in sent_ops:
+        if k == "eq":
+            w_cnt = len(re.findall(r"[A-Za-z0-9’']+", t))
+            cur_consec_eq += w_cnt
+            if cur_consec_eq > max_consec_eq_words:
+                max_consec_eq_words = cur_consec_eq
+        elif not t.isspace():
+            cur_consec_eq = 0
+
+    old_cw = _extract_content_word_set(old_txt)
+    new_cw = _extract_content_word_set(new_txt)
+    shared_content_words = len(old_cw & new_cw)
+
     return {
         "has_edit": has_edit,
         "old_text": old_txt.strip(),
         "new_text": new_txt.strip(),
         "diff_preview": preview.strip(),
+        "eq_words": eq_words,
         "new_words": eq_words + ins_words,
         "del_words": del_words,
         "ins_words": ins_words,
+        "shared_content_words": shared_content_words,
+        "max_consec_eq_words": max_consec_eq_words,
         "change_ratio": change_ratio,
         "edit_hunks": edit_hunks,
     }
+
+
+def is_strict_rv_sentence(stats: dict) -> bool:
+    """
+    Item 8.2 Strict 1–2 Sentence Cyan (`RV`) Criterion:
+    Mark a sentence `"cyan"` (`RV`) ONLY when pre-edit vs post-edit shares at most 3 content words
+    (or `eq_words <= 3`) AND `change_ratio >= 0.75` with NO intact unchanged clause of `>= 5` consecutive `eq` words!
+    """
+    if not stats.get("has_edit"):
+        return False
+    eq_w = int(stats.get("eq_words", 0))
+    shared_cw = int(stats.get("shared_content_words", eq_w))
+    max_consec = int(stats.get("max_consec_eq_words", eq_w))
+    ratio = float(stats.get("change_ratio", 0.0))
+    return (shared_cw <= 3 or eq_w <= 3) and ratio >= 0.75 and max_consec < 5
 
 
 def _extract_words_lower(s: str) -> list:
@@ -2365,14 +2955,17 @@ def _count_ops_words(ops_slice: list) -> int:
     return count_msword_en_words(txt)
 
 
-def compute_precision_yellow(ops: list) -> list:
+def compute_precision_yellow(ops: list, max_gap_words: int = 3) -> list:
     """
     Given diff ops [(kind, text), ...] for a contiguous non-cyan block inside a shaded region,
-    return [(kind, text, 'yellow'|None), ...] implementing the 5 precision rules:
-      1. Pure punctuation / case-after-punct edits -> 3-word window around edit.
-      2. Long clauses (>12 words) with localized edit -> split at intact conjunction sub-clauses (>=5w each side).
-      3. Tighten after unchanged/inserted ':' or ';', restrict parenthetical edits to '(...)', stop at cluster-ending delimiters.
-      4. Bridge fragmented internal gaps when surrounding yellow spans outnumber unmarked internal gaps (outer ends untouched).
+    return [(kind, text, 'yellow'|None), ...] implementing the v1.8 precision rules:
+      - 8.1 Colon Boundary Rule:
+          * Pure punctuation swap (`.` / `,` / `;` -> `:`) with unchanged word before `:` -> NEVER expand backward before `:`;
+            highlight starts from `:` onward (`: Flowers...`, or 3-word forward window if nothing after `:` changed).
+          * Word modified into / together with `:` (e.g. `flower that` -> `flower:`) -> expand backward to sentence start!
+      - 8.2 Half-sentence / clause & sub-clause splitting (`>= 4` words on each side, including `,` and cleft/complementizer pivots).
+      - 8.3 Configurable `max_gap_words` (default `3`): unconditionally bridge any two yellow spans separated by
+            `1 <= g_words <= max_gap_words` English words (even across `.` or `Thus,`), without bridging gaps `> max_gap_words`.
     """
     n = len(ops)
     if n == 0:
@@ -2380,8 +2973,8 @@ def compute_precision_yellow(ops: list) -> list:
 
     hl = [False] * n
 
-    # Step A: Identify edit clusters
-    clusters = []
+    # Step A: Identify raw edit clusters
+    raw_clusters = []
     i = 0
     while i < n:
         if ops[i][0] in ("del", "ins") and not ops[i][1].isspace():
@@ -2413,40 +3006,115 @@ def compute_precision_yellow(ops: list) -> list:
                     end = end + 2
                     continue
                 break
-            clusters.append((start, end))
+            raw_clusters.append((start, end))
             i = end + 1
         else:
             i += 1
 
-    if not clusters:
+    if not raw_clusters:
         return [(k, t, None) for k, t in ops]
 
     cluster_infos = []
-    for s, e in clusters:
+    for s, e in raw_clusters:
         del_txt = "".join(ops[k][1] for k in range(s, e + 1) if ops[k][0] == "del")
         ins_txt = "".join(ops[k][1] for k in range(s, e + 1) if ops[k][0] == "ins")
         ctype = "punct_only" if _extract_words_lower(del_txt) == _extract_words_lower(ins_txt) else "word_edit"
-        cluster_infos.append({"start": s, "end": e, "type": ctype, "del_txt": del_txt, "ins_txt": ins_txt})
+        colon_mode = None
+        adj_eq_colon = (e + 1 < n and ops[e + 1] == ("eq", ":"))
+        if ctype == "word_edit" and (":" in ins_txt or ":" in del_txt or adj_eq_colon):
+            colon_mode = "word_colon_expand_sent"
+        cluster_infos.append({
+            "start": s,
+            "end": e,
+            "type": ctype,
+            "del_txt": del_txt,
+            "ins_txt": ins_txt,
+            "colon_mode": colon_mode,
+        })
 
-    # Rule 3a: Newly inserted ':'/';'/',' immediately preceding a word edit should NOT trigger a 3-word window before ':'
+    # Step A2: Item 8.1 Colon Disambiguation (pure `.`/`,`/`;` -> `:` swap vs word-modified-with-colon)
+    merged_infos = []
+    idx_c = 0
+    while idx_c < len(cluster_infos):
+        ci = cluster_infos[idx_c]
+        if ci["type"] == "punct_only" and ci["ins_txt"].strip() == ":":
+            prev_non_ws = ci["start"] - 1
+            while prev_non_ws >= 0 and ops[prev_non_ws][0] == "eq" and ops[prev_non_ws][1].isspace():
+                prev_non_ws -= 1
+            prev_word_unchanged = (prev_non_ws < 0) or (ops[prev_non_ws][0] == "eq")
+            old_was_punct = ci["del_txt"].strip() in (".", ",", ";", "—", "–", "!", "?")
+
+            if old_was_punct and prev_word_unchanged:
+                ci["colon_mode"] = "pure_punct_colon"
+                merged_infos.append(ci)
+                idx_c += 1
+                continue
+
+            # Not a pure punct->colon swap (e.g. `flower that blooms` -> `flower: It blooms` where `:` inserted before space + word edit)
+            if idx_c + 1 < len(cluster_infos):
+                nxt = cluster_infos[idx_c + 1]
+                between = ops[ci["end"] + 1 : nxt["start"]]
+                if nxt["type"] == "word_edit" and all(k == "eq" and t.isspace() for k, t in between):
+                    new_s, new_e = ci["start"], nxt["end"]
+                    merged_infos.append({
+                        "start": new_s,
+                        "end": new_e,
+                        "type": "word_edit",
+                        "del_txt": "".join(ops[k][1] for k in range(new_s, new_e + 1) if ops[k][0] == "del"),
+                        "ins_txt": "".join(ops[k][1] for k in range(new_s, new_e + 1) if ops[k][0] == "ins"),
+                        "colon_mode": "word_colon_expand_sent",
+                    })
+                    idx_c += 2
+                    continue
+            if merged_infos and merged_infos[-1]["type"] == "word_edit":
+                prv = merged_infos[-1]
+                between = ops[prv["end"] + 1 : ci["start"]]
+                if all(k == "eq" and t.isspace() for k, t in between):
+                    new_s, new_e = prv["start"], ci["end"]
+                    merged_infos[-1] = {
+                        "start": new_s,
+                        "end": new_e,
+                        "type": "word_edit",
+                        "del_txt": "".join(ops[k][1] for k in range(new_s, new_e + 1) if ops[k][0] == "del"),
+                        "ins_txt": "".join(ops[k][1] for k in range(new_s, new_e + 1) if ops[k][0] == "ins"),
+                        "colon_mode": "word_colon_expand_sent",
+                    }
+                    idx_c += 1
+                    continue
+            # Pure newly inserted `:` with unchanged surrounding words -> treat like forward colon window (no expansion before `:`)
+            ci["colon_mode"] = "pure_punct_colon"
+            merged_infos.append(ci)
+            idx_c += 1
+            continue
+
+        merged_infos.append(ci)
+        idx_c += 1
+
+    cluster_infos = merged_infos
+
+    # Rule 3a: Newly inserted ';'/',' immediately preceding a word edit should NOT trigger a 3-word window before ';'/','
     for idx_c, ci in enumerate(cluster_infos):
-        if ci["type"] == "punct_only" and ci["ins_txt"].strip() in (":", ";", ",") and idx_c + 1 < len(cluster_infos):
+        if ci["type"] == "punct_only" and ci["ins_txt"].strip() in (";", ",") and idx_c + 1 < len(cluster_infos):
             nxt = cluster_infos[idx_c + 1]
             between = ops[ci["end"] + 1 : nxt["start"]]
             if nxt["type"] == "word_edit" and all(k == "eq" and t.isspace() for k, t in between):
                 ci["type"] = "leading_delim_skip"
 
-    # Pass 1: Expand 'word_edit' clusters to tight clause / parentheses / conjunction boundaries (Rules 2 & 3)
+    # Pass 1: Expand 'word_edit' clusters to tight clause / parentheses / conjunction boundaries (Items 8.1 & 8.2)
+    SENT_START_STOP_DELIMS = {".", "?", "!", "”", "\n"}
     for ci in cluster_infos:
         if ci["type"] != "word_edit":
             continue
         s, e = ci["start"], ci["end"]
+        expand_to_sent_start = (ci.get("colon_mode") == "word_colon_expand_sent")
 
         L = s
         paren_depth = 0
         while L > 0:
             pk, pt = ops[L - 1]
             if pk == "eq":
+                if "\n" in pt:
+                    break
                 if pt in CLOSE_BRACKETS:
                     paren_depth += 1
                 elif pt in OPEN_BRACKETS:
@@ -2455,12 +3123,17 @@ def compute_precision_yellow(ops: list) -> list:
                     else:
                         L -= 1
                         break
-                elif paren_depth == 0 and pt in HARD_DELIMS:
-                    break
-                elif paren_depth == 0 and pt in ("“",):
-                    break
+                elif paren_depth == 0:
+                    if expand_to_sent_start:
+                        if pt in SENT_START_STOP_DELIMS or pt in ("“",):
+                            break
+                    else:
+                        if pt in HARD_DELIMS or pt in ("“",):
+                            break
             elif pk in ("del", "ins"):
-                if pt.strip() in (":", ";"):
+                if not expand_to_sent_start and pt.strip() in (":", ";"):
+                    break
+                if expand_to_sent_start and any(ch in pt for ch in ".?!\n"):
                     break
             L -= 1
 
@@ -2474,6 +3147,8 @@ def compute_precision_yellow(ops: list) -> list:
             while R + 1 < n:
                 nk, nt = ops[R + 1]
                 if nk == "eq":
+                    if "\n" in nt:
+                        break
                     if nt in OPEN_BRACKETS:
                         if not started_at_open_paren and paren_depth == 0:
                             break
@@ -2496,9 +3171,17 @@ def compute_precision_yellow(ops: list) -> list:
         while R > e and ops[R][0] == "eq" and ops[R][1].isspace():
             R -= 1
 
-        # Rule 2: Conjunction sub-splitting for long clauses (> 12 words)
-        if _count_ops_words(ops[L : R + 1]) > 12:
+        # Item 8.2: Sub-clause & Cleft/Complementizer Half-Sentence Splitting (`>= 4` words on intact side)
+        if _count_ops_words(ops[L : R + 1]) >= 8:
             best_L, best_R = L, R
+            in_range_wes = [
+                ci2 for ci2 in cluster_infos
+                if ci2["type"] == "word_edit" and L <= ci2["start"] and ci2["end"] <= R
+            ]
+            first_we_s = min((c["start"] for c in in_range_wes), default=s)
+            last_we_e = max((c["end"] for c in in_range_wes), default=e)
+
+            # 2A. Conjunction sub-splitting (`and`, `or`, `but`, `yet`, `while`, `nor`, `because`, `since`, `although`, `though`, ...)
             p_depth = 0
             for k_idx in range(L, R + 1):
                 ok, ot = ops[k_idx]
@@ -2519,34 +3202,89 @@ def compute_precision_yellow(ops: list) -> list:
                             continue
                         w_left = _count_ops_words(ops[best_L:k_idx])
                         w_right = _count_ops_words(ops[k_idx : best_R + 1])
-                        if w_left >= 5 and w_right >= 5:
-                            if k_idx > e:
-                                has_other = any(
-                                    ci2["type"] == "word_edit" and k_idx <= ci2["start"] <= best_R
-                                    for ci2 in cluster_infos
-                                )
-                                if not has_other:
-                                    best_R = k_idx - 1
-                                    while best_R > e and ops[best_R][0] == "eq" and ops[best_R][1].isspace():
-                                        best_R -= 1
-                                    break
-                            elif k_idx < s:
-                                has_other = any(
-                                    ci2["type"] == "word_edit" and best_L <= ci2["end"] <= k_idx
-                                    for ci2 in cluster_infos
-                                )
-                                if not has_other:
-                                    best_L = k_idx
+                        if w_left >= 4 and w_right >= 4:
+                            if k_idx > last_we_e:
+                                best_R = k_idx - 1
+                                while best_R > last_we_e and ops[best_R][0] == "eq" and ops[best_R][1].isspace():
+                                    best_R -= 1
+                                break
+                            elif k_idx < first_we_s and not expand_to_sent_start:
+                                best_L = k_idx
+
+            # 2B. Cleft / Complementizer / Clause-Linker Split (e.g. `{-It-} {+This+} is {-for these reasons that-} {+why+} such people...`)
+            if last_we_e < best_R:
+                tail_slice = ops[last_we_e + 1 : best_R + 1]
+                if all(k == "eq" for k, _ in tail_slice):
+                    tail_words = _extract_words_lower("".join(t for _, t in tail_slice))
+                    head_new_w = _count_ops_words(ops[best_L : last_we_e + 1])
+                    last_ci = max(in_range_wes, key=lambda c: c["end"]) if in_range_wes else ci
+                    last_ins_words = _extract_words_lower(last_ci["ins_txt"])
+                    last_del_words = _extract_words_lower(last_ci["del_txt"])
+                    ended_at_pivot = (
+                        (bool(last_ins_words) and last_ins_words[-1] in CLAUSE_PIVOT_WORDS)
+                        or (bool(last_del_words) and last_del_words[-1] in CLAUSE_PIVOT_WORDS)
+                    )
+                    if ended_at_pivot and head_new_w >= 2 and len(tail_words) >= 4:
+                        best_R = last_we_e
+                    elif tail_words and tail_words[0] in CLAUSE_PIVOT_WORDS and head_new_w >= 2 and len(tail_words) >= 5:
+                        # Pivot word is the first unchanged token right after the edited matrix clause
+                        piv_idx = last_we_e + 1
+                        while piv_idx <= best_R and ops[piv_idx][1].isspace():
+                            piv_idx += 1
+                        if piv_idx <= best_R:
+                            best_R = piv_idx - 1
+                            while best_R > last_we_e and ops[best_R][0] == "eq" and ops[best_R][1].isspace():
+                                best_R -= 1
+
+            if best_L < first_we_s and not expand_to_sent_start:
+                head_slice = ops[best_L:first_we_s]
+                if all(k == "eq" for k, _ in head_slice):
+                    head_words = _extract_words_lower("".join(t for _, t in head_slice))
+                    right_new_w = _count_ops_words(ops[first_we_s : best_R + 1])
+                    if len(head_words) >= 3 and head_words[-1] in CLAUSE_PIVOT_WORDS and right_new_w >= 4:
+                        best_L = first_we_s
+                        while best_L < last_we_e and ops[best_L][0] == "eq" and ops[best_L][1].isspace():
+                            best_L += 1
+
             L, R = best_L, best_R
 
         for k_idx in range(L, R + 1):
             hl[k_idx] = True
 
-    # Pass 2: Rule 1 — 3-word window around pure punctuation mismatches
+    # Pass 2: Rule 1 — 3-word window around pure punctuation mismatches (+ Item 8.1 forward-only colon rule)
     for ci in cluster_infos:
         if ci["type"] != "punct_only":
             continue
         s, e = ci["start"], ci["end"]
+
+        if ci.get("colon_mode") == "pure_punct_colon":
+            # NEVER expand backward before `:`!
+            nxt_k = e + 1
+            while nxt_k < n and ops[nxt_k][0] == "eq" and ops[nxt_k][1].isspace() and "\n" not in ops[nxt_k][1]:
+                nxt_k += 1
+            if nxt_k < n and hl[nxt_k]:
+                for k_idx in range(s, nxt_k + 1):
+                    hl[k_idx] = True
+            else:
+                L, R = s, e
+                need_right = 3
+                while R + 1 < n and need_right > 0:
+                    if "\n" in ops[R + 1][1]:
+                        break
+                    R += 1
+                    if ops[R][0] != "del" and is_word_token(ops[R][1]):
+                        need_right -= 1
+                if _count_ops_words(ops[s : R + 1]) == 0:
+                    # Edge fallback only if `:` is at the very end of paragraph with 0 words after it
+                    need_left = 2
+                    while L > 0 and need_left > 0:
+                        L -= 1
+                        if ops[L][0] != "del" and is_word_token(ops[L][1]):
+                            need_left -= 1
+                for k_idx in range(L, R + 1):
+                    hl[k_idx] = True
+            continue
+
         inner_words = _count_ops_words(ops[s : e + 1])
         L, R = s, e
         need_left = 1
@@ -2562,15 +3300,46 @@ def compute_precision_yellow(ops: list) -> list:
         for k_idx in range(L, R + 1):
             hl[k_idx] = True
 
-    # Bridge pure whitespace between already-highlighted tokens
+    # Absorb sentence-initial 1-word discourse conjunction + comma (`But, `, `Yet, `, `And, `) into edited first clause
+    # ONLY when there is NO highlighted token before that sentence (never touching gaps between two yellow spans!)
+    first_hl = next((idx for idx, flag in enumerate(hl) if flag), -1)
+    if first_hl >= 2:
+        lead_end = first_hl
+        while lead_end > 0 and ops[lead_end - 1][0] == "eq" and ops[lead_end - 1][1].isspace():
+            lead_end -= 1
+        if lead_end >= 2 and ops[lead_end - 1] == ("eq", ","):
+            w_idx = lead_end - 2
+            if ops[w_idx][0] == "eq" and ops[w_idx][1].lower() in ("but", "yet", "and", "so"):
+                at_sent_start = (w_idx == 0) or (
+                    ops[w_idx - 1][0] == "eq"
+                    and (
+                        "\n" in ops[w_idx - 1][1]
+                        or ops[w_idx - 1][1] in SENT_START_STOP_DELIMS
+                        or (
+                            ops[w_idx - 1][1].isspace()
+                            and (w_idx - 2 < 0 or ops[w_idx - 2][1] in SENT_START_STOP_DELIMS or ops[w_idx - 2][1] == "“")
+                        )
+                    )
+                )
+                if at_sent_start:
+                    for k_idx in range(w_idx, first_hl):
+                        hl[k_idx] = True
+
+    # Bridge pure horizontal whitespace between already-highlighted tokens
     for k_idx in range(1, n - 1):
-        if not hl[k_idx] and ops[k_idx][0] == "eq" and ops[k_idx][1].isspace() and hl[k_idx - 1] and hl[k_idx + 1]:
+        if (
+            not hl[k_idx]
+            and ops[k_idx][0] == "eq"
+            and ops[k_idx][1].isspace()
+            and "\n" not in ops[k_idx][1]
+            and hl[k_idx - 1]
+            and hl[k_idx + 1]
+        ):
             hl[k_idx] = True
 
-    # Pass 3: Rule 4 — Anti-fragmentation gap bridging (internal gaps only; outer ends never expanded)
-    changed = True
-    while changed:
-        changed = False
+    # Pass 3: Item 8.3 — Configurable `max_gap_words` Yellow Gap Bridging (unconditional when `g_words <= max_gap_words`)
+    eff_gap_limit = max(0, int(max_gap_words if max_gap_words is not None else 3))
+    if eff_gap_limit > 0:
         spans = []
         cur_val = hl[0]
         st = 0
@@ -2581,71 +3350,114 @@ def compute_precision_yellow(ops: list) -> list:
                 st = k_idx
         spans.append((cur_val, st, n - 1, _count_ops_words(ops[st:n])))
 
-        def _is_new_sent_comma_clause(idx_sp: int) -> bool:
-            _, gs, ge, _ = spans[idx_sp]
-            prev_end = "".join(t for k, t in ops[spans[idx_sp - 1][1] : spans[idx_sp - 1][2] + 1] if k in ("eq", "ins")).rstrip("”’\"') ")
-            g_txt = "".join(t for k, t in ops[gs : ge + 1] if k in ("eq", "ins")).strip()
-            return (
-                bool(prev_end) and prev_end[-1] in ".?!"
-                and bool(g_txt) and g_txt[-1] in (",", ";")
-                and not any(ch in g_txt for ch in ".?!")
-            )
-
         for sp_i in range(1, len(spans) - 1):
             is_h, g_s, g_e, g_words = spans[sp_i]
             if is_h:
                 continue
-            left_w = spans[sp_i - 1][3]
-            right_w = spans[sp_i + 1][3]
-            # Condition A1: Micro-gap (<= 4 words, e.g. '“God,' or 'I swear to You(s):') tightly sandwiched between yellow spans
-            if (
-                not _is_new_sent_comma_clause(sp_i)
-                and g_words <= 4
-                and (left_w + right_w) >= max(8, g_words * 3)
-                and max(left_w, right_w) >= 4
-            ):
+            gap_txt = "".join(t for k, t in ops[g_s : g_e + 1] if k in ("eq", "ins"))
+            if "\n" in gap_txt:
+                continue
+            if g_words <= eff_gap_limit:
                 for k_idx in range(g_s, g_e + 1):
                     hl[k_idx] = True
-                changed = True
-                break
-            # Condition A2: Intra-sentence or short whole-sentence gap (<= 10 words, e.g. 'sin does not represent God, and God is sinless.')
-            # Never bridge across a sentence break (.?!) into an unchanged opening comma/semicolon clause of the next sentence!
-            if (
-                not _is_new_sent_comma_clause(sp_i)
-                and g_words <= 10
-                and min(left_w, right_w) >= 4
-                and (left_w + right_w) >= max(14, g_words * 3)
-            ):
-                for k_idx in range(g_s, g_e + 1):
-                    hl[k_idx] = True
-                changed = True
-                break
-
-        if not changed and len(spans) >= 7:
-            true_indices = [idx_sp for idx_sp, sp in enumerate(spans) if sp[0]]
-            for a_i in range(len(true_indices)):
-                for b_i in range(len(true_indices) - 1, a_i + 2, -1):
-                    si, sj = true_indices[a_i], true_indices[b_i]
-                    sub_indices = list(range(si, sj + 1))
-                    if any(not spans[idx_s][0] and _is_new_sent_comma_clause(idx_s) for idx_s in sub_indices):
-                        continue
-                    sub = [spans[idx_s] for idx_s in sub_indices]
-                    false_gaps = [sp[3] for sp in sub if not sp[0]]
-                    if not false_gaps or max(false_gaps) > 15:
-                        continue
-                    y_sum = sum(sp[3] for sp in sub if sp[0])
-                    u_sum = sum(false_gaps)
-                    if y_sum >= max(30, u_sum * 2.2):
-                        for sp in sub:
-                            if not sp[0]:
-                                for k_idx in range(sp[1], sp[2] + 1):
-                                    hl[k_idx] = True
-                        changed = True
-                        break
-                if changed:
-                    break
 
     return [(ops[k][0], ops[k][1], "yellow" if hl[k] else None) for k in range(n)]
+
+
+def should_promote_region_to_cyan(sents: list, actions: list = None, max_gap_words: int = 3) -> bool:
+    """
+    Item 8.4 Whole-Paragraph Cyan (`RV`) Promotion When Entire Paragraph Is Fragmented ("花掉"):
+    For a quoted region / paragraph with `>= 4` sentences, if:
+      - unedited sentences (`not has_edit`) count is `<= 2`, AND
+      - edited sentence ratio is `>= 0.75`, AND
+      - (`total_edit_hunks >= 12` OR (`hl_word_coverage >= 0.60` with `>= 6` separate edit clusters)),
+    return True so all sentences in that region promote to `"cyan"` (`RV`).
+    """
+    total_sents = len(sents or ())
+    if total_sents < 4:
+        return False
+
+    eff_actions = (
+        list(actions)
+        if (actions is not None and len(actions) == total_sents)
+        else [s.get("suggested_action", "yellow" if s.get("has_edit") else "none") for s in sents]
+    )
+
+    unedited_cnt = sum(1 for idx, s in enumerate(sents) if not s.get("has_edit") or eff_actions[idx] == "none")
+    if unedited_cnt > 2:
+        return False
+
+    edited_cnt = total_sents - unedited_cnt
+    if (edited_cnt / total_sents) < 0.75:
+        return False
+
+    total_hunks = 0
+    combined_ops = []
+    for s in sents:
+        s_ops = s.get("ops") or []
+        combined_ops.extend(s_ops)
+        if "edit_hunks" in s:
+            total_hunks += int(s["edit_hunks"])
+        else:
+            total_hunks += sum(
+                1 for idx, (k, _) in enumerate(s_ops)
+                if k in ("del", "ins") and (idx == 0 or s_ops[idx - 1][0] == "eq")
+            )
+
+    if total_hunks >= 12:
+        return True
+
+    # Count separate edit clusters across combined_ops and compute yellow+cyan word coverage
+    edit_clusters = 0
+    in_cl = False
+    for k, t in combined_ops:
+        if k in ("del", "ins") and not t.isspace():
+            if not in_cl:
+                edit_clusters += 1
+                in_cl = True
+        elif k == "eq" and not t.isspace():
+            in_cl = False
+
+    if edit_clusters < 6:
+        return False
+
+    total_words = 0
+    hl_words = 0
+    idx_s = 0
+    while idx_s < total_sents:
+        if eff_actions[idx_s] == "cyan":
+            c_ops = []
+            while idx_s < total_sents and eff_actions[idx_s] == "cyan":
+                c_ops.extend(sents[idx_s].get("ops") or [])
+                idx_s += 1
+            w_c = _count_ops_words(c_ops)
+            total_words += w_c
+            hl_words += w_c
+        else:
+            nc_ops = []
+            while idx_s < total_sents and eff_actions[idx_s] != "cyan":
+                s_obj = sents[idx_s]
+                act = eff_actions[idx_s]
+                if not s_obj.get("has_edit") or act == "none":
+                    for k, t in (s_obj.get("ops") or ()):
+                        if k != "del":
+                            nc_ops.append(("eq", t))
+                else:
+                    nc_ops.extend(s_obj.get("ops") or [])
+                idx_s += 1
+            total_words += _count_ops_words(nc_ops)
+            toks = compute_precision_yellow(nc_ops, max_gap_words=max_gap_words)
+            y_buf = []
+            for k, t, h in toks:
+                if k in ("eq", "ins"):
+                    if h == "yellow":
+                        y_buf.append(t)
+                    elif y_buf:
+                        y_buf.append(" ")
+            hl_words += count_msword_en_words("".join(y_buf))
+
+    coverage = hl_words / max(1, total_words)
+    return coverage >= 0.60
 
 
 def apply_clause_yellow_highlights(sent_ops: list) -> list:
@@ -2831,6 +3643,18 @@ def find_fuzzy_substring_span(haystack: str, needle: str, search_from: int = 0):
         elif ch in (",", "，", "、", "،"):
             pattern_parts.append(r"[,，、،]")
             i += 1
+        elif ch in (":", "："):
+            pattern_parts.append(r"[:：]")
+            i += 1
+        elif ch in ("!", "！"):
+            pattern_parts.append(r"[!！]")
+            i += 1
+        elif ch in ("(", "（"):
+            pattern_parts.append(r"[(（]")
+            i += 1
+        elif ch in (")", "）"):
+            pattern_parts.append(r"[)）]")
+            i += 1
         else:
             pattern_parts.append(re.escape(ch))
             i += 1
@@ -2845,11 +3669,24 @@ def find_fuzzy_substring_span(haystack: str, needle: str, search_from: int = 0):
     return None
 
 
+def strip_all_highlights_in_cell(tc: ET.Element) -> int:
+    """Remove all <w:highlight> elements inside `tc` (across runs and pPr/rPr). Returns count removed."""
+    if tc is None:
+        return 0
+    removed = 0
+    for rpr in tc.findall(f".//{W}rPr"):
+        for hl in list(rpr.findall(f"{W}highlight")):
+            rpr.remove(hl)
+            removed += 1
+    return removed
+
+
 def apply_highlights_to_col3_cell(tc: ET.Element, char_spans: list):
     """
-    Apply character-offset highlights [(start, end, hl_color), ...] onto existing runs of tc
+    Apply character-offset highlights [(start, end, hl_color), ...] onto existing runs of `tc`
+    (works identically for Col 1 Chinese `yellow`/`cyan` AND Col 3 Foreign `yellow`/`lightGray`)
     WITHOUT adding extra line breaks/paragraph splits, preserving original run rPr formatting
-    and any Word comment markers (<w:commentRangeStart>, <w:commentRangeEnd>, <w:commentReference>).
+    (font, size, color, shading, bold/italic) and Word comment markers.
     """
     if not char_spans:
         return
@@ -2862,14 +3699,19 @@ def apply_highlights_to_col3_cell(tc: ET.Element, char_spans: list):
             char_hl[idx] = color
 
     global_offset = 0
-    paragraphs = tc.findall("w:p", NS)
-    for p_i, p in enumerate(paragraphs):
-        if p_i > 0:
-            global_offset += 1  # accounts for '\n' between paragraphs in get_cell_plain_text
+
+    def _rewrite_container(container: ET.Element):
+        nonlocal global_offset
         new_children = []
-        for ch in list(p):
-            local = ch.tag.split("}")[-1]
+        for ch in list(container):
+            local = _local_name(ch.tag)
+            ns = _ns_uri(ch.tag)
+            if ns != W_URI or local in ("pPr", "del", "moveFrom", "rPrChange", "pPrChange"):
+                new_children.append(ch)
+                continue
             if local != "r":
+                if ch.find(f".//{W}t") is not None:
+                    _rewrite_container(ch)
                 new_children.append(ch)
                 continue
             r_text = "".join(t.text or "" for t in ch.findall("w:t", NS))
@@ -2884,6 +3726,8 @@ def apply_highlights_to_col3_cell(tc: ET.Element, char_spans: list):
             ]
             r_len = len(r_text)
             r_hls = char_hl[global_offset: global_offset + r_len]
+            if len(r_hls) < r_len:
+                r_hls = r_hls + [None] * (r_len - len(r_hls))
             global_offset += r_len
 
             # Group contiguous characters with same highlight inside this run
@@ -2911,10 +3755,16 @@ def apply_highlights_to_col3_cell(tc: ET.Element, char_spans: list):
                     cref_r.insert(0, build_rpr(base_rPr, highlight=None, shd_fill=None))
                 new_children.append(cref_r)
 
-        for ch in list(p):
-            p.remove(ch)
+        for ch in list(container):
+            container.remove(ch)
         for ch in new_children:
-            p.append(ch)
+            container.append(ch)
+
+    paragraphs = tc.findall("w:p", NS)
+    for p_i, p in enumerate(paragraphs):
+        if p_i > 0:
+            global_offset += 1  # accounts for '\n' between paragraphs in get_cell_plain_text
+        _rewrite_container(p)
 
 
 # ==============================================================================
