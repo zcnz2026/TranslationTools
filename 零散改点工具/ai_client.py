@@ -676,8 +676,8 @@ _GREEK_RE = re.compile(r"[\u0370-\u03FF\u1F00-\u1FFF]")
 _EN_WORD_RE = re.compile(r"[A-Za-z0-9]+(?:[’'][A-Za-z0-9]+)*(?:-[A-Za-z0-9]+)*")
 _DIGIT_TOKEN_RE = re.compile(r"\d+(?:[:.]\d+)*")
 
-_CLOSING_TRAILERS = frozenset('”’"\'»›」』)）]】〕}')
-_OPENING_LEADERS = frozenset('“‘"\'«‹「『(（[【〔{„‚')
+_CLOSING_TRAILERS = frozenset('”’"\'»›」』)）]】〕}》〉')
+_OPENING_LEADERS = frozenset('“‘"\'«‹「『(（[【〔{„‚《〈')
 _PREPOSED_VOWELS = frozenset(
     "\u0e40\u0e41\u0e42\u0e43\u0e44"  # Thai เ แ โ ใ ไ
     "\u0ec0\u0ec1\u0ec2\u0ec3\u0ec4"  # Lao ເ ແ ໂ ໃ ໄ
@@ -792,6 +792,9 @@ def _split_clauses_ranges(text: str, s: int, e: int, is_english: bool = False) -
                 i += 1
                 continue
             j = i + 1
+            if ch in ("—", "–"):
+                while j < e and text[j] in ("—", "–"):
+                    j += 1
             while j < e and text[j] in _CLOSING_TRAILERS:
                 j += 1
             cs, ce = _trim_range(text, c_start, j)
@@ -897,6 +900,21 @@ def _reconstruct_fallback_old_en(spans: List[dict]) -> str:
     return "".join(chunks).strip()
 
 
+def _call_find_fuzzy(
+    find_fuzzy_fn: Callable,
+    haystack: str,
+    needle: str,
+    search_from: int = 0,
+) -> Optional[Tuple[int, int]]:
+    try:
+        return find_fuzzy_fn(haystack, needle, search_from=search_from)
+    except TypeError:
+        try:
+            return find_fuzzy_fn(haystack, needle, search_from)
+        except TypeError:
+            return find_fuzzy_fn(haystack, needle)
+
+
 def _locate_span_in_old_en(
     old_en_full: str,
     sp: dict,
@@ -933,7 +951,7 @@ def _locate_span_in_old_en(
         pos = old_en_full.find(piece, en_cursor)
         if pos != -1:
             return pos, pos + len(piece)
-        loc = find_fuzzy_fn(old_en_full, piece, search_from=en_cursor)
+        loc = _call_find_fuzzy(find_fuzzy_fn, old_en_full, piece, search_from=en_cursor)
         if loc is not None and loc[0] >= en_cursor:
             return loc[0], loc[1]
         if loc is not None:
@@ -1335,7 +1353,7 @@ def local_align_col3_spans(
             sub = col3_text[rem_s:rem_e].strip()
 
         if sub:
-            loc = find_fuzzy_fn(col3_text, sub, search_from=cursor)
+            loc = _call_find_fuzzy(find_fuzzy_fn, col3_text, sub, search_from=cursor)
             if loc is not None and loc[0] >= cursor:
                 result[sid] = col3_text[loc[0] : loc[1]]
                 cursor = loc[1]
@@ -1348,13 +1366,561 @@ def local_align_col3_spans(
     return result
 
 
+# ---------------- Offline / Fallback Col 1 (Chinese) Approximate Alignment ----------------
+
+_CN_LEADING_PUNCT = frozenset("，、。；：！？,.;:!?）》】」』”’")
+_CN_CLAUSE_DELIMS = frozenset("，、：；,:;")
+
+
+def _split_cn_sentences_ranges(text: str, include_semicolon: bool = True) -> List[Tuple[int, int]]:
+    """Split Chinese `text` into trimmed sentence ranges on `。？！\\n` (and `；;` when `include_semicolon=True`)."""
+    n = len(text)
+    if n == 0:
+        return []
+    active_terms = {"。", "？", "！", ".", "?", "!"}
+    if include_semicolon:
+        active_terms |= {"；", ";"}
+
+    ranges: List[Tuple[int, int]] = []
+    seg_start = 0
+    i = 0
+    while i < n:
+        ch = text[i]
+        if ch == "\n":
+            ts, te = _trim_range(text, seg_start, i)
+            if ts < te:
+                ranges.append((ts, te))
+            seg_start = i + 1
+            i += 1
+            continue
+        if ch in active_terms:
+            if ch == "." and i > 0 and i + 1 < n and text[i - 1].isdigit() and text[i + 1].isdigit():
+                i += 1
+                continue
+            j = i + 1
+            while j < n and text[j] in active_terms and text[j] != "\n":
+                j += 1
+            while j < n and text[j] in _CLOSING_TRAILERS:
+                j += 1
+            ts, te = _trim_range(text, seg_start, j)
+            if ts < te:
+                ranges.append((ts, te))
+            seg_start = j
+            i = j
+            continue
+        i += 1
+
+    ts, te = _trim_range(text, seg_start, n)
+    if ts < te:
+        ranges.append((ts, te))
+    return ranges
+
+
+def _split_cn_clauses_ranges(
+    text: str,
+    s: int,
+    e: int,
+    include_dunhao: bool = True,
+) -> List[Tuple[int, int]]:
+    """Split Chinese sentence `text[s:e]` into sub-clauses on `，：—–` (plus `、` when `include_dunhao=True`)."""
+    if s >= e:
+        return []
+    delims = {"，", "：", ",", ":", "—", "–"}
+    if include_dunhao:
+        delims.add("、")
+
+    clauses: List[Tuple[int, int]] = []
+    c_start = s
+    i = s
+    while i < e:
+        ch = text[i]
+        if ch in delims:
+            if ch in (":", ",") and i > s and i + 1 < e and text[i - 1].isdigit() and text[i + 1].isdigit():
+                i += 1
+                continue
+            j = i + 1
+            if ch in ("—", "–"):
+                while j < e and text[j] in ("—", "–"):
+                    j += 1
+            while j < e and text[j] in _CLOSING_TRAILERS:
+                j += 1
+            cs, ce = _trim_range(text, c_start, j)
+            if cs < ce:
+                clauses.append((cs, ce))
+            c_start = j
+            i = j
+            continue
+        i += 1
+
+    cs, ce = _trim_range(text, c_start, e)
+    if cs < ce:
+        clauses.append((cs, ce))
+    return clauses if clauses else [(s, e)]
+
+
+def _merge_short_en_lead_clauses(
+    en_text: str,
+    clauses: List[Tuple[int, int]],
+    target_count: int,
+) -> List[Tuple[int, int]]:
+    """
+    Merge 1–2 word introductory English discourse clauses (e.g. 'But,', 'However,', 'In fact,')
+    into the following clause when English has more comma splits than Chinese (`但就人而言，`).
+    """
+    merged = list(clauses)
+    idx = 0
+    while len(merged) > max(1, target_count) and idx + 1 < len(merged):
+        cs, ce = merged[idx]
+        w_cnt = len(_EN_WORD_RE.findall(en_text[cs:ce]))
+        if w_cnt <= 2:
+            merged[idx : idx + 2] = [(cs, merged[idx + 1][1])]
+        else:
+            idx += 1
+    return merged
+
+
+def _build_effective_en_for_col1(
+    old_en_full: str,
+    spans: List[dict],
+    find_fuzzy_fn: Callable,
+) -> Tuple[str, List[Tuple[int, int]]]:
+    """
+    Reconstruct effective English reference text (splicing `new_en` where available, falling back to
+    `old_en_in_col3` on pure deletions) together with exact monotonic `(start, end)` bounds per span,
+    so Col 1 (latest Chinese) aligns accurately against both replacements and pure insertions.
+    """
+    base_old = old_en_full if (old_en_full and old_en_full.strip()) else _reconstruct_fallback_old_en(spans)
+    if base_old:
+        orig_positions: List[Tuple[int, int]] = []
+        en_cur = 0
+        for idx, sp in enumerate(spans):
+            cs, ce = _locate_span_in_old_en(base_old, sp, en_cur, idx, len(spans), find_fuzzy_fn)
+            orig_positions.append((cs, ce))
+            en_cur = max(en_cur, ce)
+
+        parts: List[str] = []
+        eff_positions: List[Tuple[int, int]] = []
+        prev_end = 0
+        cur_len = 0
+        for idx, sp in enumerate(spans):
+            ocs, oce = orig_positions[idx]
+            ocs = max(prev_end, min(len(base_old), ocs))
+            oce = max(ocs, min(len(base_old), oce))
+
+            prefix_seg = base_old[prev_end:ocs]
+            if prefix_seg:
+                parts.append(prefix_seg)
+                cur_len += len(prefix_seg)
+
+            new_piece = (sp.get("new_en") or "").strip()
+            old_piece = (sp.get("old_en_in_col3") or "").strip()
+            eff_piece = new_piece if new_piece else old_piece
+
+            if ocs == oce and eff_piece:
+                if eff_piece[0] in ",;:" and parts:
+                    # Pure clause insertion at sentence end (e.g. 'domain.' + ', and ...') replaces trailing '.'
+                    stripped_prev = parts[-1].rstrip()
+                    if stripped_prev.endswith("."):
+                        ws_tail = parts[-1][len(stripped_prev) :]
+                        parts[-1] = stripped_prev[:-1] + ws_tail
+                        cur_len -= 1
+                prev_ch = parts[-1][-1] if parts and parts[-1] else ""
+                if prev_ch and not prev_ch.isspace() and eff_piece[0] not in ",.;:?!)]}”’\"'":
+                    parts.append(" ")
+                    cur_len += 1
+
+            sp_s = cur_len
+            if eff_piece:
+                parts.append(eff_piece)
+                cur_len += len(eff_piece)
+            sp_e = cur_len
+
+            if ocs == oce and eff_piece and oce < len(base_old):
+                next_ch = base_old[oce]
+                if not next_ch.isspace() and next_ch not in ",.;:?!)]}”’\"'":
+                    parts.append(" ")
+                    cur_len += 1
+
+            eff_positions.append((sp_s, sp_e))
+            prev_end = oce
+
+        tail_seg = base_old[prev_end:]
+        if tail_seg:
+            parts.append(tail_seg)
+        eff_en = "".join(parts)
+        if eff_en.strip():
+            return eff_en, eff_positions
+
+    # Synthetic fallback when only spans with `new_en` / `old_en_in_col3` were supplied
+    syn_parts: List[str] = []
+    syn_positions: List[Tuple[int, int]] = []
+    cur_len = 0
+    for idx, sp in enumerate(spans):
+        l_ctx = sp.get("left_old_context") or ""
+        mid = (sp.get("new_en") or "").strip() or (sp.get("old_en_in_col3") or "").strip() or "edit"
+        r_ctx = sp.get("right_old_context") or ""
+        if idx == 0 and l_ctx:
+            syn_parts.append(l_ctx)
+            cur_len += len(l_ctx)
+        if syn_parts and not syn_parts[-1].endswith((" ", "\n")) and mid[0] not in ",.;:?!":
+            syn_parts.append(" ")
+            cur_len += 1
+        s0 = cur_len
+        syn_parts.append(mid)
+        cur_len += len(mid)
+        s1 = cur_len
+        syn_positions.append((s0, s1))
+        if r_ctx:
+            if not r_ctx[0].isspace() and r_ctx[0] not in ",.;:?!":
+                syn_parts.append(" ")
+                cur_len += 1
+            syn_parts.append(r_ctx)
+            cur_len += len(r_ctx)
+    return "".join(syn_parts), syn_positions
+
+
+def _refine_cn_local_window_bounds(
+    col1_text: str,
+    cand_s: int,
+    cand_e: int,
+    min_s: int,
+    max_e: int,
+    en_span_slice: str,
+) -> Tuple[int, int]:
+    """Clean Chinese local UP window edges so punctuation/comma boundaries never leave 1-2 stray chars across a comma."""
+    s = max(min_s, min(max_e, cand_s))
+    e = max(s, min(max_e, cand_e))
+    en_trim = (en_span_slice or "").strip()
+    en_starts_punct = bool(en_trim and en_trim[0] in ":;,.")
+    en_ends_punct = bool(en_trim and en_trim[-1] in ",;:.")
+
+    # Do not begin a normal lexical CJK highlight on closing/mid punctuation
+    if not en_starts_punct:
+        while s < e and col1_text[s] in _CN_LEADING_PUNCT:
+            s += 1
+
+    # Never split in the middle of an ASCII word or number/verse token (e.g. '9:50' or '144,000')
+    while s > min_s and s < max_e and col1_text[s].isascii() and (col1_text[s].isalnum() or col1_text[s] in ":.") and col1_text[s - 1].isascii() and col1_text[s - 1].isalnum():
+        s -= 1
+    while e < max_e and e > s and col1_text[e - 1].isascii() and (col1_text[e - 1].isalnum() or col1_text[e - 1] in ":.") and col1_text[e].isascii() and (col1_text[e].isalnum() or col1_text[e] in ":."):
+        e += 1
+
+    # Include immediately preceding opening quote/bracket if window starts right inside it
+    if s > min_s and s < e and col1_text[s - 1] in _OPENING_LEADERS:
+        s -= 1
+
+    # Complete immediately adjacent closing paren/quote if window opened one (e.g. '（路9:50' -> '（路9:50）')
+    _pair_map = {"（": "）", "(": ")", "《": "》", "“": "”", "「": "」", "『": "』", "【": "】", "[": "]"}
+    if s < e and col1_text[s] in _pair_map:
+        closer = _pair_map[col1_text[s]]
+        if closer not in col1_text[s:e] and e < max_e and col1_text[e] == closer:
+            e += 1
+
+    # Avoid grabbing 1-2 stray characters before a comma at the left edge (e.g. '此，这样的人' -> '这样的人')
+    for pos in range(s, min(e, s + 3)):
+        if col1_text[pos] in _CN_CLAUSE_DELIMS and (e - (pos + 1)) >= 4:
+            if not (en_starts_punct and pos == s):
+                s = pos + 1
+                while s < e and col1_text[s].isspace():
+                    s += 1
+                break
+
+    # Avoid spilling 1-2 stray characters past a comma at the right edge (e.g. '正因如此，这' -> '正因如此，' / '正因如此')
+    for pos in range(e - 1, max(s, e - 3) - 1, -1):
+        if col1_text[pos] in _CN_CLAUSE_DELIMS and (pos - s) >= 4 and (e - (pos + 1)) in (1, 2):
+            e = (pos + 1) if en_ends_punct else pos
+            break
+
+    return _snap_safe_codepoint_bounds(col1_text, s, e, min_s, max_e)
+
+
+def local_align_col1_spans(
+    col1_text: str,
+    old_en_full: str,
+    spans: List[dict],
+    find_fuzzy_fn: Callable,
+) -> Dict[str, str]:
+    """
+    100% offline / zero-API Col 1 (Chinese) span aligner:
+      - Splits `col1_text` into Chinese sentences (`。？！；\\n`) and sub-clauses (`，、：`).
+      - Maps each English span's sentence/clause/character ratio onto `col1_text` using
+        `new_en` / `old_en_in_col3` length & position.
+      - Selects full corresponding Chinese sentence(s) for `rv` full-sentence spans, and
+        corresponding Chinese clause or proportional ~4–12 CJK character window for `up` local spans.
+      - Enforces strict monotonic non-overlapping cursor order verified via `find_fuzzy_fn`.
+    """
+    result: Dict[str, str] = {}
+    if not col1_text or not col1_text.strip() or not spans:
+        return result
+
+    en_full, en_positions = _build_effective_en_for_col1(old_en_full, spans, find_fuzzy_fn)
+    if not en_full:
+        return result
+
+    # Choose sentence segmentation (`。？！；\n` vs `。？！\n`) that best aligns Chinese & English sentence counts
+    en_semi = _split_sentences_ranges(en_full, is_english=True, include_semi_colon=True)
+    cn_semi = _split_cn_sentences_ranges(col1_text, include_semicolon=True)
+    en_prim = _split_sentences_ranges(en_full, is_english=True, include_semi_colon=False)
+    cn_prim = _split_cn_sentences_ranges(col1_text, include_semicolon=False)
+
+    candidates = [
+        (en_semi, cn_semi),
+        (en_prim, cn_semi),
+        (en_prim, cn_prim),
+    ]
+    valid_cands = [(es, cs) for (es, cs) in candidates if es and cs]
+    if valid_cands:
+        en_sents, cn_sents = min(valid_cands, key=lambda pair: abs(len(pair[0]) - len(pair[1])))
+    else:
+        ts_e, te_e = _trim_range(en_full, 0, len(en_full))
+        en_sents = [(ts_e, te_e)] if ts_e < te_e else [(0, len(en_full))]
+        ts_c, te_c = _trim_range(col1_text, 0, len(col1_text))
+        if ts_c >= te_c:
+            return result
+        cn_sents = [(ts_c, te_c)]
+
+    # Pre-map each span to English `[s_first, s_last]` and Chinese `[c_first, c_last]` sentence indices
+    span_sent_maps: List[Tuple[int, int, int, int]] = []
+    for cs, ce in en_positions:
+        ov = [
+            i for i, (es, ee) in enumerate(en_sents)
+            if (cs < ce and max(es, cs) < min(ee, ce)) or (cs == ce and es <= cs <= ee)
+        ]
+        if not ov:
+            mid = (cs + ce) / 2.0
+            nearest = min(
+                range(len(en_sents)),
+                key=lambda i: min(abs(en_sents[i][0] - mid), abs(en_sents[i][1] - mid)),
+            )
+            ov = [nearest]
+        sf, sl = ov[0], ov[-1]
+        cf, cl = _map_sentence_indices(sf, sl, en_sents, cn_sents, len(en_full), len(col1_text))
+        span_sent_maps.append((sf, sl, cf, cl))
+
+    # Also record which English sentences map to each Chinese sentence (for N-to-1 English->Chinese sentences)
+    en_sent_to_cn: List[Tuple[int, int]] = [
+        _map_sentence_indices(ei, ei, en_sents, cn_sents, len(en_full), len(col1_text))
+        for ei in range(len(en_sents))
+    ]
+
+    col1_end_trimmed = _trim_range(col1_text, 0, len(col1_text))[1]
+    cursor = 0
+
+    for idx, sp in enumerate(spans):
+        sid = sp["span_id"]
+        if cursor >= col1_end_trimmed:
+            break
+
+        c_start, c_end = en_positions[idx]
+        s_first, s_last, c_first, c_last = span_sent_maps[idx]
+
+        while c_last < len(cn_sents) - 1 and cn_sents[c_last][1] <= cursor:
+            c_first = min(len(cn_sents) - 1, c_first + 1)
+            c_last = max(c_first, c_last + 1)
+
+        en_sent_s, en_sent_e = en_sents[s_first][0], en_sents[s_last][1]
+        # Expand English scope for UP ratio/clause mapping if multiple English sentences map into `[c_first, c_last]`
+        sharing_en_idxs = [
+            ei for ei, (ecf, ecl) in enumerate(en_sent_to_cn)
+            if max(ecf, c_first) <= min(ecl, c_last)
+        ]
+        en_scope_s = min(en_sent_s, en_sents[sharing_en_idxs[0]][0]) if sharing_en_idxs else en_sent_s
+        en_scope_e = max(en_sent_e, en_sents[sharing_en_idxs[-1]][1]) if sharing_en_idxs else en_sent_e
+
+        cn_sent_s, cn_sent_e = cn_sents[c_first][0], cn_sents[c_last][1]
+        if cn_sent_e <= cursor:
+            cn_sent_s, cn_sent_e = cursor, col1_end_trimmed
+
+        later_same_sent = sum(
+            1 for j in range(idx + 1, len(spans))
+            if span_sent_maps[j][2] <= c_last
+        )
+
+        _, _, span_w_cnt, sent_w_cnt = _word_ratio_in_box(en_full, en_scope_s, en_scope_e, c_start, c_end)
+        char_cov = max(0, min(c_end, en_scope_e) - max(c_start, en_scope_s)) / max(1, en_scope_e - en_scope_s)
+        word_cov = span_w_cnt / max(1, sent_w_cnt)
+        is_full_sentence = (sp.get("type") == "rv") or (max(char_cov, word_cov) >= 0.75 and later_same_sent == 0)
+
+        cand_s, cand_e = cn_sent_s, cn_sent_e
+
+        if is_full_sentence:
+            cand_s = max(cursor, cn_sent_s)
+            cand_e = cn_sent_e
+            if later_same_sent > 0 and sp.get("type") == "rv":
+                clusters_all = _build_grapheme_clusters(col1_text, cand_s, cand_e)
+                if len(clusters_all) > later_same_sent * 2 + 2:
+                    cand_e = clusters_all[len(clusters_all) - 1 - later_same_sent * 2][1]
+            cand_s, cand_e = _snap_safe_codepoint_bounds(col1_text, cand_s, cand_e, max(cursor, 0), len(col1_text))
+        else:
+            en_box_s, en_box_e = en_scope_s, en_scope_e
+            cn_box_s, cn_box_e = cn_sent_s, cn_sent_e
+
+            # Split `en_scope` into clauses (including `.?!` if multiple English sentences mapped to 1 Chinese sentence)
+            en_clauses_raw: List[Tuple[int, int]] = []
+            for sub_es, sub_ee in _split_sentences_ranges(en_full[en_scope_s:en_scope_e], is_english=True, include_semi_colon=True):
+                en_clauses_raw.extend(
+                    _split_clauses_ranges(en_full, en_scope_s + sub_es, en_scope_s + sub_ee, is_english=True)
+                )
+            if not en_clauses_raw:
+                en_clauses_raw = _split_clauses_ranges(en_full, en_scope_s, en_scope_e, is_english=True)
+            cn_clauses_major = _split_cn_clauses_ranges(col1_text, cn_sent_s, cn_sent_e, include_dunhao=False)
+            cn_clauses_fine = _split_cn_clauses_ranges(col1_text, cn_sent_s, cn_sent_e, include_dunhao=True)
+
+            en_for_major = _merge_short_en_lead_clauses(en_full, en_clauses_raw, len(cn_clauses_major))
+            en_for_fine = _merge_short_en_lead_clauses(en_full, en_clauses_raw, len(cn_clauses_fine))
+
+            if abs(len(en_for_fine) - len(cn_clauses_fine)) < abs(len(en_for_major) - len(cn_clauses_major)):
+                en_clauses, cn_clauses = en_for_fine, cn_clauses_fine
+            else:
+                en_clauses, cn_clauses = en_for_major, cn_clauses_major
+
+            used_whole_clause = False
+            if (
+                len(en_clauses) >= 2
+                and len(cn_clauses) >= 2
+                and abs(len(en_clauses) - len(cn_clauses)) <= (0 if len(en_clauses) == 2 else 1)
+            ):
+                cl_ov = [
+                    ci for ci, (ecs, ece) in enumerate(en_clauses)
+                    if (c_start < c_end and max(ecs, c_start) < min(ece, c_end))
+                    or (c_start == c_end and ecs <= c_start <= ece)
+                ]
+                if cl_ov:
+                    cf0, cf1 = _map_sentence_indices(
+                        cl_ov[0],
+                        cl_ov[-1],
+                        en_clauses,
+                        cn_clauses,
+                        en_scope_e - en_scope_s,
+                        cn_sent_e - cn_sent_s,
+                    )
+                    cand_cn_s, cand_cn_e = cn_clauses[cf0][0], cn_clauses[cf1][1]
+                    if cand_cn_e > cursor:
+                        en_box_s, en_box_e = en_clauses[cl_ov[0]][0], en_clauses[cl_ov[-1]][1]
+                        cn_box_s, cn_box_e = max(cursor, cand_cn_s), cand_cn_e
+
+                        later_same_clause = any(
+                            en_positions[j][0] < en_box_e for j in range(idx + 1, len(spans))
+                        )
+                        _, _, cl_sp_w, cl_tot_w = _word_ratio_in_box(en_full, en_box_s, en_box_e, c_start, c_end)
+                        cl_char_cov = max(0, min(c_end, en_box_e) - max(c_start, en_box_s)) / max(1, en_box_e - en_box_s)
+                        if max(cl_char_cov, cl_sp_w / max(1, cl_tot_w)) >= 0.75 and not later_same_clause:
+                            cand_s, cand_e = _snap_safe_codepoint_bounds(
+                                col1_text, cn_box_s, cn_box_e, cursor, len(col1_text)
+                            )
+                            used_whole_clause = True
+
+            if not used_whole_clause:
+                avail_s = max(cursor, cn_box_s)
+                avail_e = cn_box_e
+                if avail_s >= avail_e:
+                    avail_s = cursor
+                    avail_e = max(cn_sent_e, col1_end_trimmed)
+
+                rel_s, rel_e, sp_words, _box_words = _word_ratio_in_box(en_full, en_box_s, en_box_e, c_start, c_end)
+                if cn_box_e > cn_box_s and avail_s > cn_box_s:
+                    consumed_frac = (avail_s - cn_box_s) / (cn_box_e - cn_box_s)
+                    if consumed_frac < 0.95:
+                        rel_s = max(0.0, (rel_s - consumed_frac) / (1.0 - consumed_frac))
+                        rel_e = max(rel_s, min(1.0, (rel_e - consumed_frac) / (1.0 - consumed_frac)))
+
+                en_span_slice = en_full[c_start:c_end]
+                en_digits = _DIGIT_TOKEN_RE.findall(en_span_slice)
+                digit_anchor_span: Optional[Tuple[int, int]] = None
+                if en_digits:
+                    d_tok = en_digits[0]
+                    d_hits = [
+                        (avail_s + m.start(), avail_s + m.end())
+                        for m in re.finditer(re.escape(d_tok), col1_text[avail_s:avail_e])
+                    ]
+                    if len(d_hits) == 1:
+                        digit_anchor_span = d_hits[0]
+
+                clusters = _build_grapheme_clusters(col1_text, avail_s, avail_e)
+                usable_c_cnt = len(clusters)
+                if later_same_sent > 0 and usable_c_cnt > later_same_sent * 2:
+                    same_box_later = sum(
+                        1 for j in range(idx + 1, len(spans))
+                        if en_positions[j][0] < en_box_e or (cn_box_e == cn_sent_e and span_sent_maps[j][2] <= c_last)
+                    )
+                    if same_box_later > 0 and usable_c_cnt > same_box_later * 2:
+                        usable_c_cnt -= same_box_later * 2
+
+                c_pool = clusters[: max(1, usable_c_cnt)]
+                c_n = len(c_pool)
+                if c_n == 0:
+                    cand_s, cand_e = _snap_safe_codepoint_bounds(col1_text, avail_s, avail_e, cursor, len(col1_text))
+                else:
+                    if digit_anchor_span is not None:
+                        d_mid = (digit_anchor_span[0] + digit_anchor_span[1]) / 2.0
+                        center_ci = min(
+                            range(c_n),
+                            key=lambda ci: abs(((c_pool[ci][0] + c_pool[ci][1]) / 2.0) - d_mid),
+                        )
+                    else:
+                        center_ci = min(c_n - 1, max(0, int(((rel_s + rel_e) / 2.0) * c_n)))
+
+                    raw_prop = round((rel_e - rel_s) * c_n)
+                    if sp_words <= 3:
+                        min_win = 5 if c_n >= 6 else 4
+                        target_c = min(c_n, max(min_win, min(8, raw_prop if raw_prop > 0 else 6)))
+                        c0 = max(0, min(c_n - target_c, int(round(rel_s * c_n)) if rel_s <= 0.08 else center_ci - (target_c // 2)))
+                        c1 = min(c_n - 1, c0 + target_c - 1)
+                    else:
+                        est_c = min(c_n, max(5, min(12, raw_prop) if (rel_e - rel_s) < 0.65 else raw_prop))
+                        c0 = max(0, min(c_n - est_c, int(round(rel_s * c_n))))
+                        c1 = max(c0, min(c_n - 1, max(int(round(rel_e * c_n)) - 1, c0 + est_c - 1)))
+                        if (c1 - c0 + 1) > 12 and (rel_e - rel_s) < 0.55:
+                            c1 = min(c_n - 1, c0 + 11)
+
+                    while (c_pool[c1][1] - c_pool[c0][0]) < 4 and (c0 > 0 or c1 + 1 < c_n):
+                        if c1 + 1 < c_n:
+                            c1 += 1
+                        elif c0 > 0:
+                            c0 -= 1
+
+                    cand_s = c_pool[c0][0]
+                    cand_e = c_pool[c1][1]
+                    if digit_anchor_span is not None:
+                        cand_s = min(cand_s, digit_anchor_span[0])
+                        cand_e = max(cand_e, min(c_pool[-1][1], digit_anchor_span[1]))
+                    cand_s, cand_e = _refine_cn_local_window_bounds(
+                        col1_text, cand_s, cand_e, cursor, len(col1_text), en_span_slice
+                    )
+
+        sub = col1_text[cand_s:cand_e].strip()
+        if not sub:
+            rem_s, rem_e = _snap_safe_codepoint_bounds(
+                col1_text, cursor, min(col1_end_trimmed, cursor + 8), cursor, col1_end_trimmed
+            )
+            sub = col1_text[rem_s:rem_e].strip()
+
+        if sub:
+            loc = _call_find_fuzzy(find_fuzzy_fn, col1_text, sub, search_from=cursor)
+            if loc is not None and loc[0] >= cursor:
+                result[sid] = col1_text[loc[0] : loc[1]]
+                cursor = loc[1]
+            else:
+                direct_pos = col1_text.find(sub, cursor)
+                if direct_pos != -1:
+                    result[sid] = sub
+                    cursor = direct_pos + len(sub)
+
+    return result
+
+
 # ---------------- Step 1 & Step 2 Multi-Threaded Evaluators with Seamless Local Fallback ----------------
 
 STEP1_SYS_PROMPT = """你是专业的多语种文稿修订分级专家。
-对于给定的每个英文修订句（包含 sent_id、change_ratio、edit_hunks、diff_preview），请判定它属于：
-- "yellow"（UP 局部改点）：局部词汇替换、短语微调、增删少量词、标点/引号微调，译者可在外文原句上直接局部修改；
-- "cyan"（RV 整句重翻/大改）：整句语序重组、主干句式推倒重写、或改动极其密集导致译者难以在原句局部修补（通常 change_ratio >= 0.40 且多处打散重写，或相邻连续多句大改）。
-注意：为了节约翻译成本，凡是译者能在原句顺畅局部修改的，一律优先判为 "yellow"；只有确实整句结构大改、难以局部下手的才判为 "cyan"。
+对于给定的每个英文修订句（包含 sent_id、heuristic_suggested、change_ratio、edit_hunks、new_words、diff_preview），请严格判定它属于：
+- "yellow"（UP 局部改点）：局部词汇替换、短语/习语改写、增删词句、标点/引号微调，或半句话改动较大而另一半句基本未变，译者可在原句上直接局部修改；
+- "cyan"（RV 整句重翻）：整句彻底推倒重写，译者无法在原句局部修补。
+
+【核心硬性边界规则（务必严格遵守）】：
+1. 单独一句或两句话，**只有在「改前与改后仅剩两三个实词能对上、绝大多数词都重写，且句中没有任何完整未改动的半句/分句」时**，才允许判为 "cyan"（RV 整句重翻）！
+2. 如果只是**半句话改动较大、另一半句基本未变**（例如 `as far as man is concerned` -> `when it comes to man`，或 `It is for these reasons that` -> `This is why`，而后半句基本未变），**一律判为 "yellow"（UP 局部改点），绝不判为 "cyan"**！
+3. 为了节约翻译成本，除非整段几乎每句都被密集打散重写（整段花掉），否则凡是保留了完整未改动半句或译者能顺畅局部修改的句子，一律判为 "yellow"。
+
 请严格输出 JSON：{"items": [{"sent_id": "...", "decision": "yellow" 或 "cyan"}]}。"""
 
 
@@ -1530,16 +2096,156 @@ def evaluate_step1_decisions(
     return decisions
 
 
-STEP2_SYS_PROMPT = """你是多语种平行语料精准片段对齐专家（支持全球任意语种，包括拉丁语系、斯拉夫语系、希腊语、阿拉伯/波斯等从右向左语系、日韩语、泰/缅/柬/老等东南亚无空格语系、印地/孟加拉等南亚语系）。
-给定表格第 3 列完整外文段落 `col3_text`，以及若干第 2 列高亮片段 `spans`（每个片段含 `span_id`、对应的旧版英文 `old_en_in_col3`、新版英文 `new_en`、以及前后未高亮的英文上下文 `left_old_context` / `right_old_context`）：
-请在 `col3_text` 中找出与每个 `old_en_in_col3` 语义完全对应的**原样连续外文子串**（`col3_substring`）。
+STEP2_SYS_PROMPT = """你是多语种三列平行语料精准片段对齐专家（支持中文及全球任意外语，包括拉丁语系、斯拉夫语系、希腊语、阿拉伯/波斯等从右向左语系、日韩语、泰/缅/柬/老等东南亚无空格语系、印地/孟加拉等南亚语系）。
+给定同一表格行的：
+- 第 1 列完整中文段落 `col1_text`（若提供，对应修订后的最新中文）；
+- 第 3 列完整外文段落 `col3_text`（对应修订前的旧版外文译文）；
+- 以及若干第 2 列英文高亮片段 `spans`（每个片段含 `span_id`、类型 `type`["up"局部改点 / "rv"整句重翻]、对应的旧版英文 `old_en_in_col3`、新版英文 `new_en`、以及前后未高亮的英文上下文 `left_old_context` / `right_old_context`）。
+
+请在**同一次请求**中，为每个 `span` 精准找出：
+1. `col1_substring`（当输入提供非空 `col1_text` 时必填）：在 `col1_text` 中与 `new_en` / `old_en_in_col3`（结合前后上下文位置）语义完全对应的**原样连续中文子串**；
+2. `col3_substring`：在 `col3_text` 中与 `old_en_in_col3`（结合前后上下文位置）语义完全对应的**原样连续外文子串**。
 
 严格规则：
-1. `col3_substring` 必须**一字不差地原样复制**自 `col3_text`（包含外文原有的标点符号，绝不可自行翻译、改写、省略中间词或添加省略号 `...`）。
-2. 若 `old_en_in_col3` 仅为 ~3 个词的短窗口（纯标点改点），在 `col3_text` 中同样只截取对应位置的约 3 个外文词（若外文为日语、泰语、缅甸语、高棉语等无空格分词语言，则截取对应位置约 4~8 个字符的短片段）。
-3. 若 `old_en_in_col3` 是半句/分句（如到逗号、分号或连词处为止），`col3_substring` 也必须精准停在对应的外文分句/连词边界，绝不可把 `left_old_context` 或 `right_old_context` 对应的未高亮外文包进来！
-4. 同一行内的多个 `spans` 按顺序先后出现，互不重叠。
-请严格输出 JSON：{"alignments": [{"span_id": "...", "col3_substring": "..."}]}。"""
+1. `col1_substring` 必须**一字不差地原样复制**自 `col1_text`，`col3_substring` 必须**一字不差地原样复制**自 `col3_text`（包含原文标点符号，绝不可自行翻译、改写、省略中间词或添加省略号 `...`）。
+2. 若 `type == "rv"`（整句重翻），`col1_substring` 与 `col3_substring` 应分别截取对应的完整中文句子与完整外文句子。
+3. 若英文片段仅为 ~3 个词的短窗口（如纯标点改点），`col1_substring` 只截取对应位置约 4~8 个汉字的短片段，`col3_substring` 只截取对应位置的约 3 个外文词（若外文为日语、泰语、缅甸语、高棉语等无空格分词语言，则截取约 4~8 个字符的短片段）。
+4. 若英文片段是半句/分句（如到逗号、分号或连词处为止），`col1_substring` 与 `col3_substring` 也必须精准停在对应的中文分句与外文分句/连词边界，绝不可把 `left_old_context` 或 `right_old_context` 对应的未改动内容包进来！
+5. 同一行内的多个 `spans` 在 `col1_text` 和 `col3_text` 中均按顺序先后出现，互不重叠。
+请严格输出 JSON：{"alignments": [{"span_id": "...", "col1_substring": "...", "col3_substring": "..."}]}（若输入未提供 `col1_text`，则每项输出 `span_id` 与 `col3_substring`）。"""
+
+
+def _resolve_side_with_fallback(
+    text: str,
+    raw_map: Dict[str, str],
+    spans: List[dict],
+    local_fallback_fn: Callable[[], Dict[str, str]],
+    find_fuzzy_fn: Callable,
+) -> Dict[str, str]:
+    """
+    Validate `raw_map` monotonically against `text` via `find_fuzzy_fn`, recovering any residual
+    unmatched spans via bounded head/tail anchoring and `local_fallback_fn()` while preserving
+    strict non-overlapping order across all spans in the row.
+    """
+    resolved: Dict[str, str] = {}
+    if not text or not text.strip() or not spans:
+        return resolved
+
+    matched_locs: List[Optional[Tuple[int, int]]] = [None] * len(spans)
+    probe_cur = 0
+    for i, s in enumerate(spans):
+        sid = s["span_id"]
+        cand = (raw_map.get(sid) or "").strip()
+        if not cand:
+            continue
+        loc = _call_find_fuzzy(find_fuzzy_fn, text, cand, search_from=probe_cur)
+        if loc is not None and probe_cur <= loc[0] < loc[1]:
+            matched_locs[i] = (loc[0], loc[1])
+            probe_cur = loc[1]
+
+    local_backup: Optional[Dict[str, str]] = None
+    for i, s in enumerate(spans):
+        if matched_locs[i] is not None:
+            continue
+        sid = s["span_id"]
+        low_b = matched_locs[i - 1][1] if (i > 0 and matched_locs[i - 1] is not None) else 0
+        high_b = next(
+            (matched_locs[j][0] for j in range(i + 1, len(spans)) if matched_locs[j] is not None),
+            len(text),
+        )
+        if low_b >= high_b:
+            continue
+
+        cand = (raw_map.get(sid) or "").strip()
+        anchored = False
+        words = cand.split()
+        if len(words) >= 4:
+            for n_anchor in (3, 2, 1):
+                head = " ".join(words[:n_anchor])
+                tail = " ".join(words[-n_anchor:])
+                h_loc = _call_find_fuzzy(find_fuzzy_fn, text, head, search_from=low_b)
+                if h_loc is not None and low_b <= h_loc[0] < h_loc[1] <= high_b:
+                    t_loc = _call_find_fuzzy(find_fuzzy_fn, text, tail, search_from=h_loc[1])
+                    if (
+                        t_loc is not None
+                        and h_loc[1] <= t_loc[0] < t_loc[1] <= high_b
+                        and (t_loc[1] - h_loc[0]) <= max(len(cand) * 2 + 120, high_b - low_b)
+                    ):
+                        matched_locs[i] = (h_loc[0], t_loc[1])
+                        anchored = True
+                        break
+        elif len(cand) >= 8:
+            for n_ch in (6, 4, 3, 2):
+                if len(cand) < n_ch * 2:
+                    continue
+                head = cand[:n_ch]
+                tail = cand[-n_ch:]
+                h_loc = _call_find_fuzzy(find_fuzzy_fn, text, head, search_from=low_b)
+                if h_loc is not None and low_b <= h_loc[0] < h_loc[1] <= high_b:
+                    t_loc = _call_find_fuzzy(find_fuzzy_fn, text, tail, search_from=h_loc[1])
+                    if (
+                        t_loc is not None
+                        and h_loc[1] <= t_loc[0] < t_loc[1] <= high_b
+                        and (t_loc[1] - h_loc[0]) <= max(len(cand) * 2 + 80, high_b - low_b)
+                    ):
+                        matched_locs[i] = (h_loc[0], t_loc[1])
+                        anchored = True
+                        break
+
+        if not anchored:
+            if local_backup is None:
+                local_backup = local_fallback_fn()
+            fb_cand = (local_backup.get(sid) or "").strip()
+            fb_loc = _call_find_fuzzy(find_fuzzy_fn, text, fb_cand, search_from=low_b) if fb_cand else None
+            if fb_loc is not None and low_b <= fb_loc[0] < fb_loc[1] <= high_b:
+                matched_locs[i] = (fb_loc[0], fb_loc[1])
+            else:
+                # Bounded cluster fallback inside `[low_b, high_b]` so monotonic alignment never drops or overlaps
+                rem_unres = 1
+                for j in range(i + 1, len(spans)):
+                    if matched_locs[j] is not None:
+                        break
+                    rem_unres += 1
+                gap_clusters = _build_grapheme_clusters(text, low_b, high_b)
+                if gap_clusters:
+                    take_n = max(1, len(gap_clusters) // max(1, rem_unres))
+                    take_n = min(len(gap_clusters), min(take_n, 10) if s.get("type") != "rv" else take_n)
+                    gs, ge = _snap_safe_codepoint_bounds(
+                        text, gap_clusters[0][0], gap_clusters[take_n - 1][1], low_b, high_b
+                    )
+                    sub_gap = text[gs:ge].strip()
+                    if sub_gap:
+                        g_loc = _call_find_fuzzy(find_fuzzy_fn, text, sub_gap, search_from=low_b)
+                        if g_loc is not None and low_b <= g_loc[0] < g_loc[1] <= high_b:
+                            matched_locs[i] = (g_loc[0], g_loc[1])
+
+    for s, loc in zip(spans, matched_locs):
+        if loc is not None and loc[0] < loc[1]:
+            resolved[s["span_id"]] = text[loc[0] : loc[1]]
+    return resolved
+
+
+def _pack_row_alignments(
+    spans: List[dict],
+    has_col1: bool,
+    col1_map: Dict[str, str],
+    col3_map: Dict[str, str],
+) -> Dict[str, Union[str, Dict[str, str]]]:
+    out: Dict[str, Union[str, Dict[str, str]]] = {}
+    if has_col1:
+        for s in spans:
+            sid = s["span_id"]
+            c1 = col1_map.get(sid, "")
+            c3 = col3_map.get(sid, "")
+            if c1 or c3:
+                out[sid] = {"col1_substring": c1, "col3_substring": c3}
+    else:
+        for s in spans:
+            sid = s["span_id"]
+            c3 = col3_map.get(sid, "")
+            if c3:
+                out[sid] = c3
+    return out
 
 
 def align_step2_spans(
@@ -1555,10 +2261,10 @@ def align_step2_spans(
     enable_ai: bool = True,
     max_workers: Optional[int] = None,
     stats_out: Optional[dict] = None,
-) -> Dict[str, str]:
+) -> Dict[str, Union[str, Dict[str, str]]]:
     stats = {"used_local_fallback": False, "fallback_reason": ""}
     row_tasks = tasks_data.get("row_tasks", [])
-    alignments: Dict[str, str] = {}
+    alignments: Dict[str, Union[str, Dict[str, str]]] = {}
     if not row_tasks:
         if progress_fn:
             progress_fn(1.0, "无需对齐外文（0 处高亮）")
@@ -1568,28 +2274,46 @@ def align_step2_spans(
 
     pool = _build_optional_pool(api_key, rotation_mode=rotation_mode) if enable_ai else None
     total_rows = len(row_tasks)
+    any_col1 = any(bool((rt.get("col1_text") or "").strip()) for rt in row_tasks)
 
     if not enable_ai or pool is None:
         stats["used_local_fallback"] = True
         if enable_ai and pool is None:
             stats["fallback_reason"] = "未填写 API Key"
         if log_fn:
-            log_fn(f"  ℹ️ 外文标色：使用「本地位置估算模式」对齐共 {total_rows} 行第 3 列高亮...")
+            col_desc = "第 1 列中文与第 3 列外文" if any_col1 else "第 3 列外文"
+            log_fn(f"  ℹ️ 同步标色：使用「本地位置估算模式」对齐共 {total_rows} 行{col_desc}高亮...")
         for r_i, rt in enumerate(row_tasks):
-            row_map = local_align_col3_spans(
-                col3_text=rt.get("col3_text", ""),
-                old_en_full=rt.get("old_en_full", ""),
-                spans=rt.get("spans", []),
+            col1_text = rt.get("col1_text", "")
+            col3_text = rt.get("col3_text", "")
+            old_en_full = rt.get("old_en_full", "")
+            spans = rt.get("spans", [])
+            has_col1 = bool(col1_text and col1_text.strip())
+
+            col3_map = local_align_col3_spans(
+                col3_text=col3_text,
+                old_en_full=old_en_full,
+                spans=spans,
                 find_fuzzy_fn=find_fuzzy_fn,
             )
-            alignments.update(row_map)
+            col1_map = (
+                local_align_col1_spans(
+                    col1_text=col1_text,
+                    old_en_full=old_en_full,
+                    spans=spans,
+                    find_fuzzy_fn=find_fuzzy_fn,
+                )
+                if has_col1
+                else {}
+            )
+            alignments.update(_pack_row_alignments(spans, has_col1, col1_map, col3_map))
             if progress_fn:
-                progress_fn((r_i + 1) / total_rows, f"本地外文位置估算：已完成 {r_i + 1}/{total_rows} 行")
+                progress_fn((r_i + 1) / total_rows, f"本地位置估算：已完成 {r_i + 1}/{total_rows} 行")
         if stats_out is not None:
             stats_out.update(stats)
         return alignments
 
-    schema = {
+    schema_col3_only = {
         "type": "object",
         "properties": {
             "alignments": {
@@ -1601,6 +2325,25 @@ def align_step2_spans(
                         "col3_substring": {"type": "string"},
                     },
                     "required": ["span_id", "col3_substring"],
+                },
+            }
+        },
+        "required": ["alignments"],
+    }
+
+    schema_dual = {
+        "type": "object",
+        "properties": {
+            "alignments": {
+                "type": "array",
+                "items": {
+                    "type": "object",
+                    "properties": {
+                        "span_id": {"type": "string"},
+                        "col1_substring": {"type": "string"},
+                        "col3_substring": {"type": "string"},
+                    },
+                    "required": ["span_id", "col1_substring", "col3_substring"],
                 },
             }
         },
@@ -1635,46 +2378,67 @@ def align_step2_spans(
                 progress_fn(frac, msg)
 
     if total_rows > 1 and workers > 1:
-        _safe_log(f"  ⚡ 启动 {workers} 线程并发对齐 {total_rows} 行外文高亮（密钥池 {len(pool)} 个 Key）...")
+        target_lbl = "中/外文同步高亮" if any_col1 else "外文高亮"
+        _safe_log(f"  ⚡ 启动 {workers} 线程并发对齐 {total_rows} 行{target_lbl}（密钥池 {len(pool)} 个 Key）...")
 
     def _align_single_row(r_i: int) -> None:
         nonlocal completed_rows
         rt = row_tasks[r_i]
+        col1_text = rt.get("col1_text", "")
         col3_text = rt.get("col3_text", "")
         old_en_full = rt.get("old_en_full", "")
         spans = rt.get("spans", [])
-        row_align: Dict[str, str] = {}
+        has_col1 = bool(col1_text and col1_text.strip())
+        has_col3 = bool(col3_text and col3_text.strip())
+        row_align: Dict[str, Union[str, Dict[str, str]]] = {}
+
+        if not spans:
+            with state_lock:
+                completed_rows += 1
+                done_r = completed_rows
+            _safe_progress(done_r / total_rows, f"已完成 {done_r}/{total_rows} 行")
+            return
 
         if fallback_event.is_set():
-            row_align = local_align_col3_spans(col3_text, old_en_full, spans, find_fuzzy_fn)
+            col3_map = local_align_col3_spans(col3_text, old_en_full, spans, find_fuzzy_fn) if has_col3 else {}
+            col1_map = local_align_col1_spans(col1_text, old_en_full, spans, find_fuzzy_fn) if has_col1 else {}
+            row_align = _pack_row_alignments(spans, has_col1, col1_map, col3_map)
         else:
             art_short = (rt.get("article_title") or "")[:18]
-            stage_msg = f"AI 外文对齐：第 {r_i + 1}/{total_rows} 行（《{art_short}》，{len(spans)} 处高亮）"
+            lbl_kind = "AI 中/外文对齐" if has_col1 else "AI 外文对齐"
+            stage_msg = f"{lbl_kind}：第 {r_i + 1}/{total_rows} 行（《{art_short}》，{len(spans)} 处高亮）"
             _safe_call_log(f"  [{stage_msg}]...")
 
+            row_col1: Dict[str, str] = {}
+            row_col3: Dict[str, str] = {}
             pending_spans = list(spans)
             feedback_msg = ""
             switched_to_local = False
+            active_schema = schema_dual if has_col1 else schema_col3_only
 
             for attempt in range(3):
                 if fallback_event.is_set():
                     switched_to_local = True
                     break
 
-                payload_obj = {
+                payload_obj: dict = {
                     "target_language": target_lang_hint or "auto",
-                    "col3_text": col3_text,
-                    "spans": [
-                        {
-                            "span_id": s["span_id"],
-                            "old_en_in_col3": s["old_en_in_col3"],
-                            "new_en": s["new_en"],
-                            "left_old_context": s.get("left_old_context", ""),
-                            "right_old_context": s.get("right_old_context", ""),
-                        }
-                        for s in pending_spans
-                    ],
                 }
+                if has_col1:
+                    payload_obj["col1_text"] = col1_text
+                payload_obj["col3_text"] = col3_text
+                payload_obj["spans"] = [
+                    {
+                        "span_id": s["span_id"],
+                        "type": s.get("type", "up"),
+                        "old_en_in_col3": s.get("old_en_in_col3", ""),
+                        "new_en": s.get("new_en", ""),
+                        "left_old_context": s.get("left_old_context", ""),
+                        "right_old_context": s.get("right_old_context", ""),
+                    }
+                    for s in pending_spans
+                ]
+
                 user_prompt = json.dumps(payload_obj, ensure_ascii=False, indent=2)
                 if feedback_msg:
                     user_prompt = feedback_msg + "\n\n请重新精确截取以下未匹配成功的片段：\n" + user_prompt
@@ -1685,7 +2449,7 @@ def align_step2_spans(
                         model=model,
                         system_instruction=STEP2_SYS_PROMPT,
                         user_prompt=user_prompt,
-                        json_schema=schema,
+                        json_schema=active_schema,
                         api_mode=api_mode,
                         log_fn=_safe_call_log,
                     )
@@ -1699,99 +2463,117 @@ def align_step2_spans(
                             stats["fallback_reason"] = friendly_err
                             should_log = True
                     if should_log:
-                        _safe_log(f"  ⚠️ {friendly_err} -> 已自动切换「本地位置估算模式」完成第 3 列标色")
+                        col_lbl = "第 1 列与第 3 列标色" if any_col1 else "第 3 列标色"
+                        _safe_log(f"  ⚠️ {friendly_err} -> 已自动切换「本地位置估算模式」完成{col_lbl}")
                     switched_to_local = True
                     break
 
-                returned = {
-                    item["span_id"]: item["col3_substring"]
-                    for item in res.get("alignments", [])
-                    if "span_id" in item and "col3_substring" in item
+                prev_col1 = dict(row_col1)
+                prev_col3 = dict(row_col3)
+                returned_items = {
+                    item["span_id"]: item
+                    for item in (res.get("alignments") or [])
+                    if isinstance(item, dict) and "span_id" in item
                 }
                 for s in pending_spans:
                     sid = s["span_id"]
-                    if sid in returned and str(returned[sid]).strip():
-                        row_align[sid] = str(returned[sid]).strip()
+                    it = returned_items.get(sid)
+                    if not it:
+                        continue
+                    if has_col1 and "col1_substring" in it and str(it["col1_substring"]).strip():
+                        row_col1[sid] = str(it["col1_substring"]).strip()
+                    if "col3_substring" in it and str(it["col3_substring"]).strip():
+                        row_col3[sid] = str(it["col3_substring"]).strip()
 
-                cursor = 0
-                failed = []
-                for s in spans:
-                    sid = s["span_id"]
-                    cand = row_align.get(sid, "")
-                    loc = find_fuzzy_fn(col3_text, cand, search_from=cursor) if cand else None
-                    if loc is None or loc[0] < cursor:
-                        failed.append((s, cand))
-                    else:
-                        cursor = loc[1]
+                err_lines: List[str] = []
+                failed_ids = set()
 
-                if not failed:
+                if has_col1:
+                    cur1 = 0
+                    for s in spans:
+                        sid = s["span_id"]
+                        cand1 = row_col1.get(sid, "")
+                        loc1 = _call_find_fuzzy(find_fuzzy_fn, col1_text, cand1, search_from=cur1) if cand1 else None
+                        if loc1 is None or loc1[0] < cur1:
+                            # Keep previous valid col1_substring if retry regressed
+                            old_c1 = prev_col1.get(sid, "")
+                            old_loc1 = _call_find_fuzzy(find_fuzzy_fn, col1_text, old_c1, search_from=cur1) if old_c1 else None
+                            if old_loc1 is not None and old_loc1[0] >= cur1:
+                                row_col1[sid] = col1_text[old_loc1[0] : old_loc1[1]]
+                                cur1 = old_loc1[1]
+                            else:
+                                failed_ids.add(sid)
+                                err_lines.append(
+                                    f"- {sid} 返回的 col1_substring {cand1!r} 在 col1_text 中未按顺序找到！请务必从 col1_text 原文一字不差复制连续中文片段。"
+                                )
+                        else:
+                            row_col1[sid] = col1_text[loc1[0] : loc1[1]]
+                            cur1 = loc1[1]
+
+                if has_col3:
+                    cur3 = 0
+                    for s in spans:
+                        sid = s["span_id"]
+                        cand3 = row_col3.get(sid, "")
+                        loc3 = _call_find_fuzzy(find_fuzzy_fn, col3_text, cand3, search_from=cur3) if cand3 else None
+                        if loc3 is None or loc3[0] < cur3:
+                            old_c3 = prev_col3.get(sid, "")
+                            old_loc3 = _call_find_fuzzy(find_fuzzy_fn, col3_text, old_c3, search_from=cur3) if old_c3 else None
+                            if old_loc3 is not None and old_loc3[0] >= cur3:
+                                row_col3[sid] = col3_text[old_loc3[0] : old_loc3[1]]
+                                cur3 = old_loc3[1]
+                            else:
+                                failed_ids.add(sid)
+                                err_lines.append(
+                                    f"- {sid} 返回的 col3_substring {cand3!r} 在 col3_text 中未按顺序找到！请务必从 col3_text 原文一字不差复制完整连续片段（不要用省略号，不要改标点）。"
+                                )
+                        else:
+                            row_col3[sid] = col3_text[loc3[0] : loc3[1]]
+                            cur3 = loc3[1]
+
+                if not failed_ids:
                     break
 
-                pending_spans = [f[0] for f in failed]
-                err_lines = [
-                    f"- {s['span_id']} 返回的子串 {cand!r} 在 col3_text 中未找到！请务必从 col3_text 原文一字不差复制完整连续片段（不要用省略号，不要改标点）。"
-                    for s, cand in failed
-                ]
-                feedback_msg = "上一次返回的部分子串未能匹配 col3_text 原文：\n" + "\n".join(err_lines)
+                pending_spans = [s for s in spans if s["span_id"] in failed_ids]
+                feedback_msg = "上一次返回的部分子串未能匹配原文：\n" + "\n".join(err_lines)
                 if attempt + 1 < 3:
-                    _safe_call_log(f"    ↻ 自动修正重试 {len(failed)} 处子串边界（第 {attempt + 2} 次）...")
+                    _safe_call_log(f"    ↻ 自动修正重试 {len(pending_spans)} 处子串边界（第 {attempt + 2} 次）...")
 
             if switched_to_local:
-                row_align = local_align_col3_spans(col3_text, old_en_full, spans, find_fuzzy_fn)
+                col3_final = local_align_col3_spans(col3_text, old_en_full, spans, find_fuzzy_fn) if has_col3 else {}
+                col1_final = local_align_col1_spans(col1_text, old_en_full, spans, find_fuzzy_fn) if has_col1 else {}
+                row_align = _pack_row_alignments(spans, has_col1, col1_final, col3_final)
             else:
-                # Safety anchor fallback + local_align_col3_spans fallback for any residual unmatched spans
-                local_backup: Optional[Dict[str, str]] = None
-                cursor = 0
-                for s in spans:
-                    sid = s["span_id"]
-                    cand = row_align.get(sid, "")
-                    loc = find_fuzzy_fn(col3_text, cand, search_from=cursor) if cand else None
-                    if loc is not None and loc[0] >= cursor:
-                        cursor = loc[1]
-                        continue
-
-                    anchored = False
-                    words = cand.split()
-                    if len(words) >= 4:
-                        for n_anchor in (3, 2, 1):
-                            head = " ".join(words[:n_anchor])
-                            tail = " ".join(words[-n_anchor:])
-                            h_loc = find_fuzzy_fn(col3_text, head, search_from=cursor)
-                            if h_loc is not None and h_loc[0] >= cursor:
-                                t_loc = find_fuzzy_fn(col3_text, tail, search_from=h_loc[1])
-                                if t_loc is not None and t_loc[0] >= h_loc[1] and (t_loc[1] - h_loc[0]) <= max(len(cand) * 2 + 120, len(col3_text)):
-                                    row_align[sid] = col3_text[h_loc[0] : t_loc[1]]
-                                    cursor = t_loc[1]
-                                    anchored = True
-                                    break
-                    elif len(cand) >= 12:
-                        for n_ch in (6, 4, 3):
-                            head = cand[:n_ch]
-                            tail = cand[-n_ch:]
-                            h_loc = find_fuzzy_fn(col3_text, head, search_from=cursor)
-                            if h_loc is not None and h_loc[0] >= cursor:
-                                t_loc = find_fuzzy_fn(col3_text, tail, search_from=h_loc[1])
-                                if t_loc is not None and t_loc[0] >= h_loc[1] and (t_loc[1] - h_loc[0]) <= max(len(cand) * 2 + 80, len(col3_text)):
-                                    row_align[sid] = col3_text[h_loc[0] : t_loc[1]]
-                                    cursor = t_loc[1]
-                                    anchored = True
-                                    break
-
-                    if not anchored:
-                        if local_backup is None:
-                            local_backup = local_align_col3_spans(col3_text, old_en_full, spans, find_fuzzy_fn)
-                        fb_cand = local_backup.get(sid, "")
-                        fb_loc = find_fuzzy_fn(col3_text, fb_cand, search_from=cursor) if fb_cand else None
-                        if fb_loc is not None and fb_loc[0] >= cursor:
-                            row_align[sid] = col3_text[fb_loc[0] : fb_loc[1]]
-                            cursor = fb_loc[1]
+                col3_final = (
+                    _resolve_side_with_fallback(
+                        text=col3_text,
+                        raw_map=row_col3,
+                        spans=spans,
+                        local_fallback_fn=lambda: local_align_col3_spans(col3_text, old_en_full, spans, find_fuzzy_fn),
+                        find_fuzzy_fn=find_fuzzy_fn,
+                    )
+                    if has_col3
+                    else {}
+                )
+                col1_final = (
+                    _resolve_side_with_fallback(
+                        text=col1_text,
+                        raw_map=row_col1,
+                        spans=spans,
+                        local_fallback_fn=lambda: local_align_col1_spans(col1_text, old_en_full, spans, find_fuzzy_fn),
+                        find_fuzzy_fn=find_fuzzy_fn,
+                    )
+                    if has_col1
+                    else {}
+                )
+                row_align = _pack_row_alignments(spans, has_col1, col1_final, col3_final)
 
         with state_lock:
             alignments.update(row_align)
             completed_rows += 1
             done_r = completed_rows
 
-        mode_lbl = "本地位置估算" if fallback_event.is_set() else "AI 外文对齐"
+        mode_lbl = "本地位置估算" if fallback_event.is_set() else ("AI 中/外文对齐" if any_col1 else "AI 外文对齐")
         _safe_progress(done_r / total_rows, f"{mode_lbl}：已完成 {done_r}/{total_rows} 行")
 
     with ThreadPoolExecutor(max_workers=workers) as executor:

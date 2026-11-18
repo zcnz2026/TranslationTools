@@ -162,6 +162,13 @@ def load_languages() -> List[Dict]:
             if item.get("tri_prefix"):
                 entry_out["tri_prefix"] = str(item["tri_prefix"]).strip()
 
+            if "favorite" in item and item["favorite"] is not None:
+                fav_raw = item["favorite"]
+                if isinstance(fav_raw, str):
+                    entry_out["favorite"] = fav_raw.strip().lower() in ("1", "true", "yes", "on", "★")
+                else:
+                    entry_out["favorite"] = bool(fav_raw)
+
             for pt_key in ("title_pt", "body_pt", "citation_pt"):
                 if pt_key in item and item[pt_key] is not None:
                     try:
@@ -190,9 +197,21 @@ def load_languages() -> List[Dict]:
 
 def save_languages(entries: List[Dict]) -> None:
     p = get_languages_file()
+    serialized: List[Dict] = []
+    for item in entries:
+        if not isinstance(item, dict):
+            continue
+        d = dict(item)
+        if "favorite" in d and d["favorite"] is not None:
+            fav_raw = d["favorite"]
+            if isinstance(fav_raw, str):
+                d["favorite"] = fav_raw.strip().lower() in ("1", "true", "yes", "on", "★")
+            else:
+                d["favorite"] = bool(fav_raw)
+        serialized.append(d)
     payload = {
-        "_comment": "可在此自由新增或修改语种配置：code 为输出定稿文件名前缀，name 为显示名称，keywords 为从总库目录/文件名自动识别该语种的关键词，font 为第 3 列标准外文字体（留空则保留原文档字体）。",
-        "languages": entries,
+        "_comment": "可在此自由新增或修改语种配置：code 为输出定稿文件名前缀，name 为显示名称，keywords 为从总库目录/文件名自动识别该语种的关键词，font 为第 3 列标准外文字体（留空则保留原文档字体），favorite 为可选常用语种置顶布尔标记。",
+        "languages": serialized,
     }
     with open(p, "w", encoding="utf-8") as f:
         json.dump(payload, f, ensure_ascii=False, indent=2)
@@ -272,7 +291,13 @@ def build_keywords_list(name: str, raw_keywords: str) -> List[str]:
     return parts
 
 
-def format_combo_label(entry: Dict) -> str:
+_COMBO_MARKER_PREFIX_RE = re.compile(r"^(?:[★☆⏱⭐📌•·\ufe0f\u200b]+\s*)+")
+
+
+def format_combo_label(entry: Dict, prefix: str = "") -> str:
+    p = (prefix or "").strip()
+    if p:
+        return f"{p} {entry['code']} - {entry['name']}"
     return f"{entry['code']} - {entry['name']}"
 
 
@@ -280,15 +305,95 @@ def get_combo_values(entries: List[Dict]) -> List[str]:
     return [AUTO_COMBO_LABEL] + [format_combo_label(e) for e in entries]
 
 
+def get_prioritized_combo_values(
+    entries: List[Dict],
+    recent_codes: Optional[List[str]] = None,
+    favorite_codes: Optional[List[str]] = None,
+) -> List[str]:
+    """
+    Build language combobox values with pinned groups:
+      0. `AUTO_COMBO_LABEL`
+      1. Favorite languages (`entry.get("favorite")` is True or code in `favorite_codes`): `"★ CODE - Name"`
+      2. Recently used languages (`recent_codes` in MRU order, excluding favorites): `"⏱ CODE - Name"`
+      3. Remaining languages in registry order: `"CODE - Name"`
+    """
+    out: List[str] = [AUTO_COMBO_LABEL]
+    if not entries:
+        return out
+
+    by_code: Dict[str, Dict] = {}
+    ordered_entries: List[Dict] = []
+    for e in entries:
+        if not isinstance(e, dict):
+            continue
+        c = str(e.get("code", "")).strip().upper()
+        if not c or c in by_code:
+            continue
+        by_code[c] = e
+        ordered_entries.append(e)
+
+    fav_set = set()
+    for raw_fc in (favorite_codes or []):
+        fc = _COMBO_MARKER_PREFIX_RE.sub("", str(raw_fc or "").strip())
+        if " - " in fc:
+            fc = fc.split(" - ", 1)[0].strip()
+        fc_up = re.sub(r"[^A-Za-z0-9_-]", "", fc).upper()
+        if not fc_up or fc_up in ("AUTO", "XX"):
+            continue
+        fav_set.add(fc_up)
+        if fc_up not in by_code and fc_up in _CODE_ALIASES:
+            fav_set.add(_CODE_ALIASES[fc_up])
+
+    seen_codes = set()
+
+    # 1. Favorites
+    for e in ordered_entries:
+        c = str(e["code"]).strip().upper()
+        if bool(e.get("favorite")) or c in fav_set:
+            out.append(format_combo_label(e, "★ "))
+            seen_codes.add(c)
+
+    # 2. Recently used (MRU order, excluding already-listed favorites)
+    for raw_rc in (recent_codes or []):
+        rc = _COMBO_MARKER_PREFIX_RE.sub("", str(raw_rc or "").strip())
+        if " - " in rc:
+            rc = rc.split(" - ", 1)[0].strip()
+        rc_up = re.sub(r"[^A-Za-z0-9_-]", "", rc).upper()
+        if not rc_up or rc_up in ("AUTO", "XX"):
+            continue
+        target_code = rc_up
+        if target_code not in by_code and target_code in _CODE_ALIASES and _CODE_ALIASES[target_code] in by_code:
+            target_code = _CODE_ALIASES[target_code]
+        if target_code in by_code and target_code not in seen_codes:
+            out.append(format_combo_label(by_code[target_code], "⏱ "))
+            seen_codes.add(target_code)
+
+    # 3. Remaining languages
+    for e in ordered_entries:
+        c = str(e["code"]).strip().upper()
+        if c not in seen_codes:
+            out.append(format_combo_label(e))
+            seen_codes.add(c)
+
+    return out
+
+
 def resolve_combo_to_code(text: str, entries: List[Dict]) -> str:
-    s = (text or "").strip()
-    if not s or s.upper() == "AUTO" or s.startswith("AUTO "):
+    s = _COMBO_MARKER_PREFIX_RE.sub("", (text or "").strip()).strip()
+    if not s or s.upper() == "AUTO" or s.upper().startswith("AUTO ") or s.upper().startswith("AUTO-"):
         return "AUTO"
     if " - " in s:
-        return s.split(" - ", 1)[0].strip().upper()
+        lhs = _COMBO_MARKER_PREFIX_RE.sub("", s.split(" - ", 1)[0]).strip()
+        lhs_clean = re.sub(r"[^A-Za-z0-9_-]", "", lhs).upper()
+        return lhs_clean or "AUTO"
     s_up = s.upper()
     for e in entries:
-        if s_up == e["code"] or s == e["name"] or s in e.get("keywords", []) or s_up in [str(k).upper() for k in e.get("keywords", [])]:
+        if (
+            s_up == e["code"]
+            or s == e["name"]
+            or s in e.get("keywords", [])
+            or s_up in [str(k).upper() for k in e.get("keywords", [])]
+        ):
             return e["code"]
     canon = _CODE_ALIASES.get(s_up)
     if canon:
@@ -296,6 +401,36 @@ def resolve_combo_to_code(text: str, entries: List[Dict]) -> str:
             if e["code"] == canon:
                 return canon
     return re.sub(r"[^A-Za-z0-9_-]", "", s).upper() or "AUTO"
+
+
+def record_recent_language(
+    code: str,
+    recent_codes: Optional[List[str]] = None,
+    max_items: int = 5,
+) -> List[str]:
+    """Return updated MRU language code list with `code` moved/inserted at index 0 (ignoring AUTO / XX / empty)."""
+    limit = max(0, int(max_items))
+    if limit == 0:
+        return []
+
+    def _norm_code(raw_val: str) -> str:
+        val = _COMBO_MARKER_PREFIX_RE.sub("", str(raw_val or "").strip()).strip()
+        if " - " in val:
+            val = val.split(" - ", 1)[0].strip()
+        return re.sub(r"[^A-Za-z0-9_-]", "", val).upper()
+
+    cleaned_existing: List[str] = []
+    for item in (recent_codes or []):
+        c = _norm_code(item)
+        if c and c not in ("AUTO", "XX") and c not in cleaned_existing:
+            cleaned_existing.append(c)
+
+    target = _norm_code(code)
+    if not target or target in ("AUTO", "XX"):
+        return cleaned_existing[:limit]
+
+    updated = [target] + [c for c in cleaned_existing if c != target]
+    return updated[:limit]
 
 
 def find_lang_display_name(code: str, entries: List[Dict]) -> str:
