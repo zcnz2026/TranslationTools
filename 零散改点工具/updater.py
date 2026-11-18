@@ -14,7 +14,7 @@ import urllib.parse
 import urllib.request
 import zipfile
 
-APP_VERSION = "1.7.0"
+APP_VERSION = "1.8.0"
 GITHUB_REPO = "zcnz2026/TranslationTools"
 
 ZIP_ASSET_NAME = "ScatteredRevisionTool-Windows-x64.zip"

@@ -1,4 +1,5 @@
 from concurrent.futures import ThreadPoolExecutor
+import copy
 import importlib
 import inspect
 import io
@@ -14,6 +15,7 @@ from datetime import datetime
 from pathlib import Path
 from typing import Callable, Dict, List, Optional, Tuple, Union
 from unittest.mock import patch
+import xml.etree.ElementTree as ET
 
 
 def _ensure_skill_scripts_on_path():
@@ -39,11 +41,17 @@ import step2_render_final  # noqa: E402
 from ai_client import ApiKeyPool, align_step2_spans, evaluate_step1_decisions  # noqa: E402
 from dedup_checker import remove_unmerged_duplicates_from_docx  # noqa: E402
 from lang_registry import find_lang_display_name, get_languages_file, load_languages  # noqa: E402
-from security_utils import get_secure_user_workdir, parse_api_keys  # noqa: E402
+from master_sync import _accept_cell_revisions_inplace, sync_pending_with_latest_master  # noqa: E402
+from security_utils import (  # noqa: E402
+    create_ephemeral_workdir,
+    get_secure_user_workdir,
+    parse_api_keys,
+)
 from word_counter import (  # noqa: E402
     balance_trilingual_table_widths,
     ensure_three_column_tables_and_landscape,
     format_counted_docx_name,
+    is_top_highlight_instruction_text,
     parse_doc_filename,
     resolve_doc_naming_label,
     update_top_highlight_instruction_lines,
@@ -51,6 +59,9 @@ from word_counter import (  # noqa: E402
 
 # Ensure SCATTERED_REV_LANGUAGES_JSON env var points to external languages.json
 get_languages_file()
+
+W = docx_xml_utils.W
+NS = docx_xml_utils.NS
 
 _OUTPUT_COUNT_TAG_RE = re.compile(
     r"_\((?:UP\s+\d+\s+words(?:,\s*RV\s+\d+\s+words)?|RV\s+\d+\s+words)\)_",
@@ -60,7 +71,7 @@ _WORD_COUNTS_STDOUT_RE = re.compile(r"Final Col 2 Word Counts:\s*UP\s*=\s*(\d+)\
 _CLI_FLAG_SUPPORT_CACHE: Dict[Tuple[str, str], bool] = {}
 
 
-def _script_supports_cli_flag(mod, flag: str, fallback_utils_attr: str) -> bool:
+def _script_supports_cli_flag(mod, flag: str, fallback_utils_attr: str = "") -> bool:
     key = (getattr(mod, "__name__", str(mod)), flag)
     if key in _CLI_FLAG_SUPPORT_CACHE:
         return _CLI_FLAG_SUPPORT_CACHE[key]
@@ -76,7 +87,8 @@ def _script_supports_cli_flag(mod, flag: str, fallback_utils_attr: str) -> bool:
                 return supported
             except OSError:
                 pass
-    supported = callable(getattr(docx_xml_utils, fallback_utils_attr, None))
+    if fallback_utils_attr:
+        supported = callable(getattr(docx_xml_utils, fallback_utils_attr, None))
     _CLI_FLAG_SUPPORT_CACHE[key] = supported
     return supported
 
@@ -89,7 +101,7 @@ def ensure_library_index(
 ) -> dict:
     """
     Build or refresh the persistent multi-threaded library index via `library_index.ensure_library_index`,
-    forwarding `force_rebuild` (with safe fallback when running standalone before branch merge).
+    verifying live `os.stat` `(mtime_ns, size)` on every run and forwarding `force_rebuild`.
     """
     _ensure_skill_scripts_on_path()
     try:
@@ -133,6 +145,10 @@ def ensure_library_index(
             continue
         rel_str = str(p.relative_to(lib_p))
         if any(kw in rel_str for kw in excl_kws):
+            continue
+        try:
+            _ = os.stat(p)
+        except OSError:
             continue
         docx_files.append(p)
 
@@ -218,7 +234,7 @@ def _run_module_main(mod_main, argv: list, log_fn: Optional[Callable[[str], None
 
 
 def _get_work_dir(stem: str) -> Path:
-    return get_secure_user_workdir(stem)
+    return create_ephemeral_workdir(stem)
 
 
 def clean_doc_label(stem: str) -> str:
@@ -269,6 +285,138 @@ def _prepare_optional_pool(
     return keys, eff_rot, has_keys, False
 
 
+def _strip_all_highlights_in_root(root: ET.Element) -> None:
+    """Remove all `<w:highlight>` tags across `root` and strip top Blue/Yellow instruction lines."""
+    for rPr in root.findall(".//w:rPr", NS):
+        docx_xml_utils.remove_rpr_child(rPr, "highlight")
+    update_top_highlight_instruction_lines(root, has_up=False, has_rv=False)
+
+
+def _clone_clean_col12_paragraphs(src_tc: ET.Element, target_tc: ET.Element) -> List[ET.Element]:
+    """
+    Clone clean paragraphs from matched library Col 1 (`s_tcs[0]`) or Col 2 (`s_tcs[1]`)
+    without shading, highlights, or track changes for pre-diff raw trilingual export.
+    """
+    work_tc = copy.deepcopy(src_tc)
+    _accept_cell_revisions_inplace(work_tc)
+    tpl_pPr = docx_xml_utils.get_cell_template_ppr(target_tc, fallback_tc=work_tc)
+    tpl_rPr = docx_xml_utils.get_first_run_rpr(target_tc, fallback_tc=work_tc)
+    for non_base in ("color", "b", "bCs", "i", "iCs", "u", "highlight", "shd"):
+        docx_xml_utils.remove_rpr_child(tpl_rPr, non_base)
+
+    out_paras: List[ET.Element] = []
+    for p in work_tc.findall("w:p", NS):
+        new_p = ET.Element(f"{W}p")
+        if tpl_pPr is not None:
+            new_p.append(copy.deepcopy(tpl_pPr))
+        for r in p.findall(".//w:r", NS):
+            txt = "".join(t.text or "" for t in r.findall("w:t", NS))
+            if not txt:
+                continue
+            r_rPr = copy.deepcopy(tpl_rPr)
+            old_rPr = r.find("w:rPr", NS)
+            if old_rPr is not None:
+                for inline_tag in ("color", "b", "bCs", "i", "iCs", "u"):
+                    ch_el = old_rPr.find(f"w:{inline_tag}", NS)
+                    if ch_el is not None:
+                        cp_el = copy.deepcopy(ch_el)
+                        docx_xml_utils._strip_unsafe_attrs_recursive(cp_el)
+                        docx_xml_utils.insert_rpr_child_ordered(r_rPr, cp_el)
+            new_p.append(docx_xml_utils.make_run(txt, base_rPr=r_rPr, highlight=None, shd_fill=None, is_del=False))
+        out_paras.append(new_p)
+
+    if not out_paras:
+        empty_p = ET.Element(f"{W}p")
+        if tpl_pPr is not None:
+            empty_p.append(copy.deepcopy(tpl_pPr))
+        out_paras.append(empty_p)
+    return out_paras
+
+
+def _build_raw_trilingual_docx_from_manifest(
+    manifest_path: Path,
+    output_path: Path,
+    balance_columns: bool = True,
+) -> Path:
+    """
+    Fallback builder for pre-comparison extracted 3-language raw `.docx` (`对比前提取的三语原稿`):
+      - Col 1 = matched library Col 1 (`s_tcs[0]` clean)
+      - Col 2 = matched library old English (`s_tcs[1]` clean)
+      - Col 3 = matched library Foreign (`s_tcs[2]` with preserved formatting & migrated Word comments)
+    """
+    with open(manifest_path, "r", encoding="utf-8") as f:
+        manifest = json.load(f)
+
+    inp_path = Path(manifest["input_docx"]).resolve()
+    root, _, ns_pairs = docx_xml_utils.load_docx_xml(inp_path)
+    ensure_three_column_tables_and_landscape(root)
+    orig_comments = docx_xml_utils.load_docx_comments_xml(inp_path)
+    inp_had_comments = orig_comments is not None
+    working_comments = orig_comments if orig_comments is not None else docx_xml_utils.new_comments_root()
+    id_allocator = docx_xml_utils.CommentIdAllocator(doc_root=root, comments_root=working_comments)
+    body = root.find("w:body", NS)
+
+    src_cache: Dict[Path, tuple] = {}
+    for rm in manifest.get("rows", []):
+        body_el = body[rm["body_idx"]]
+        tr = body_el.findall("w:tr", NS)[rm["row_idx"]]
+        tcs = tr.findall("w:tc", NS)
+        if len(tcs) < 3:
+            continue
+
+        src_file = Path(rm["source_file"])
+        if src_file not in src_cache:
+            s_root, _, _ = docx_xml_utils.load_docx_xml(src_file)
+            s_cmap = docx_xml_utils.load_docx_comments_map(src_file)
+            s_styles = docx_xml_utils.load_docx_styles_xml(src_file)
+            src_cache[src_file] = (s_root.findall(".//w:tbl/w:tr", NS), s_cmap, s_styles)
+        s_trs, s_cmap, s_styles = src_cache[src_file]
+        s_tr = s_trs[rm["source_row_idx"]]
+        s_tcs = s_tr.findall("w:tc", NS)
+
+        col1_paras = _clone_clean_col12_paragraphs(s_tcs[0], tcs[0])
+        col2_paras = _clone_clean_col12_paragraphs(s_tcs[1], tcs[1])
+        col3_paras = step1_render_draft.clean_col3_paragraphs(
+            src_tc3=s_tcs[2],
+            target_tc3=tcs[2],
+            target_tc2=tcs[1],
+            src_comments_map=s_cmap,
+            target_comments_root=working_comments,
+            id_allocator=id_allocator,
+            src_styles_root=s_styles,
+        )
+
+        for tc_target, new_ps in ((tcs[0], col1_paras), (tcs[1], col2_paras), (tcs[2], col3_paras)):
+            tcPr = tc_target.find("w:tcPr", NS)
+            for ch in list(tc_target):
+                if ch is not tcPr:
+                    tc_target.remove(ch)
+            for np in new_ps:
+                tc_target.append(np)
+
+    for sr in manifest.get("skipped_rows", []):
+        body_el = body[sr["body_idx"]]
+        trs = body_el.findall("w:tr", NS)
+        if 0 <= sr["row_idx"] < len(trs):
+            tcs = trs[sr["row_idx"]].findall("w:tc", NS)
+            if len(tcs) >= 3:
+                _strip_all_highlights_in_root(trs[sr["row_idx"]])
+                step1_render_draft.populate_skipped_col3_cell(tcs[2], fallback_tc=tcs[1])
+
+    update_top_highlight_instruction_lines(root, has_up=False, has_rv=False)
+    if balance_columns:
+        balance_trilingual_table_widths(root)
+
+    final_comments = (
+        working_comments
+        if (inp_had_comments or len(working_comments.findall(f"{W}comment")) > 0)
+        else None
+    )
+    out_p = Path(output_path).resolve()
+    docx_xml_utils.save_docx_xml(inp_path, out_p, root, ns_pairs, comments_root=final_comments)
+    return out_p
+
+
 def run_step1_pipeline(
     input_docx: str,
     library_dir: str,
@@ -282,11 +430,19 @@ def run_step1_pipeline(
     progress_fn: Optional[Callable[[float, str], None]] = None,
     enable_ai: bool = True,
     force_full_diff: bool = False,
+    highlight_colors: bool = True,
+    yellow_gap_words: int = 3,
+    export_raw_trilingual: bool = False,
+    raw_trilingual_dir: str = "",
+    raw_trilingual_label: str = "",
+    date_str: str = "",
+    balance_columns: bool = True,
 ) -> dict:
+    eff_enable_ai = bool(enable_ai and highlight_colors)
     pool_or_keys, eff_rot, has_keys, effective_ai = _prepare_optional_pool(
         api_key=api_key,
         rotation_mode=rotation_mode,
-        enable_ai=enable_ai,
+        enable_ai=eff_enable_ai,
     )
     inp_p = Path(input_docx).resolve()
     lib_p = Path(library_dir).resolve()
@@ -352,31 +508,37 @@ def run_step1_pipeline(
     detected_lang = manifest.get("lang_code") or (clean_lang if clean_lang and clean_lang != "AUTO" else "XX")
     edited_cnt = sum(1 for x in review_items if x.get("has_edit"))
 
-    if enable_ai and not has_keys and log_fn:
-        log_fn("  ℹ️ 未填写 API Key，本次自动使用内置规则评估黄(UP)/青(RV)分级...")
-
-    mode_desc = f"调用 {model}" if effective_ai else "使用本地内置规则"
-    if progress_fn:
-        progress_fn(22.0, f"第一步 (2/3)：{mode_desc}评估 {edited_cnt} 处改动句（黄 UP / 青 RV）...")
-    if log_fn:
-        log_fn(f"▶ [第一步 2/3] {mode_desc}评估 {edited_cnt} 处改动句（黄 UP / 青 RV 分级）...")
-
-    def _sub_prog(frac: float, msg: str):
-        if progress_fn:
-            progress_fn(22.0 + frac * 63.0, f"第一步 (2/3)：{msg}")
-
     step1_stats: dict = {}
-    decisions = evaluate_step1_decisions(
-        review_items=review_items,
-        api_key=pool_or_keys,
-        model=model,
-        api_mode=api_mode,
-        rotation_mode=eff_rot,
-        log_fn=log_fn,
-        progress_fn=_sub_prog,
-        enable_ai=effective_ai,
-        stats_out=step1_stats,
-    )
+    if not highlight_colors:
+        if log_fn:
+            log_fn("▶ [第一步 2/3] 已关闭高亮颜色标记，跳过黄/青颜色分级与 AI 调用（仅输出对比修订痕迹）...")
+        decisions = {}
+    else:
+        if enable_ai and not has_keys and log_fn:
+            log_fn("  ℹ️ 未填写 API Key，本次自动使用内置规则评估黄(UP)/青(RV)分级...")
+
+        mode_desc = f"调用 {model}" if effective_ai else "使用本地内置规则"
+        if progress_fn:
+            progress_fn(22.0, f"第一步 (2/3)：{mode_desc}评估 {edited_cnt} 处改动句（黄 UP / 青 RV）...")
+        if log_fn:
+            log_fn(f"▶ [第一步 2/3] {mode_desc}评估 {edited_cnt} 处改动句（黄 UP / 青 RV 分级）...")
+
+        def _sub_prog(frac: float, msg: str):
+            if progress_fn:
+                progress_fn(22.0 + frac * 63.0, f"第一步 (2/3)：{msg}")
+
+        decisions = evaluate_step1_decisions(
+            review_items=review_items,
+            api_key=pool_or_keys,
+            model=model,
+            api_mode=api_mode,
+            rotation_mode=eff_rot,
+            log_fn=log_fn,
+            progress_fn=_sub_prog,
+            enable_ai=effective_ai,
+            stats_out=step1_stats,
+        )
+
     decisions_path = wdir / "step1_decisions.json"
     with open(decisions_path, "w", encoding="utf-8") as f:
         json.dump(decisions, f, ensure_ascii=False, indent=2)
@@ -387,27 +549,82 @@ def run_step1_pipeline(
     if log_fn:
         log_fn("▶ [第一步 3/3] 渲染初筛稿（保留原文档字体/字号/排版及全部修订痕迹）...")
 
+    raw_tri_path_obj: Optional[Path] = None
+    if export_raw_trilingual:
+        tri_dir = Path(raw_trilingual_dir).resolve() if (raw_trilingual_dir or "").strip() else out_d
+        tri_dir.mkdir(parents=True, exist_ok=True)
+        safe_lang_tri = docx_xml_utils.sanitize_filename_part(detected_lang, fallback="XX", max_len=16)
+        safe_lbl_tri = docx_xml_utils.sanitize_filename_part(
+            (raw_trilingual_label or clean_doc_label(inp_p.stem)).strip(),
+            fallback="Document",
+            max_len=120,
+        )
+        eff_dt_tri = docx_xml_utils.sanitize_filename_part(
+            (date_str or "").strip() or datetime.now().strftime("%Y%m%d"),
+            fallback=datetime.now().strftime("%Y%m%d"),
+            max_len=16,
+        )
+        raw_tri_name = f"{safe_lang_tri}_{safe_lbl_tri}_提取三语原稿_{eff_dt_tri}.docx"
+        raw_tri_path_obj = docx_xml_utils.safe_join_output_file(tri_dir, raw_tri_name)
+
+    supports_ygap = _script_supports_cli_flag(step1_render_draft, "--yellow-gap-words")
+    supports_no_hl1 = _script_supports_cli_flag(step1_render_draft, "--no-highlight-colors")
+    supports_raw_tri = _script_supports_cli_flag(step1_render_draft, "--raw-trilingual-output")
+
     argv1b = [
         "step1_render_draft.py",
         "--manifest", str(manifest_path),
         "--decisions", str(decisions_path),
         "--output", str(draft_path),
     ]
+    clamped_gap = max(0, int(yellow_gap_words if yellow_gap_words is not None else 3))
+    if supports_ygap:
+        argv1b.extend(["--yellow-gap-words", str(clamped_gap)])
+    if not highlight_colors and supports_no_hl1:
+        argv1b.append("--no-highlight-colors")
+    if raw_tri_path_obj is not None and supports_raw_tri:
+        argv1b.extend(["--raw-trilingual-output", str(raw_tri_path_obj)])
+
     _run_module_main(step1_render_draft.main, argv1b, log_fn=log_fn)
 
-    meta_path = wdir / "session_meta.json"
-    with open(meta_path, "w", encoding="utf-8") as f:
-        json.dump({"lang_code": detected_lang, "doc_label": clean_doc_label(inp_p.stem)}, f, ensure_ascii=False)
+    # Standalone fallback when step1_render_draft does not yet support --no-highlight-colors
+    if not highlight_colors and not supports_no_hl1 and draft_path.is_file():
+        d_root, _, d_ns = docx_xml_utils.load_docx_xml(draft_path)
+        d_cmts = docx_xml_utils.load_docx_comments_xml(draft_path)
+        _strip_all_highlights_in_root(d_root)
+        docx_xml_utils.save_docx_xml(draft_path, draft_path, d_root, d_ns, comments_root=d_cmts)
+
+    # Standalone fallback when step1_render_draft does not yet support --raw-trilingual-output
+    if raw_tri_path_obj is not None and (not supports_raw_tri or not raw_tri_path_obj.is_file()):
+        _build_raw_trilingual_docx_from_manifest(
+            manifest_path=manifest_path,
+            output_path=raw_tri_path_obj,
+            balance_columns=bool(balance_columns),
+        )
+        if log_fn:
+            log_fn(f"  📄 已导出对比前提取三语原稿：{raw_tri_path_obj.name}")
+
+    meta_payload = {"lang_code": detected_lang, "doc_label": clean_doc_label(inp_p.stem)}
+    for meta_dir in (wdir, get_secure_user_workdir(safe_inp_stem)):
+        try:
+            (meta_dir / "session_meta.json").write_text(
+                json.dumps(meta_payload, ensure_ascii=False), encoding="utf-8"
+            )
+        except OSError:
+            pass
 
     if progress_fn:
         progress_fn(100.0, "第一步已完成：初筛稿已生成！")
 
     used_fallback = bool(
-        step1_stats.get("used_local_fallback", False)
-        or (edited_cnt > 0 and not effective_ai)
+        highlight_colors
+        and (
+            step1_stats.get("used_local_fallback", False)
+            or (edited_cnt > 0 and not effective_ai)
+        )
     )
-    fb_reason = step1_stats.get("fallback_reason", "")
-    if not fb_reason and enable_ai and not has_keys:
+    fb_reason = step1_stats.get("fallback_reason", "") if highlight_colors else ""
+    if highlight_colors and not fb_reason and enable_ai and not has_keys:
         fb_reason = "未填写 API Key"
 
     return {
@@ -419,6 +636,7 @@ def run_step1_pipeline(
         "skipped_count": len(skipped_rows),
         "used_local_fallback": used_fallback,
         "fallback_reason": fb_reason,
+        "raw_trilingual_path": str(raw_tri_path_obj) if raw_tri_path_obj is not None else "",
     }
 
 
@@ -429,20 +647,30 @@ def _postprocess_rendered_docx(
     date_yyyymmdd: str,
     balance_columns: bool,
     step2_native_v17: bool,
+    highlight_colors: bool = True,
+    step2_supports_no_hl: bool = False,
 ) -> Tuple[Path, int, int]:
     """
     Ensure every rendered output file has:
       - Balanced 3-column table widths (when `balance_columns=True`)
       - Top 'Blue/Yellow highlighted parts...' instruction lines synchronized with UP/RV counts
+        (or all highlights & header lines stripped when `highlight_colors=False`)
       - Zero word counts omitted in filename (`format_counted_docx_name`)
-    Works identically both before and after `xml-core` merges!
     """
     cfg = docx_xml_utils.load_config()
     col2_up = cfg.get("col2_up_highlight", "yellow")
     col2_rv = cfg.get("col2_rv_highlight", "cyan")
 
     root, _, ns_pairs = docx_xml_utils.load_docx_xml(saved_path)
-    u_w, r_w = docx_xml_utils.compute_col2_up_rv_words(root, up_color=col2_up, rv_color=col2_rv)
+    needs_xml_rewrite = not step2_native_v17
+
+    if not highlight_colors:
+        u_w, r_w = 0, 0
+        if not step2_supports_no_hl or root.find(".//w:rPr/w:highlight", NS) is not None:
+            _strip_all_highlights_in_root(root)
+            needs_xml_rewrite = True
+    else:
+        u_w, r_w = docx_xml_utils.compute_col2_up_rv_words(root, up_color=col2_up, rv_color=col2_rv)
 
     desired_name = format_counted_docx_name(
         lang_code=lang_code,
@@ -453,11 +681,15 @@ def _postprocess_rendered_docx(
     )
     desired_path = docx_xml_utils.safe_join_output_file(saved_path.parent, desired_name)
 
-    if not step2_native_v17:
+    if needs_xml_rewrite:
         comments_root = docx_xml_utils.load_docx_comments_xml(saved_path)
         if balance_columns:
             balance_trilingual_table_widths(root)
-        update_top_highlight_instruction_lines(root, has_up=(u_w > 0), has_rv=(r_w > 0))
+        update_top_highlight_instruction_lines(
+            root,
+            has_up=bool(highlight_colors and u_w > 0),
+            has_rv=bool(highlight_colors and r_w > 0),
+        )
         docx_xml_utils.save_docx_xml(saved_path, desired_path, root, ns_pairs, comments_root=comments_root)
         if os.path.normcase(str(desired_path.resolve())) != os.path.normcase(str(saved_path.resolve())):
             try:
@@ -492,11 +724,13 @@ def run_step2_pipeline(
     balance_columns: bool = True,
     dedup_pkg_dir: str = "",
     date_str: str = "",
+    highlight_colors: bool = True,
 ) -> dict:
+    eff_enable_ai = bool(enable_ai and highlight_colors)
     pool_or_keys, eff_rot, has_keys, effective_ai = _prepare_optional_pool(
         api_key=api_key,
         rotation_mode=rotation_mode,
-        enable_ai=enable_ai,
+        enable_ai=eff_enable_ai,
     )
     draft_p = Path(draft_docx).resolve()
     out_d = Path(output_dir).resolve()
@@ -510,10 +744,12 @@ def run_step2_pipeline(
 
     clean_lang = (lang or "").strip().upper()
     if not clean_lang or clean_lang == "AUTO":
-        meta_path = wdir / "session_meta.json"
-        if meta_path.exists():
-            with open(meta_path, "r", encoding="utf-8") as f:
-                clean_lang = json.load(f).get("lang_code", "XX")
+        legacy_meta = get_secure_user_workdir(base_stem) / "session_meta.json"
+        if legacy_meta.exists():
+            try:
+                clean_lang = json.loads(legacy_meta.read_text(encoding="utf-8")).get("lang_code", "XX")
+            except Exception:
+                clean_lang = "XX"
         else:
             clean_lang = "XX"
 
@@ -545,34 +781,41 @@ def run_step2_pipeline(
     total_spans = sum(len(r.get("spans", [])) for r in tasks_data.get("row_tasks", []))
     total_rows = len(tasks_data.get("row_tasks", []))
 
-    if enable_ai and not has_keys and log_fn:
-        log_fn("  ℹ️ 未填写 API Key，自动采用「本地位置估算模式」完成第 3 列外文标色...")
-
-    mode_desc2 = f"调用 {model}" if effective_ai else "使用「本地位置估算模式」"
-    if progress_fn:
-        progress_fn(14.0, f"第二步 (2/3)：正在{mode_desc2}对齐 {total_rows} 行共 {total_spans} 处外文高亮...")
-    if log_fn:
-        log_fn(f"▶ [第二步 2/3] {mode_desc2}将 {total_spans} 处第 2 列高亮对齐至第 3 列外文...")
-
-    def _sub_prog2(frac: float, msg: str):
-        if progress_fn:
-            progress_fn(14.0 + frac * 74.0, f"第二步 (2/3)：{msg}")
-
-    lang_hint = find_lang_display_name(clean_lang, load_languages())
     step2_stats: dict = {}
-    alignments = align_step2_spans(
-        tasks_data=tasks_data,
-        find_fuzzy_fn=docx_xml_utils.find_fuzzy_substring_span,
-        api_key=pool_or_keys,
-        model=model,
-        api_mode=api_mode,
-        rotation_mode=eff_rot,
-        log_fn=log_fn,
-        progress_fn=_sub_prog2,
-        target_lang_hint=lang_hint,
-        enable_ai=effective_ai,
-        stats_out=step2_stats,
-    )
+    if not highlight_colors:
+        if log_fn:
+            log_fn("▶ [第二步 2/3] 已关闭高亮颜色标记，跳过第 1/3 列高亮对齐与 AI 调用...")
+        alignments = {}
+        total_spans = 0
+    else:
+        if enable_ai and not has_keys and log_fn:
+            log_fn("  ℹ️ 未填写 API Key，自动采用「本地位置估算模式」完成第 3 列外文标色...")
+
+        mode_desc2 = f"调用 {model}" if effective_ai else "使用「本地位置估算模式」"
+        if progress_fn:
+            progress_fn(14.0, f"第二步 (2/3)：正在{mode_desc2}对齐 {total_rows} 行共 {total_spans} 处外文高亮...")
+        if log_fn:
+            log_fn(f"▶ [第二步 2/3] {mode_desc2}将 {total_spans} 处第 2 列高亮对齐至第 3 列外文...")
+
+        def _sub_prog2(frac: float, msg: str):
+            if progress_fn:
+                progress_fn(14.0 + frac * 74.0, f"第二步 (2/3)：{msg}")
+
+        lang_hint = find_lang_display_name(clean_lang, load_languages())
+        alignments = align_step2_spans(
+            tasks_data=tasks_data,
+            find_fuzzy_fn=docx_xml_utils.find_fuzzy_substring_span,
+            api_key=pool_or_keys,
+            model=model,
+            api_mode=api_mode,
+            rotation_mode=eff_rot,
+            log_fn=log_fn,
+            progress_fn=_sub_prog2,
+            target_lang_hint=lang_hint,
+            enable_ai=effective_ai,
+            stats_out=step2_stats,
+        )
+
     alignments_path = wdir / "step2_alignments.json"
     with open(alignments_path, "w", encoding="utf-8") as f:
         json.dump(alignments, f, ensure_ascii=False, indent=2)
@@ -580,6 +823,7 @@ def run_step2_pipeline(
     supports_no_bal = _script_supports_cli_flag(
         step2_render_final, "--no-balance-columns", "balance_trilingual_table_widths"
     )
+    supports_no_hl2 = _script_supports_cli_flag(step2_render_final, "--no-highlight-colors")
     step2_native_v17 = supports_no_bal and callable(getattr(docx_xml_utils, "format_up_rv_count_tag", None))
 
     saved_files: List[str] = []
@@ -616,6 +860,8 @@ def run_step2_pipeline(
                 argv2b.append(filter_flag)
             if not balance_columns and supports_no_bal:
                 argv2b.append("--no-balance-columns")
+            if not highlight_colors and supports_no_hl2:
+                argv2b.append("--no-highlight-colors")
             out_txt = _run_module_main(step2_render_final.main, argv2b, log_fn=log_fn)
             m = re.search(r"Final Document Saved:\s*(.+)", out_txt)
             if m:
@@ -627,6 +873,8 @@ def run_step2_pipeline(
                     date_yyyymmdd=date_yyyymmdd,
                     balance_columns=bool(balance_columns),
                     step2_native_v17=step2_native_v17,
+                    highlight_colors=bool(highlight_colors),
+                    step2_supports_no_hl=supports_no_hl2,
                 )
                 if idx == 0 and clean_dedup_dir:
                     d_res = remove_unmerged_duplicates_from_docx(
@@ -640,8 +888,8 @@ def run_step2_pipeline(
                     )
                     dedup_removed_count = int(d_res.get("duplicate_count", 0))
                     dedup_report_path = str(d_res.get("report_path") or "")
-                    u_w = int(d_res.get("up_words", u_w))
-                    r_w = int(d_res.get("rv_words", r_w))
+                    u_w = int(d_res.get("up_words", u_w)) if highlight_colors else 0
+                    r_w = int(d_res.get("rv_words", r_w)) if highlight_colors else 0
                     if dedup_removed_count > 0:
                         recalc_name = format_counted_docx_name(
                             lang_code=clean_lang,
@@ -675,6 +923,8 @@ def run_step2_pipeline(
         ]
         if not balance_columns and supports_no_bal:
             argv2b.append("--no-balance-columns")
+        if not highlight_colors and supports_no_hl2:
+            argv2b.append("--no-highlight-colors")
         out_txt = _run_module_main(step2_render_final.main, argv2b, log_fn=log_fn)
         m = re.search(r"Final Document Saved:\s*(.+)", out_txt)
         if m:
@@ -686,6 +936,8 @@ def run_step2_pipeline(
                 date_yyyymmdd=date_yyyymmdd,
                 balance_columns=bool(balance_columns),
                 step2_native_v17=step2_native_v17,
+                highlight_colors=bool(highlight_colors),
+                step2_supports_no_hl=supports_no_hl2,
             )
             if clean_dedup_dir:
                 d_res = remove_unmerged_duplicates_from_docx(
@@ -699,8 +951,8 @@ def run_step2_pipeline(
                 )
                 dedup_removed_count = int(d_res.get("duplicate_count", 0))
                 dedup_report_path = str(d_res.get("report_path") or "")
-                u_w = int(d_res.get("up_words", u_w))
-                r_w = int(d_res.get("rv_words", r_w))
+                u_w = int(d_res.get("up_words", u_w)) if highlight_colors else 0
+                r_w = int(d_res.get("rv_words", r_w)) if highlight_colors else 0
                 if dedup_removed_count > 0:
                     recalc_name = format_counted_docx_name(
                         lang_code=clean_lang,
@@ -719,26 +971,32 @@ def run_step2_pipeline(
             up_words, rv_words = u_w, r_w
 
     if (up_words is None or rv_words is None) and saved_files:
-        try:
-            cfg = docx_xml_utils.load_config()
-            r_doc, _, _ = docx_xml_utils.load_docx_xml(Path(saved_files[0]))
-            up_words, rv_words = docx_xml_utils.compute_col2_up_rv_words(
-                r_doc,
-                up_color=cfg.get("col2_up_highlight", "yellow"),
-                rv_color=cfg.get("col2_rv_highlight", "cyan"),
-            )
-        except Exception:
+        if not highlight_colors:
             up_words, rv_words = 0, 0
+        else:
+            try:
+                cfg = docx_xml_utils.load_config()
+                r_doc, _, _ = docx_xml_utils.load_docx_xml(Path(saved_files[0]))
+                up_words, rv_words = docx_xml_utils.compute_col2_up_rv_words(
+                    r_doc,
+                    up_color=cfg.get("col2_up_highlight", "yellow"),
+                    rv_color=cfg.get("col2_rv_highlight", "cyan"),
+                )
+            except Exception:
+                up_words, rv_words = 0, 0
 
     if progress_fn:
         progress_fn(100.0, f"第二步已完成：共生成 {len(saved_files)} 个定稿文件！")
 
     used_fallback = bool(
-        step2_stats.get("used_local_fallback", False)
-        or (total_spans > 0 and not effective_ai)
+        highlight_colors
+        and (
+            step2_stats.get("used_local_fallback", False)
+            or (total_spans > 0 and not effective_ai)
+        )
     )
-    fb_reason = step2_stats.get("fallback_reason", "")
-    if not fb_reason and enable_ai and not has_keys:
+    fb_reason = step2_stats.get("fallback_reason", "") if highlight_colors else ""
+    if highlight_colors and not fb_reason and enable_ai and not has_keys:
         fb_reason = "未填写 API Key"
 
     return {
@@ -751,6 +1009,7 @@ def run_step2_pipeline(
         "fallback_reason": fb_reason,
         "dedup_removed_count": dedup_removed_count,
         "dedup_report_path": dedup_report_path,
+        "workdir": str(wdir),
     }
 
 
@@ -774,14 +1033,18 @@ def run_oneclick_pipeline(
     log_fn: Optional[Callable[[str], None]] = None,
     progress_fn: Optional[Callable[[float, str], None]] = None,
     date_mmdd: str = "",
+    latest_master_path: str = "",
+    highlight_colors: bool = True,
+    yellow_gap_words: int = 3,
+    export_raw_trilingual: bool = True,
 ) -> dict:
     """
     One-click end-to-end Scattered Revision pipeline:
-      1. Warms/loads the persistent multi-threaded library index;
-      2. Runs Step 1 into an ephemeral temp directory (keeping `output_dir` 100% free of intermediate drafts);
-      3. Runs Step 2 (with multi-threaded AI alignment or automatic local approximate Col 3 fallback);
-      4. Optionally deduplicates `发译者版` against `dedup_pkg_dir` (`未入库改点包`);
-      5. Outputs clean final `.docx` deliverables (with 0-word counts omitted) to `output_dir`.
+      1. Optionally syncs `input_docx` against `latest_master_path` (`{原名}{YYYYMMDD}更新.docx`);
+      2. Warms/loads the persistent multi-threaded library index (checking live `os.stat` on disk);
+      3. Runs Step 1 in a fresh ephemeral workdir (optionally exporting `_提取三语原稿_`);
+      4. Runs Step 2 (skipping AI & highlights when `highlight_colors=False`);
+      5. Keeps ALL single-doc outputs flat in `output_dir` (NO subfolders) and cleans up ephemeral workdirs.
     """
     inp_p = Path(input_docx).resolve()
     lib_p = Path(library_dir).resolve()
@@ -792,14 +1055,35 @@ def run_oneclick_pipeline(
         raise FileNotFoundError(f"找不到语种总库文件夹：{lib_p}")
     out_d.mkdir(parents=True, exist_ok=True)
 
+    eff_enable_ai = bool(enable_ai and highlight_colors)
     pool_or_keys, eff_rot, has_keys, effective_ai = _prepare_optional_pool(
         api_key=api_key,
         rotation_mode=rotation_mode,
-        enable_ai=enable_ai,
+        enable_ai=eff_enable_ai,
     )
 
+    eff_date = (date_str or date_mmdd or "").strip() or datetime.now().strftime("%Y%m%d")
+
+    pre_saved_files: List[str] = []
+    master_sync_res: Optional[dict] = None
+    effective_input_p = inp_p
+    clean_master_path = (latest_master_path or "").strip()
+    if clean_master_path:
+        if progress_fn:
+            progress_fn(1.0, "正在核对最新中英底稿并同步更新待处理文档...")
+        master_sync_res = sync_pending_with_latest_master(
+            pending_docx=inp_p,
+            latest_master_path=clean_master_path,
+            output_dir=out_d,
+            date_str=eff_date,
+            log_fn=log_fn,
+        )
+        upd_path_str = str(master_sync_res["updated_docx_path"])
+        pre_saved_files.append(upd_path_str)
+        effective_input_p = Path(upd_path_str).resolve()
+
     if progress_fn:
-        progress_fn(2.0, "正在预热/加载语种总库检索索引...")
+        progress_fn(3.0, "正在预热/加载语种总库检索索引...")
     idx_stats = ensure_library_index(str(lib_p), log_fn=log_fn)
     if log_fn:
         log_fn(
@@ -812,18 +1096,19 @@ def run_oneclick_pipeline(
         naming_mode=naming_mode,
         scattered_keyword=scattered_keyword,
         fallback_stem=inp_p.stem,
-        source_docx_path=inp_p,
+        source_docx_path=effective_input_p,
     )
-    eff_date = (date_str or date_mmdd or "").strip()
 
     tmp_draft_dir = tempfile.mkdtemp(prefix="scattered_rev_draft_")
+    wdir1_str = ""
+    wdir2_str = ""
     try:
         def _prog_s1(p: float, msg: str):
             if progress_fn:
                 progress_fn(6.0 + (p / 100.0) * 44.0, msg)
 
         r1 = run_step1_pipeline(
-            input_docx=str(inp_p),
+            input_docx=str(effective_input_p),
             library_dir=str(lib_p),
             output_dir=tmp_draft_dir,
             api_key=pool_or_keys,
@@ -834,14 +1119,22 @@ def run_oneclick_pipeline(
             log_fn=log_fn,
             progress_fn=_prog_s1,
             enable_ai=effective_ai,
+            highlight_colors=bool(highlight_colors),
+            yellow_gap_words=yellow_gap_words,
+            export_raw_trilingual=bool(export_raw_trilingual),
+            raw_trilingual_dir=str(out_d),
+            raw_trilingual_label=resolved_doc_name,
+            date_str=eff_date,
+            balance_columns=bool(balance_columns),
         )
+        wdir1_str = str(r1.get("workdir") or "")
 
         det_lang = r1.get("lang_code") or "XX"
         skipped_rows = r1.get("skipped_rows") or []
         step1_failed_api = bool(effective_ai and r1.get("used_local_fallback") and r1.get("fallback_reason"))
 
-        step2_enable_ai = effective_ai
-        if step1_failed_api:
+        step2_enable_ai = effective_ai and bool(highlight_colors)
+        if step1_failed_api and highlight_colors:
             if log_fn:
                 log_fn(f"  ⚠️ {r1['fallback_reason']} -> 已自动切换「本地位置估算模式」完成第 3 列标色")
             step2_enable_ai = False
@@ -870,23 +1163,36 @@ def run_oneclick_pipeline(
             balance_columns=balance_columns,
             dedup_pkg_dir=dedup_pkg_dir,
             date_str=eff_date,
+            highlight_colors=bool(highlight_colors),
         )
+        wdir2_str = str(r2.get("workdir") or "")
     finally:
         shutil.rmtree(tmp_draft_dir, ignore_errors=True)
+        for wd_s in (wdir1_str, wdir2_str):
+            if wd_s:
+                shutil.rmtree(wd_s, ignore_errors=True)
+
+    all_saved: List[str] = []
+    for fp_s in [*pre_saved_files, *r2["saved_files"], r1.get("raw_trilingual_path") or ""]:
+        if fp_s and fp_s not in all_saved:
+            all_saved.append(fp_s)
 
     used_fallback = bool(
-        r1.get("used_local_fallback")
-        or r2.get("used_local_fallback")
-        or (enable_ai and not has_keys)
-        or (not enable_ai)
+        highlight_colors
+        and (
+            r1.get("used_local_fallback")
+            or r2.get("used_local_fallback")
+            or (enable_ai and not has_keys)
+            or (not enable_ai)
+        )
     )
-    fallback_reason = r2.get("fallback_reason") or r1.get("fallback_reason") or ""
+    fallback_reason = (r2.get("fallback_reason") or r1.get("fallback_reason") or "") if highlight_colors else ""
 
     if progress_fn:
-        progress_fn(100.0, f"一键整理已完成：共输出 {len(r2['saved_files'])} 份定稿！")
+        progress_fn(100.0, f"一键整理已完成：共输出 {len(all_saved)} 份文档！")
 
     return {
-        "saved_files": r2["saved_files"],
+        "saved_files": all_saved,
         "lang_code": r2.get("lang_code") or det_lang,
         "skipped_count": len(skipped_rows),
         "skipped_rows": skipped_rows,
@@ -898,4 +1204,7 @@ def run_oneclick_pipeline(
         "edited_sentences": int(r1.get("edited_sentences", 0)),
         "dedup_removed_count": int(r2.get("dedup_removed_count", 0)),
         "dedup_report_path": r2.get("dedup_report_path", ""),
+        "raw_trilingual_path": r1.get("raw_trilingual_path", ""),
+        "updated_master_docx_path": pre_saved_files[0] if pre_saved_files else "",
+        "master_sync_result": master_sync_res,
     }
