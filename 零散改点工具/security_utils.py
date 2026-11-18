@@ -5,8 +5,10 @@ import hashlib
 import os
 from pathlib import Path
 import re
+import shutil
 import sys
 import tempfile
+import time
 import urllib.parse
 
 ALLOWED_API_HOSTS = frozenset({
@@ -247,24 +249,99 @@ def _is_reparse_or_symlink(p: Path) -> bool:
     return False
 
 
+def _resolve_secure_work_root() -> Path:
+    local_app = os.environ.get("LOCALAPPDATA", "").strip()
+    base_root = Path(local_app) if local_app else Path(tempfile.gettempdir())
+    tool_root = base_root / "ScatteredRevisionTool"
+    app_root = tool_root / "work"
+
+    for check_p in (tool_root, app_root):
+        if check_p.exists() and _is_reparse_or_symlink(check_p):
+            raise RuntimeError(f"检测到不安全的符号链接或重解析点工作目录，已拒绝访问：{check_p}")
+
+    app_root.mkdir(parents=True, exist_ok=True)
+    if _is_reparse_or_symlink(app_root):
+        raise RuntimeError(f"工作目录校验异常（疑似重解析点）：{app_root}")
+    return app_root
+
+
+def _prune_stale_workdirs(app_root: Path, max_age_seconds: float = 6 * 3600) -> int:
+    """Opportunistically remove sibling workdirs in `app_root` older than `max_age_seconds` (default 6h)."""
+    if max_age_seconds <= 0 or not app_root.is_dir():
+        return 0
+    cutoff = time.time() - float(max_age_seconds)
+    pruned = 0
+    try:
+        with os.scandir(app_root) as it:
+            entries = list(it)
+    except OSError:
+        return 0
+
+    for entry in entries:
+        try:
+            p = Path(entry.path)
+            if not entry.is_dir(follow_symlinks=False) or _is_reparse_or_symlink(p):
+                continue
+            st = os.stat(p)
+            latest_mtime = st.st_mtime
+            if latest_mtime < cutoff:
+                try:
+                    with os.scandir(p) as sub_it:
+                        for sub in sub_it:
+                            try:
+                                sub_mt = os.stat(sub.path).st_mtime
+                                if sub_mt > latest_mtime:
+                                    latest_mtime = sub_mt
+                            except OSError:
+                                pass
+                except OSError:
+                    pass
+            if latest_mtime < cutoff:
+                shutil.rmtree(p, ignore_errors=True)
+                pruned += 1
+        except OSError:
+            continue
+    return pruned
+
+
 def get_secure_user_workdir(stem: str) -> Path:
     """
     Create and return a per-user private working directory under %LOCALAPPDATA%,
     rejecting symlink or NTFS junction reparse points (mitigates CWE-377 / CWE-59).
     """
-    local_app = os.environ.get("LOCALAPPDATA", "").strip()
-    base_root = Path(local_app) if local_app else Path(tempfile.gettempdir())
-    app_root = base_root / "ScatteredRevisionTool" / "work"
-
-    safe_stem = re.sub(r"[^\w\u4e00-\u9fff-]+", "_", stem).strip("_")[:36] or "doc"
-    digest = hashlib.sha256(stem.encode("utf-8")).hexdigest()[:12]
+    app_root = _resolve_secure_work_root()
+    safe_stem = re.sub(r"[^\w\u4e00-\u9fff-]+", "_", stem or "").strip("_")[:36] or "doc"
+    digest = hashlib.sha256((stem or "").encode("utf-8")).hexdigest()[:12]
     target = app_root / f"{safe_stem}_{digest}"
 
-    for check_p in (base_root / "ScatteredRevisionTool", app_root, target):
-        if check_p.exists() and _is_reparse_or_symlink(check_p):
-            raise RuntimeError(f"检测到不安全的符号链接或重解析点工作目录，已拒绝访问：{check_p}")
+    if target.exists() and _is_reparse_or_symlink(target):
+        raise RuntimeError(f"检测到不安全的符号链接或重解析点工作目录，已拒绝访问：{target}")
 
     target.mkdir(parents=True, exist_ok=True)
     if _is_reparse_or_symlink(target):
         raise RuntimeError(f"工作目录校验异常（疑似重解析点）：{target}")
     return target
+
+
+def create_ephemeral_workdir(stem: str, max_age_hours: float = 6.0) -> Path:
+    """
+    Create and return a 100% fresh, unique per-run working directory under
+    `%LOCALAPPDATA%\\ScatteredRevisionTool\\work\\` using timestamp + `os.urandom(4).hex()`,
+    while opportunistically pruning stale sibling workdirs older than `max_age_hours` (default 6h).
+    """
+    app_root = _resolve_secure_work_root()
+    _prune_stale_workdirs(app_root, max_age_seconds=max(0.0, float(max_age_hours)) * 3600.0)
+
+    safe_stem = re.sub(r"[^\w\u4e00-\u9fff-]+", "_", stem or "").strip("_")[:28] or "doc"
+    for _ in range(8):
+        ts_str = time.strftime("%Y%m%d_%H%M%S")
+        rand_hex = os.urandom(4).hex()
+        target = app_root / f"{safe_stem}_{ts_str}_{rand_hex}"
+        if target.exists():
+            continue
+        target.mkdir(parents=True, exist_ok=False)
+        if _is_reparse_or_symlink(target):
+            raise RuntimeError(f"工作目录校验异常（疑似重解析点）：{target}")
+        return target
+
+    raise RuntimeError(f"无法创建唯一临时工作目录：{app_root}")
