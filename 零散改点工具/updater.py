@@ -20,7 +20,7 @@ try:
 except ImportError:
     create_secure_update_stagedir = None
 
-APP_VERSION = "1.8.0"
+APP_VERSION = "1.8.1"
 GITHUB_REPO = "zcnz2026/TranslationTools"
 
 ZIP_ASSET_NAME = "ScatteredRevisionTool-Windows-x64.zip"

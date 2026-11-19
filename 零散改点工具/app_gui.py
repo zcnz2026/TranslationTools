@@ -97,7 +97,7 @@ try:
 except ImportError:
     _updater_mod = None
 
-RAW_APP_VERSION = "1.8.0"
+RAW_APP_VERSION = "1.8.1"
 APP_VERSION = f"v{RAW_APP_VERSION}"
 check_for_updates = getattr(_updater_mod, "check_for_updates", None)
 download_and_apply_update = getattr(_updater_mod, "download_and_apply_update", None)
@@ -6340,8 +6340,8 @@ def _run_frozen_self_test() -> int:
     from ai_client import format_friendly_api_error as _ai_friendly_err
     from ai_client import local_align_col3_spans
 
-    if RAW_APP_VERSION != "1.8.0":
-        raise RuntimeError(f"RAW_APP_VERSION expected '1.8.0', got {RAW_APP_VERSION!r}")
+    if RAW_APP_VERSION != "1.8.1":
+        raise RuntimeError(f"RAW_APP_VERSION expected '1.8.1', got {RAW_APP_VERSION!r}")
 
     is_frozen = bool(getattr(sys, "frozen", False))
     if is_frozen and hasattr(sys, "_MEIPASS"):
@@ -6451,7 +6451,7 @@ def _run_frozen_self_test() -> int:
             raise RuntimeError("dedup_checker.check_and_export_duplicates missing in self-test")
 
         upd_ver = str(getattr(_upd_test, "APP_VERSION", "")).lstrip("vV")
-        expected_vers = ("1.8.0",) if require_v18_siblings else ("1.7.0", "1.8.0")
+        expected_vers = ("1.8.1",) if require_v18_siblings else ("1.7.0", "1.8.0", "1.8.1")
         if upd_ver not in expected_vers:
             raise RuntimeError(f"updater.APP_VERSION mismatch: {getattr(_upd_test, 'APP_VERSION', None)!r}")
         if not callable(getattr(_upd_test, "check_for_updates", None)) or not callable(
