@@ -40,6 +40,7 @@ from ai_client import ApiKeyPool, align_step2_spans, evaluate_step1_decisions  #
 from dedup_checker import remove_unmerged_duplicates_from_docx  # noqa: E402
 from lang_registry import find_lang_display_name, load_languages  # noqa: E402
 from master_sync import _accept_cell_revisions_inplace  # noqa: E402
+from security_utils import create_ephemeral_workdir  # noqa: E402
 from pipeline import (  # noqa: E402
     _build_raw_trilingual_docx_from_manifest,
     _postprocess_rendered_docx,
@@ -419,9 +420,8 @@ def _parse_single_master_docx(task: Tuple[str, str, int, int]) -> Tuple[str, dic
     try:
         with zipfile.ZipFile(abs_path_str, "r") as zf:
             docx_xml_utils._validate_docx_zip(zf)
-            xml_bytes = zf.read("word/document.xml")
-        docx_xml_utils._assert_safe_openxml_bytes(xml_bytes)
-        root = ET.fromstring(xml_bytes)
+            xml_bytes = docx_xml_utils.read_docx_member_bounded(zf, "word/document.xml")
+        root = docx_xml_utils.parse_safe_openxml_bytes(xml_bytes)
     except Exception as ex:
         return rel_posix, {
             "rel_path": rel_posix,
@@ -1794,7 +1794,7 @@ def run_full_article_pipeline(
         if progress_fn:
             progress_fn(base_pct, f"[{a_idx + 1}/{total_arts}] 正在提取《{cn_disp}》并比对外文总库...")
 
-        tmp_root = Path(tempfile.mkdtemp(prefix=f"full_art_{a_idx + 1}_")).resolve()
+        tmp_root = create_ephemeral_workdir(f"full_art_{a_idx + 1}")
         try:
             extracted_docx = tmp_root / "extracted_article.docx"
             workdir = tmp_root / "work"

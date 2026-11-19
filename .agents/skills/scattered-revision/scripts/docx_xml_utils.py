@@ -309,12 +309,32 @@ def _validate_docx_zip(zf: zipfile.ZipFile) -> None:
             )
 
 
-def _assert_safe_openxml_bytes(xml_bytes: bytes) -> None:
-    """Block DTD / Entity declarations (Billion Laughs / XXE) before XML parsing."""
-    if len(xml_bytes) > MAX_DOCX_MEMBER_BYTES:
+def _assert_safe_openxml_bytes(xml_bytes: bytes, max_bytes: int = MAX_DOCX_MEMBER_BYTES) -> None:
+    """Block DTD / Entity declarations (Billion Laughs / XXE) and oversized streams before XML parsing."""
+    if len(xml_bytes) > max_bytes:
         raise ValueError("OpenXML member exceeds maximum allowed byte size.")
     if _DTD_RE.search(xml_bytes):
         raise ValueError("Unsafe XML DOCTYPE/ENTITY declaration rejected in OpenXML document.")
+
+
+def read_docx_member_bounded(
+    zf: zipfile.ZipFile,
+    member: str | zipfile.ZipInfo,
+    max_bytes: int = MAX_DOCX_MEMBER_BYTES,
+) -> bytes:
+    """Read a ZIP member enforcing an actual decompressed stream byte limit (defends against forged ZIP headers)."""
+    with zf.open(member, "r") as fp:
+        data = fp.read(max_bytes + 1)
+    if len(data) > max_bytes:
+        mname = member.filename if isinstance(member, zipfile.ZipInfo) else str(member)
+        raise ValueError(f"ZIP member {mname!r} actual decompressed stream exceeds safety limit ({max_bytes} bytes).")
+    return data
+
+
+def parse_safe_openxml_bytes(xml_bytes: bytes, max_bytes: int = MAX_DOCX_MEMBER_BYTES) -> ET.Element:
+    """Validate OpenXML bytes against DTD/Entity & byte limits, then parse with ElementTree."""
+    _assert_safe_openxml_bytes(xml_bytes, max_bytes=max_bytes)
+    return ET.fromstring(xml_bytes)
 
 
 def _local_name(tag_or_attr: str) -> str:

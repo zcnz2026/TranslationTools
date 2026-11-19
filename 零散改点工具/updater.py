@@ -1,3 +1,4 @@
+import base64
 import hashlib
 import json
 import os
@@ -13,6 +14,11 @@ import urllib.error
 import urllib.parse
 import urllib.request
 import zipfile
+
+try:
+    from security_utils import create_secure_update_stagedir
+except ImportError:
+    create_secure_update_stagedir = None
 
 APP_VERSION = "1.8.0"
 GITHUB_REPO = "zcnz2026/TranslationTools"
@@ -334,9 +340,18 @@ def _write_and_launch_windows_updater_script(
         "try {",
         "    Remove-Item -LiteralPath $StagedExe -Force -ErrorAction SilentlyContinue",
         "} catch {}",
-        "$CleanCmd = 'ping 127.0.0.1 -n 3 >nul & rmdir /s /q \"' + $StageDir + '\"'",
-        "Start-Process -FilePath 'cmd.exe' -ArgumentList '/c', $CleanCmd -WindowStyle Hidden",
     ]
+    # Pure PowerShell -EncodedCommand cleanup (eliminates shell string interpolation & %VAR% / & hazards)
+    clean_ps_code = (
+        f"Start-Sleep -Seconds 2; "
+        f"Remove-Item -LiteralPath {_ps_quote(str(stage_dir))} -Recurse -Force -ErrorAction SilentlyContinue"
+    )
+    clean_b64 = base64.b64encode(clean_ps_code.encode("utf-16-le")).decode("ascii")
+    ps_lines.append(
+        f"Start-Process -FilePath 'powershell.exe' "
+        f"-ArgumentList '-NoProfile', '-NonInteractive', '-WindowStyle', 'Hidden', '-EncodedCommand', '{clean_b64}' "
+        f"-WindowStyle Hidden"
+    )
     script_path.write_text("\r\n".join(ps_lines) + "\r\n", encoding="utf-8-sig")
 
     creation_flags = 0
@@ -345,6 +360,7 @@ def _write_and_launch_windows_updater_script(
             subprocess, "DETACHED_PROCESS", 0x00000008
         )
 
+    safe_cwd = str(stage_dir.parent if stage_dir.parent.is_dir() else Path(tempfile.gettempdir()))
     subprocess.Popen(
         [
             "powershell.exe",
@@ -357,7 +373,7 @@ def _write_and_launch_windows_updater_script(
             "-File",
             str(script_path),
         ],
-        cwd=str(tempfile.gettempdir()),
+        cwd=safe_cwd,
         close_fds=True,
         creationflags=creation_flags,
     )
@@ -370,8 +386,9 @@ def download_and_apply_update(
     timeout: float = 30.0,
 ) -> dict:
     """
-    Download release ZIP, verify SHA-256 against `SHA256SUMS.txt` when available,
-    safely extract `零散改点整理工具.exe`, and stage detached auto-restart replacement when frozen.
+    Download release ZIP, strictly enforce SHA-256 verification against `SHA256SUMS.txt`
+    (both archive and extracted executable, fail-closed), safely extract `零散改点整理工具.exe`,
+    and stage detached auto-restart replacement when frozen.
     """
     if not isinstance(update_info, dict):
         raise ValueError("更新信息格式无效。")
@@ -383,32 +400,35 @@ def download_and_apply_update(
 
     if not zip_url:
         raise ValueError(f"当前新版本 (v{latest_ver}) 尚未包含 Windows 更新包附件 ({ZIP_ASSET_NAME})。")
+    if not sha256_url:
+        raise ValueError(f"当前新版本 (v{latest_ver}) 缺少官方安全校验文件 ({SHA256_ASSET_NAME})，已拒绝自动更新。")
     validate_github_https_url(zip_url)
-    if sha256_url:
-        validate_github_https_url(sha256_url)
+    validate_github_https_url(sha256_url)
     if html_url:
         validate_github_https_url(html_url)
 
-    stage_dir = Path(tempfile.mkdtemp(prefix="scattered_rev_update_")).resolve()
+    if callable(create_secure_update_stagedir):
+        stage_dir = create_secure_update_stagedir()
+    else:
+        stage_dir = Path(tempfile.mkdtemp(prefix="scattered_rev_update_")).resolve()
     zip_path = stage_dir / ZIP_ASSET_NAME
 
     try:
-        expected_zip_sha = ""
-        expected_exe_sha = ""
-        if sha256_url:
-            if progress_fn:
-                progress_fn(3.0, "正在获取官方 SHA-256 安全校验清单...")
-            req_sha = urllib.request.Request(
-                sha256_url,
-                headers={"User-Agent": _user_agent_header(APP_VERSION)},
-                method="GET",
-            )
-            with _open_with_proxy_fallback(req_sha, timeout=timeout) as resp_sha:
-                sums_raw = resp_sha.read(65536).decode("utf-8", errors="replace")
-            expected_zip_sha = parse_sha256sums(sums_raw, ZIP_ASSET_NAME)
-            expected_exe_sha = parse_sha256sums(sums_raw, EXE_ENTRY_NAME)
-            if not expected_zip_sha:
-                raise ValueError("SHA256SUMS.txt 中未找到更新压缩包的校验值，已安全中止。")
+        if progress_fn:
+            progress_fn(3.0, "正在获取官方 SHA-256 安全校验清单...")
+        req_sha = urllib.request.Request(
+            sha256_url,
+            headers={"User-Agent": _user_agent_header(APP_VERSION)},
+            method="GET",
+        )
+        with _open_with_proxy_fallback(req_sha, timeout=timeout) as resp_sha:
+            sums_raw = resp_sha.read(65536).decode("utf-8", errors="replace")
+        expected_zip_sha = parse_sha256sums(sums_raw, ZIP_ASSET_NAME)
+        expected_exe_sha = parse_sha256sums(sums_raw, EXE_ENTRY_NAME)
+        if not expected_zip_sha:
+            raise ValueError("SHA256SUMS.txt 中未找到更新压缩包的校验值，已安全中止。")
+        if not expected_exe_sha:
+            raise ValueError("SHA256SUMS.txt 中未找到主程序的 SHA-256 校验值，已安全中止。")
 
         if progress_fn:
             progress_fn(6.0, f"正在下载更新包 v{latest_ver} ({ZIP_ASSET_NAME})...")
@@ -454,7 +474,7 @@ def download_and_apply_update(
         actual_zip_sha = hasher.hexdigest().lower()
         if progress_fn:
             progress_fn(85.0, "正在校验更新包完整性与安全性 (SHA-256)...")
-        if expected_zip_sha and actual_zip_sha != expected_zip_sha:
+        if actual_zip_sha != expected_zip_sha:
             raise ValueError(
                 f"更新包 SHA-256 校验失败（期望 {expected_zip_sha[:12]}...，实际 {actual_zip_sha[:12]}...），已中止更新！"
             )
@@ -463,10 +483,9 @@ def download_and_apply_update(
             progress_fn(91.0, f"正在安全提取新版主程序 ({EXE_ENTRY_NAME})...")
         staged_exe = _validate_and_extract_exe_from_zip(zip_path, stage_dir)
 
-        if expected_exe_sha:
-            actual_exe_sha = compute_file_sha256(staged_exe)
-            if actual_exe_sha != expected_exe_sha:
-                raise ValueError("解压后的主程序 SHA-256 校验不匹配，已安全中止更新！")
+        actual_exe_sha = compute_file_sha256(staged_exe)
+        if actual_exe_sha != expected_exe_sha:
+            raise ValueError("解压后的主程序 SHA-256 校验不匹配，已安全中止更新！")
 
         # Remove downloaded ZIP now that EXE is verified & staged
         try:

@@ -61,7 +61,28 @@ from lang_registry import (
 
 
 MAX_DOCX_ENTRIES = 5000
+MAX_DOCX_MEMBER_BYTES = 100 * 1024 * 1024
 MAX_DOCX_UNCOMPRESSED_BYTES = 300 * 1024 * 1024
+_DTD_RE = re.compile(rb"<!\s*(?:DOCTYPE|ENTITY)\b", re.IGNORECASE)
+
+
+def _read_zip_member_bounded(zf: zipfile.ZipFile, member: str | zipfile.ZipInfo, max_bytes: int = MAX_DOCX_MEMBER_BYTES) -> bytes:
+    """Read a ZIP member enforcing an actual decompressed stream byte limit (defends against forged ZIP headers)."""
+    with zf.open(member, "r") as fp:
+        data = fp.read(max_bytes + 1)
+    if len(data) > max_bytes:
+        mname = member.filename if isinstance(member, zipfile.ZipInfo) else str(member)
+        raise ValueError(f"文档内部成员解压流体积超过安全上限 ({max_bytes // (1024 * 1024)}MB)：{mname}")
+    return data
+
+
+def _parse_safe_xml_bytes(xml_bytes: bytes, max_bytes: int = MAX_DOCX_MEMBER_BYTES) -> ET.Element:
+    """Reject DTD / ENTITY declarations and oversized XML payloads before ElementTree parsing."""
+    if len(xml_bytes) > max_bytes:
+        raise ValueError("XML 内容体积超过安全上限。")
+    if _DTD_RE.search(xml_bytes):
+        raise ValueError("检测到不安全的 XML DOCTYPE/ENTITY 声明，已拒绝解析。")
+    return ET.fromstring(xml_bytes)
 
 
 def validate_docx_archive(docx_path: Path) -> None:
@@ -76,10 +97,15 @@ def validate_docx_archive(docx_path: Path) -> None:
         total_uncompressed = 0
         has_doc_xml = False
         for info in infos:
-            fn = info.filename.replace("\\", "/")
-            if fn.startswith("/") or ".." in fn.split("/"):
-                raise ValueError(f"文档包含不安全的归档路径：{info.filename}")
-            total_uncompressed += max(0, info.file_size)
+            raw_fn = info.filename
+            if "\x00" in raw_fn or ":" in raw_fn or raw_fn.startswith(("/", "\\")):
+                raise ValueError(f"文档包含不安全的归档路径：{raw_fn}")
+            fn = raw_fn.replace("\\", "/")
+            if ".." in fn.split("/"):
+                raise ValueError(f"文档包含路径穿越风险条目：{raw_fn}")
+            if info.file_size < 0 or info.file_size > MAX_DOCX_MEMBER_BYTES:
+                raise ValueError(f"文档单条目体积超过安全上限 (100MB)：{raw_fn}")
+            total_uncompressed += info.file_size
             if total_uncompressed > MAX_DOCX_UNCOMPRESSED_BYTES:
                 raise ValueError(f"文档解压体积超过安全上限 (300MB)：{p.name}")
             if fn == "word/document.xml":
@@ -574,7 +600,7 @@ def sanitize_fellowship_ooxml(root: ET.Element, valid_rel_ids: Optional[Set[str]
 def disable_track_revisions_in_settings_xml(settings_bytes: bytes) -> bytes:
     """Remove <w:trackRevisions/> from word/settings.xml so Word opens with '修订: 关闭'."""
     try:
-        s_root = ET.fromstring(settings_bytes)
+        s_root = _parse_safe_xml_bytes(settings_bytes)
         removed = False
         for tr_el in list(s_root.findall(f".//{W}trackRevisions")):
             for parent in s_root.iter():
@@ -594,7 +620,7 @@ def strip_comment_and_people_rels_bytes(rels_bytes: bytes) -> Tuple[bytes, Set[s
     valid_ids: Set[str] = set()
     try:
         ET.register_namespace("", REL_PKG_NS)
-        r_root = ET.fromstring(rels_bytes)
+        r_root = _parse_safe_xml_bytes(rels_bytes)
         changed = False
         for rel in list(r_root):
             target = rel.attrib.get("Target", "").lower()
@@ -616,7 +642,7 @@ def strip_comment_and_people_rels_bytes(rels_bytes: bytes) -> Tuple[bytes, Set[s
 def strip_comment_and_people_content_types_bytes(ct_bytes: bytes) -> bytes:
     try:
         ET.register_namespace("", CT_NS)
-        c_root = ET.fromstring(ct_bytes)
+        c_root = _parse_safe_xml_bytes(ct_bytes)
         changed = False
         for ov in list(c_root):
             pn = ov.attrib.get("PartName", "").lower()
@@ -3191,7 +3217,7 @@ def write_cleaned_docx(
             cleaned_rels_bytes: Optional[bytes] = None
             valid_rel_ids: Optional[Set[str]] = None
             if "word/_rels/document.xml.rels" in zin.namelist():
-                raw_rels = zin.read("word/_rels/document.xml.rels")
+                raw_rels = _read_zip_member_bounded(zin, "word/_rels/document.xml.rels")
                 cleaned_rels_bytes, valid_rel_ids = strip_comment_and_people_rels_bytes(raw_rels)
 
             sanitize_fellowship_ooxml(doc_root, valid_rel_ids=valid_rel_ids)
@@ -3204,10 +3230,12 @@ def write_cleaned_docx(
                 if fn_low.startswith("word/comments") or fn_low == "word/people.xml":
                     continue
 
-                raw = zin.read(fn)
                 if fn == "word/document.xml":
                     zout.writestr(item, doc_bytes)
-                elif fn == "word/settings.xml":
+                    continue
+
+                raw = _read_zip_member_bounded(zin, item)
+                if fn == "word/settings.xml":
                     zout.writestr(item, disable_track_revisions_in_settings_xml(raw))
                 elif fn == "word/_rels/document.xml.rels" and cleaned_rels_bytes is not None:
                     zout.writestr(item, cleaned_rels_bytes)
@@ -3229,7 +3257,7 @@ def inspect_fellowship_docx_quick(docx_path: Path) -> Dict:
     """Fast local inspection for GUI preview table (title, part_num, row_count, internal_parts)."""
     validate_docx_archive(docx_path)
     with zipfile.ZipFile(docx_path, "r") as zf:
-        root = ET.fromstring(zf.read("word/document.xml"))
+        root = _parse_safe_xml_bytes(_read_zip_member_bounded(zf, "word/document.xml"))
     body = root.find(f"{W}body")
     tbls = body.findall(f"{W}tbl") if body is not None else []
     row_cnt = sum(len(t.findall(f"{W}tr")) for t in tbls)
@@ -3331,7 +3359,7 @@ def run_fellowship_pipeline(
         try:
             validate_docx_archive(sorted_paths[0])
             with zipfile.ZipFile(sorted_paths[0], "r") as zf0:
-                r0_xml = ET.fromstring(zf0.read("word/document.xml"))
+                r0_xml = _parse_safe_xml_bytes(_read_zip_member_bounded(zf0, "word/document.xml"))
             tbl0 = r0_xml.find(f".//{W}tbl")
             if tbl0 is not None:
                 c3_sample = "".join(
@@ -3390,7 +3418,7 @@ def run_fellowship_pipeline(
 
         validate_docx_archive(src_p)
         with zipfile.ZipFile(src_p, "r") as zf:
-            doc_root = ET.fromstring(zf.read("word/document.xml"))
+            doc_root = _parse_safe_xml_bytes(_read_zip_member_bounded(zf, "word/document.xml"))
 
         # 1. Unwrap <w:sdt> content controls
         sdt_n = unwrap_all_sdts(doc_root)

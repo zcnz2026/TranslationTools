@@ -345,3 +345,38 @@ def create_ephemeral_workdir(stem: str, max_age_hours: float = 6.0) -> Path:
         return target
 
     raise RuntimeError(f"无法创建唯一临时工作目录：{app_root}")
+
+
+def create_secure_update_stagedir(max_age_hours: float = 2.0) -> Path:
+    """
+    Create and return a per-user update staging directory under
+    `%LOCALAPPDATA%\\ScatteredRevisionTool\\updates\\`, rejecting symlink or NTFS
+    reparse points on every ancestor/target directory (mitigates CWE-377 / CWE-59).
+    """
+    local_app = os.environ.get("LOCALAPPDATA", "").strip()
+    base_root = Path(local_app) if local_app else Path(tempfile.gettempdir())
+    tool_root = base_root / "ScatteredRevisionTool"
+    updates_root = tool_root / "updates"
+
+    for check_p in (tool_root, updates_root):
+        if check_p.exists() and _is_reparse_or_symlink(check_p):
+            raise RuntimeError(f"检测到不安全的符号链接或重解析点更新目录，已拒绝访问：{check_p}")
+
+    updates_root.mkdir(parents=True, exist_ok=True)
+    if _is_reparse_or_symlink(updates_root):
+        raise RuntimeError(f"更新暂存根目录校验异常（疑似重解析点）：{updates_root}")
+
+    _prune_stale_workdirs(updates_root, max_age_seconds=max(0.0, float(max_age_hours)) * 3600.0)
+
+    for _ in range(8):
+        ts_str = time.strftime("%Y%m%d_%H%M%S")
+        rand_hex = os.urandom(6).hex()
+        target = updates_root / f"upd_{ts_str}_{rand_hex}"
+        if target.exists():
+            continue
+        target.mkdir(parents=True, exist_ok=False)
+        if _is_reparse_or_symlink(target):
+            raise RuntimeError(f"更新暂存目录校验异常（疑似重解析点）：{target}")
+        return target.resolve()
+
+    raise RuntimeError(f"无法创建安全的更新暂存目录：{updates_root}")

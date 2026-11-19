@@ -214,9 +214,8 @@ def _parse_single_master_file_rows(task: Tuple[str, str, int, int]) -> List[dict
     try:
         with zipfile.ZipFile(abs_path_str, "r") as zf:
             docx_xml_utils._validate_docx_zip(zf)
-            xml_bytes = zf.read("word/document.xml")
-        docx_xml_utils._assert_safe_openxml_bytes(xml_bytes)
-        root = ET.fromstring(xml_bytes)
+            xml_bytes = docx_xml_utils.read_docx_member_bounded(zf, "word/document.xml")
+        root = docx_xml_utils.parse_safe_openxml_bytes(xml_bytes)
     except Exception:
         return []
 

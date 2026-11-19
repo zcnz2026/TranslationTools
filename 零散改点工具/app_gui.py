@@ -286,10 +286,11 @@ def _fallback_parse_titles_file(file_path: str | Path) -> list[str]:
     if not p.is_file():
         raise FileNotFoundError(f"找不到标题文档：{p}")
     if p.suffix.lower() == ".docx":
-        w_ns = "{http://schemas.openxmlformats.org/wordprocessingml/2006/main}"
+        import docx_xml_utils as _dxu
+
+        root, _, _ = _dxu.load_docx_xml(p)
+        w_ns = f"{{{_dxu.W_URI}}}"
         lines: list[str] = []
-        with zipfile.ZipFile(p, "r") as zf:
-            root = ET.fromstring(zf.read("word/document.xml"))
         for p_el in root.iter(f"{w_ns}p"):
             txt = "".join(t.text or "" for t in p_el.iter(f"{w_ns}t")).strip()
             if txt:
