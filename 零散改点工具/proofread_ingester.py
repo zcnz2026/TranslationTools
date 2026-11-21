@@ -50,6 +50,7 @@ from ai_client import ApiKeyPool, call_gemini_json  # noqa: E402
 from library_ingester import (  # noqa: E402
     _write_simple_report_docx,
     accept_all_revisions_in_cell_safe,
+    pick_proofread_new_text,
     render_diff_track_changes_into_cell,
     save_docx_without_track_revisions_flag,
     surgical_update_cell_text,
@@ -82,30 +83,46 @@ def _match_library_file_by_title(
     lib_index: step1_extract_and_diff.LibraryIndex,
 ) -> Optional[Path]:
     """Match a chapter title to its exact `.docx` file inside the 3-language library."""
-    rels = step1_extract_and_diff.match_title_to_index_rels(title, lib_index)
-    if rels:
-        p = lib_index.resolve_file_path(rels[0])
-        if p.is_file():
-            return p.resolve()
+    raw_t = (title or "").strip()
+    stripped_t = re.sub(r"(?i)(?:\s*[-—_]*\s*(?:part\s*\d+|p\d+|通读|定稿|副本|\(\d+\)|\（\d+\）))+$", "", raw_t).strip()
+    for cand_title in dict.fromkeys([raw_t, stripped_t]):
+        if not cand_title:
+            continue
+        rels = step1_extract_and_diff.match_title_to_index_rels(cand_title, lib_index)
+        if rels:
+            p = lib_index.resolve_file_path(rels[0])
+            if p.is_file():
+                return p.resolve()
 
-    # Fallback: fuzzy match against all indexed file stems & row-0 titles
-    clean_t = re.sub(r"[\s《》“”\"'_\-]+", "", (title or "").strip()).lower()
+    # Fallback: fuzzy match against all indexed file stems & row-0 Chinese titles
+    clean_t = re.sub(r"[\s\u3000《》“”\"'_\-]+", "", stripped_t or raw_t).lower()
     if not clean_t:
         return None
     best_p: Optional[Path] = None
     best_score = 0.0
-    for rel_p in lib_index.files.keys():
+    rel_keys = list(getattr(lib_index, "files_map", {}).keys()) or list(lib_index.keys())
+    rows_by_rel = getattr(lib_index, "rows_by_rel", {}) or {}
+    for rel_p in rel_keys:
         stem = Path(rel_p).stem
-        clean_stem = re.sub(r"[\s《》“”\"'_\-]+", "", stem).lower()
-        if clean_t in clean_stem:
-            cand = lib_index.resolve_file_path(rel_p)
-            if cand.is_file():
-                return cand.resolve()
-        ratio = difflib.SequenceMatcher(None, clean_t, clean_stem, autojunk=False).ratio()
-        if ratio > best_score:
-            best_score = ratio
-            best_p = lib_index.resolve_file_path(rel_p)
-    if best_p is not None and best_score >= 0.55 and best_p.is_file():
+        candidates_str = [stem]
+        r_list = rows_by_rel.get(rel_p) or []
+        if r_list:
+            r0_cn = str(r_list[0].get("cn") or "").strip()
+            if r0_cn and len(r0_cn) <= 80:
+                candidates_str.append(r0_cn)
+        for cs in candidates_str:
+            clean_cs = re.sub(r"[\s\u3000《》“”\"'_\-]+", "", cs).lower()
+            if not clean_cs:
+                continue
+            if len(clean_t) >= 4 and (clean_t in clean_cs or clean_cs in clean_t):
+                cand = lib_index.resolve_file_path(rel_p)
+                if cand.is_file():
+                    return cand.resolve()
+            ratio = difflib.SequenceMatcher(None, clean_t, clean_cs, autojunk=False).ratio()
+            if ratio > best_score:
+                best_score = ratio
+                best_p = lib_index.resolve_file_path(rel_p)
+    if best_p is not None and best_score >= 0.62 and best_p.is_file():
         return best_p.resolve()
     return None
 
@@ -163,7 +180,7 @@ def _validate_proofread_rows(
 
     for idx, r in enumerate(rows):
         old_t = clean_cell_spaces(r.target)
-        new_t = clean_cell_spaces(r.changes) if clean_cell_spaces(r.changes) else clean_cell_spaces(r.final)
+        new_t = pick_proofread_new_text(r)
         if not old_t or not new_t or old_t == new_t:
             continue
 
@@ -345,6 +362,44 @@ def run_proofread_ingestion_pipeline(
     unmatched_titles: List[str] = []
     processed_chapters = 0
 
+    def _infer_library_files_from_rows(rows: Sequence[ProofreadRow]) -> List[Path]:
+        """When a local sheet is dragged in without an explicit chapter title, infer matched library chapters from Chinese rows."""
+        found: List[Path] = []
+        seen = set()
+        dummy_tc = ET.Element(f"{W}tc")
+        for pr in rows:
+            cn_s = (pr.cn or "").strip()
+            if not cn_s or len(cn_s) < 6:
+                # Could be a short section/chapter title row (e.g. '独一无二的神自己 二') when en & target are empty
+                if cn_s and not (pr.en or "").strip() and not (pr.target or "").strip():
+                    by_t = _match_library_file_by_title(cn_s, lib_index)
+                    if by_t is not None and by_t not in seen:
+                        seen.add(by_t)
+                        found.append(by_t)
+                continue
+            if not (pr.en or "").strip() and not (pr.target or "").strip():
+                by_t = _match_library_file_by_title(cn_s, lib_index)
+                if by_t is not None and by_t not in seen:
+                    seen.add(by_t)
+                    found.append(by_t)
+                continue
+            # Only probe rows that actually carry edits (or first few rows if none edited yet)
+            if pick_proofread_new_text(pr) or len(found) == 0:
+                m_row, _, _ = step1_extract_and_diff.search_library_row_5stage(
+                    cur_title="",
+                    tc1=dummy_tc,
+                    tc2=dummy_tc,
+                    inp_cn=cn_s,
+                    inp_en=(pr.en or "").strip(),
+                    lib_index=lib_index,
+                )
+                if m_row is not None:
+                    lp = lib_index.resolve_file_path(m_row["rel_path"]).resolve()
+                    if lp.is_file() and lp not in seen:
+                        seen.add(lp)
+                        found.append(lp)
+        return found
+
     for g_idx, (ch_title, sources) in enumerate(chapter_groups):
         pct = 8.0 + (g_idx / max(1, len(chapter_groups))) * 85.0
         if progress_fn:
@@ -352,22 +407,9 @@ def run_proofread_ingestion_pipeline(
         if log_fn:
             log_fn(f"\n📑 === [{g_idx + 1}/{len(chapter_groups)}] 通读定稿入库：《{ch_title}》（{len(sources)} 个链接/表格） ===")
 
-        # Step 1: Match library chapter & copy verbatim to `改前/`
-        lib_file = _match_library_file_by_title(ch_title, lib_index)
-        if lib_file is None:
-            unmatched_titles.append(ch_title)
-            if log_fn:
-                log_fn(f"⚠️ 未在总库找到篇目《{ch_title}》，已跳过。")
-            continue
-
-        before_copy = docx_xml_utils.safe_join_output_file(before_dir, lib_file.name)
-        after_copy = docx_xml_utils.safe_join_output_file(after_dir, lib_file.name)
-        shutil.copy2(lib_file, before_copy)
-        if log_fn:
-            log_fn(f"  [步骤 1] 已提取改前文档：{lib_file.name}")
-
-        # Step 2: Load each linked sheet (strictly by gid) & validate edits
+        # Read linked sheets first (strictly by gid) & validate edits
         chapter_edits: List[Tuple[ProofreadRow, str]] = []
+        all_group_rows: List[ProofreadRow] = []
         merged_sheet_en_parts: List[str] = []
         merged_sheet_final_parts: List[str] = []
 
@@ -375,7 +417,7 @@ def run_proofread_ingestion_pipeline(
             try:
                 parsed = load_proofread_table(src, col_config=col_config, oauth=oauth)
                 if log_fn:
-                    log_fn(f"  [步骤 2] 已读取第 {s_idx + 1}/{len(sources)} 个表格（{parsed.sheet_name}，共 {len(parsed.rows)} 行）")
+                    log_fn(f"  [读取表格] 第 {s_idx + 1}/{len(sources)} 个表格（{parsed.sheet_name}，共 {len(parsed.rows)} 行）")
             except Exception as ex:
                 all_qa_alerts.append({
                     "chapter": ch_title,
@@ -390,6 +432,7 @@ def run_proofread_ingestion_pipeline(
                     log_fn(f"  ❌ 读取表格失败：{src} -> {ex}")
                 continue
 
+            all_group_rows.extend(parsed.rows)
             alerts, edits = _validate_proofread_rows(
                 chapter_title=ch_title,
                 rows=parsed.rows,
@@ -405,31 +448,129 @@ def run_proofread_ingestion_pipeline(
                 en_clean = clean_cell_spaces(pr.en)
                 if en_clean:
                     merged_sheet_en_parts.append(en_clean)
-                fin_clean = clean_cell_spaces(pr.final) or clean_cell_spaces(pr.changes) or clean_cell_spaces(pr.target)
+                fin_clean = pick_proofread_new_text(pr) or clean_cell_spaces(pr.final) or clean_cell_spaces(pr.target)
                 if fin_clean:
                     merged_sheet_final_parts.append(fin_clean)
 
-        # Step 3: Exact-match replacement into `改后/` (do NOT replace if pre-edit differs; report if >1 hits)
-        root_after, _, ns_after = docx_xml_utils.load_docx_xml(before_copy)
-        cmts_after = docx_xml_utils.load_docx_comments_xml(before_copy)
-        trs_after = [tr for tr in root_after.findall(".//w:tbl/w:tr", NS) if len(tr.findall("w:tc", NS)) >= 3]
+        # Match library chapter by title (fallback to inferring chapters from sheet Chinese rows ONLY when
+        # the title is a default dragged file stem or placeholder, so explicit unknown titles are reported!)
+        explicit_lib_file = _match_library_file_by_title(ch_title, lib_index)
+        first_src_stem = Path(sources[0]).stem if (sources and not sources[0].startswith(("http://", "https://"))) else ""
+        allow_row_inference = (ch_title in ("", "未命名篇目")) or (first_src_stem and ch_title.strip() == first_src_stem.strip())
+        target_lib_files: List[Path] = (
+            [explicit_lib_file]
+            if explicit_lib_file is not None
+            else (_infer_library_files_from_rows(all_group_rows) if allow_row_inference else [])
+        )
+        is_single_chapter_sheet = explicit_lib_file is not None or len(target_lib_files) == 1
 
-        replaced_ok = 0
-        mismatch_skip = 0
-        multi_hit_cnt = 0
+        if not target_lib_files:
+            unmatched_titles.append(ch_title)
+            if log_fn:
+                log_fn(f"⚠️ 未在总库找到篇目《{ch_title}》，已跳过。")
+            continue
 
-        for pr, new_text in chapter_edits:
-            old_exact = clean_cell_spaces(pr.target)
-            hits: List[Tuple[int, ET.Element, str]] = []
-            for r_i, tr in enumerate(trs_after):
-                tc3 = tr.findall("w:tc", NS)[2]
-                accept_all_revisions_in_cell_safe(tc3)
-                cell_txt = docx_xml_utils.get_cell_plain_text(tc3)
-                if old_exact in cell_txt:
-                    hits.append((r_i, tc3, cell_txt))
+        remaining_unmatched_edits: Dict[int, Tuple[ProofreadRow, str]] = {
+            id(pr): (pr, new_text) for pr, new_text in chapter_edits
+        }
 
-            if not hits:
-                mismatch_skip += 1
+        for lib_file in target_lib_files:
+            before_copy = docx_xml_utils.safe_join_output_file(before_dir, lib_file.name)
+            after_copy = docx_xml_utils.safe_join_output_file(after_dir, lib_file.name)
+            shutil.copy2(lib_file, before_copy)
+            if log_fn:
+                log_fn(f"  [步骤 1] 已提取改前文档：{lib_file.name}")
+
+            # Step 3: Exact-match replacement into `改后/` (do NOT replace if pre-edit differs; report if >1 hits)
+            root_after, _, ns_after = docx_xml_utils.load_docx_xml(before_copy)
+            cmts_after = docx_xml_utils.load_docx_comments_xml(before_copy)
+            trs_after = [tr for tr in root_after.findall(".//w:tbl/w:tr", NS) if len(tr.findall("w:tc", NS)) >= 3]
+
+            replaced_ok = 0
+            multi_hit_cnt = 0
+
+            for pr, new_text in chapter_edits:
+                old_exact = clean_cell_spaces(pr.target)
+                hits: List[Tuple[int, ET.Element, str]] = []
+                for r_i, tr in enumerate(trs_after):
+                    tc3 = tr.findall("w:tc", NS)[2]
+                    accept_all_revisions_in_cell_safe(tc3)
+                    cell_txt = docx_xml_utils.get_cell_plain_text(tc3).replace("\u00A0", " ")
+                    if old_exact in cell_txt:
+                        hits.append((r_i, tc3, cell_txt))
+
+                if not hits:
+                    continue
+
+                remaining_unmatched_edits.pop(id(pr), None)
+                total_occ = sum(cell_txt.count(old_exact) for _, _, cell_txt in hits)
+                for _, tc3, cell_txt in hits:
+                    updated_txt = cell_txt.replace(old_exact, new_text)
+                    surgical_update_cell_text(tc3, updated_txt)
+                replaced_ok += 1
+
+                if total_occ > 1:
+                    multi_hit_cnt += 1
+                    all_replace_logs.append({
+                        "chapter": lib_file.stem if not is_single_chapter_sheet else ch_title,
+                        "row": pr.row_number,
+                        "status": f"多处替换提示（共替换 {total_occ} 处）",
+                        "hits": total_occ,
+                        "detail": f"改前句在文档中匹配并替换了 {total_occ} 处，请核对是否均需替换：{old_exact[:60]}",
+                    })
+
+            save_docx_without_track_revisions_flag(before_copy, after_copy, root_after, ns_after, comments_root=cmts_after)
+            processed_chapters += 1
+            if log_fn:
+                log_fn(
+                    f"  [步骤 3] {lib_file.name} 精确入库完成：成功替换 {replaced_ok} 条，多处替换提示 {multi_hit_cnt} 条。"
+                )
+
+            # Step 4: Full merged comparison (for single-chapter multi-Part proofread tables)
+            if is_single_chapter_sheet:
+                doc_en_parts: List[str] = []
+                doc_f_parts: List[str] = []
+                for tr in trs_after:
+                    tcs = tr.findall("w:tc", NS)
+                    c2_t = clean_cell_spaces(docx_xml_utils.get_cell_plain_text(tcs[1]))
+                    c3_t = clean_cell_spaces(docx_xml_utils.get_cell_plain_text(tcs[2]))
+                    if c2_t:
+                        doc_en_parts.append(c2_t)
+                    if c3_t:
+                        doc_f_parts.append(c3_t)
+
+                sheet_en_all = _norm_ws_text(" ".join(merged_sheet_en_parts))
+                doc_en_all = _norm_ws_text(" ".join(doc_en_parts))
+                sheet_f_all = _norm_ws_text(" ".join(merged_sheet_final_parts))
+                doc_f_all = _norm_ws_text(" ".join(doc_f_parts))
+
+                en_differs = bool(sheet_en_all and sheet_en_all != doc_en_all)
+                f_differs = bool(sheet_f_all and sheet_f_all != doc_f_all)
+                if en_differs or f_differs:
+                    verify_dir.mkdir(parents=True, exist_ok=True)
+                    safe_ch = docx_xml_utils.sanitize_filename_part(ch_title, fallback="篇目", max_len=90)
+                    rev_p = docx_xml_utils.safe_join_output_file(verify_dir, f"全篇合并核对修订稿_{safe_ch}_{eff_date}.docx")
+                    _write_full_comparison_revision_docx(
+                        out_path=rev_p,
+                        chapter_title=ch_title,
+                        en_table_merged=sheet_en_all,
+                        en_doc_merged=doc_en_all,
+                        f_table_merged=sheet_f_all,
+                        f_doc_merged=doc_f_all,
+                    )
+                    verify_rev_files.append(str(rev_p))
+                    if log_fn:
+                        diff_cols = "、".join([x for x, flg in (("英文", en_differs), ("目标语", f_differs)) if flg])
+                        log_fn(f"  ⚠️ [步骤 4] 全篇合并核对发现差异（{diff_cols}），已输出修订稿：{rev_p.name}")
+                else:
+                    if log_fn:
+                        log_fn("  ✅ [步骤 4] 全篇合并核对完全一致（英文与目标语 0 差异）。")
+
+        if remaining_unmatched_edits:
+            if log_fn:
+                log_fn(f"  ⚠️ [步骤 3] 改前不一致未替换：{len(remaining_unmatched_edits)} 条（详见检查报告）。")
+            for pr, _ in remaining_unmatched_edits.values():
+                old_exact = clean_cell_spaces(pr.target)
                 all_replace_logs.append({
                     "chapter": ch_title,
                     "row": pr.row_number,
@@ -437,69 +578,6 @@ def run_proofread_ingestion_pipeline(
                     "hits": 0,
                     "detail": f"表格改前句在总库改前文档中未找到完全一致文本：{old_exact[:70]}",
                 })
-                continue
-
-            total_occ = sum(cell_txt.count(old_exact) for _, _, cell_txt in hits)
-            for _, tc3, cell_txt in hits:
-                updated_txt = cell_txt.replace(old_exact, new_text)
-                surgical_update_cell_text(tc3, updated_txt)
-            replaced_ok += 1
-
-            if total_occ > 1:
-                multi_hit_cnt += 1
-                all_replace_logs.append({
-                    "chapter": ch_title,
-                    "row": pr.row_number,
-                    "status": f"多处替换提示（共替换 {total_occ} 处）",
-                    "hits": total_occ,
-                    "detail": f"改前句在文档中匹配并替换了 {total_occ} 处，请核对是否均需替换：{old_exact[:60]}",
-                })
-
-        save_docx_without_track_revisions_flag(before_copy, after_copy, root_after, ns_after, comments_root=cmts_after)
-        processed_chapters += 1
-        if log_fn:
-            log_fn(
-                f"  [步骤 3] 精确入库完成：成功替换 {replaced_ok} 条，改前不一致跳过 {mismatch_skip} 条，多处替换提示 {multi_hit_cnt} 条。"
-            )
-
-        # Step 4: Full merged comparison (all Parts merged vs `改后` Col 2 & Col 3 merged)
-        doc_en_parts: List[str] = []
-        doc_f_parts: List[str] = []
-        for tr in trs_after:
-            tcs = tr.findall("w:tc", NS)
-            c2_t = clean_cell_spaces(docx_xml_utils.get_cell_plain_text(tcs[1]))
-            c3_t = clean_cell_spaces(docx_xml_utils.get_cell_plain_text(tcs[2]))
-            if c2_t:
-                doc_en_parts.append(c2_t)
-            if c3_t:
-                doc_f_parts.append(c3_t)
-
-        sheet_en_all = _norm_ws_text(" ".join(merged_sheet_en_parts))
-        doc_en_all = _norm_ws_text(" ".join(doc_en_parts))
-        sheet_f_all = _norm_ws_text(" ".join(merged_sheet_final_parts))
-        doc_f_all = _norm_ws_text(" ".join(doc_f_parts))
-
-        en_differs = bool(sheet_en_all and sheet_en_all != doc_en_all)
-        f_differs = bool(sheet_f_all and sheet_f_all != doc_f_all)
-        if en_differs or f_differs:
-            verify_dir.mkdir(parents=True, exist_ok=True)
-            safe_ch = docx_xml_utils.sanitize_filename_part(ch_title, fallback="篇目", max_len=90)
-            rev_p = docx_xml_utils.safe_join_output_file(verify_dir, f"全篇合并核对修订稿_{safe_ch}_{eff_date}.docx")
-            _write_full_comparison_revision_docx(
-                out_path=rev_p,
-                chapter_title=ch_title,
-                en_table_merged=sheet_en_all,
-                en_doc_merged=doc_en_all,
-                f_table_merged=sheet_f_all,
-                f_doc_merged=doc_f_all,
-            )
-            verify_rev_files.append(str(rev_p))
-            if log_fn:
-                diff_cols = "、".join([x for x, flg in (("英文", en_differs), ("目标语", f_differs)) if flg])
-                log_fn(f"  ⚠️ [步骤 4] 全篇合并核对发现差异（{diff_cols}），已输出修订稿：{rev_p.name}")
-        else:
-            if log_fn:
-                log_fn("  ✅ [步骤 4] 全篇合并核对完全一致（英文与目标语 0 差异）。")
 
     # Write combined QA + Replacement Report
     rep_rows = []

@@ -226,16 +226,19 @@ def _norm_cn_key(s: str) -> str:
 
 def extract_col1_shading_spans(tc1: ET.Element) -> Tuple[Optional[str], List[Tuple[str, str]]]:
     """
-    Extract Col 1 Chinese shading colors from `回稿`:
+    Extract non-marker Col 1 Chinese shading colors from `回稿`:
+      - Ignores scattered-revision extraction filter light-blue markers (`STRIP_COL23_SHD_FILLS` such as `DAE9F7`),
+        so library original Col 1 shadings/highlights remain untouched unless custom non-marker shading exists.
       - Returns `(cell_level_fill_hex_or_None, [(shaded_text_snippet, fill_hex), ...])`.
     """
+    ignore_fills = {"AUTO", "FFFFFF", "NONE"} | STRIP_COL23_SHD_FILLS
     cell_fill: Optional[str] = None
     tc_pr = tc1.find("w:tcPr", NS)
     if tc_pr is not None:
         shd = tc_pr.find("w:shd", NS)
         if shd is not None:
             fv = (shd.attrib.get(f"{W}fill") or "").strip().upper()
-            if fv and fv not in ("AUTO", "FFFFFF", "NONE"):
+            if fv and fv not in ignore_fills:
                 cell_fill = fv
 
     run_spans: List[Tuple[str, str]] = []
@@ -246,7 +249,7 @@ def extract_col1_shading_spans(tc1: ET.Element) -> Tuple[Optional[str], List[Tup
             pshd = p_pr.find("w:shd", NS)
             if pshd is not None:
                 fv = (pshd.attrib.get(f"{W}fill") or "").strip().upper()
-                if fv and fv not in ("AUTO", "FFFFFF", "NONE"):
+                if fv and fv not in ignore_fills:
                     p_fill = fv
         if p_fill:
             ptxt = "".join(t.text or "" for t in p.findall(".//w:t", NS)).strip()
@@ -262,7 +265,7 @@ def extract_col1_shading_spans(tc1: ET.Element) -> Tuple[Optional[str], List[Tup
                 continue
             rshd = r.find("./w:rPr/w:shd", NS)
             fv = (rshd.attrib.get(f"{W}fill") or "").strip().upper() if rshd is not None else ""
-            if fv in ("AUTO", "FFFFFF", "NONE"):
+            if fv in ignore_fills:
                 fv = ""
             if fv == cur_fill:
                 cur_txt += txt
@@ -764,7 +767,7 @@ def add_comment_to_cell(
     p = tc.find("w:p", NS)
     if p is None:
         p = ET.SubElement(tc, f"{W}p")
-    cid = str(id_allocator.allocate())
+    cid = str(id_allocator.next_id())
     date_iso = datetime.now().strftime("%Y-%m-%dT%H:%M:%SZ")
 
     c_el = ET.SubElement(
@@ -1057,21 +1060,37 @@ def clean_col23_highlights_and_artifacts(tc: ET.Element) -> None:
             surgical_update_paragraph_text(p, cleaned)
 
 
+def pick_proofread_new_text(pr: ProofreadRow) -> str:
+    """
+    Pick the effective post-proofread target text from `ProofreadRow`:
+      - Prefer `改动列` (`pr.changes`) when non-empty and different from `pr.target`;
+      - Otherwise use `定稿列` (`pr.final`) when non-empty and different from `pr.target`.
+    """
+    old_s = (pr.target or "").replace("\u00A0", " ").strip()
+    chg_s = (pr.changes or "").replace("\u00A0", " ").strip()
+    fin_s = (pr.final or "").replace("\u00A0", " ").strip()
+    if chg_s and chg_s != old_s:
+        return chg_s
+    if fin_s and fin_s != old_s:
+        return fin_s
+    return ""
+
+
 def apply_proofread_updates_to_text(
     col3_text: str,
     proofread_rows: Sequence[ProofreadRow],
 ) -> Tuple[str, int]:
     """
-    Apply proofread table updates (`目标语言` -> `定稿列` / `改动列`) onto `col3_text`.
+    Apply proofread table updates (`目标语言` -> `改动列` / `定稿列`) onto `col3_text`.
     Returns `(updated_text, replacements_count)`.
     """
     if not proofread_rows or not col3_text.strip():
         return col3_text, 0
-    cur = col3_text
+    cur = col3_text.replace("\u00A0", " ")
     count = 0
     for pr in proofread_rows:
-        old_s = (pr.target or "").strip()
-        new_s = (pr.final or pr.changes or "").strip()
+        old_s = (pr.target or "").replace("\u00A0", " ").strip()
+        new_s = pick_proofread_new_text(pr)
         if not old_s or not new_s or old_s == new_s:
             continue
         if old_s in cur:
@@ -1099,12 +1118,12 @@ def _write_simple_report_docx(
         r = ET.SubElement(p, f"{W}r")
         rPr = ET.SubElement(r, f"{W}rPr")
         ET.SubElement(rPr, f"{W}rFonts", {f"{W}ascii": "Georgia", f"{W}eastAsia": "宋体", f"{W}hAnsi": "Georgia"})
-        ET.SubElement(rPr, f"{W}sz", {f"{W}val": sz})
-        ET.SubElement(rPr, f"{W}szCs", {f"{W}val": sz})
         if bold:
             ET.SubElement(rPr, f"{W}b")
         if color:
             ET.SubElement(rPr, f"{W}color", {f"{W}val": color})
+        ET.SubElement(rPr, f"{W}sz", {f"{W}val": sz})
+        ET.SubElement(rPr, f"{W}szCs", {f"{W}val": sz})
         t = ET.SubElement(r, f"{W}t")
         t.text = text
         if text and (text[0].isspace() or text[-1].isspace()):
@@ -1140,9 +1159,10 @@ def _write_simple_report_docx(
                 r = ET.SubElement(p, f"{W}r")
                 rPr = ET.SubElement(r, f"{W}rPr")
                 ET.SubElement(rPr, f"{W}rFonts", {f"{W}ascii": "Georgia", f"{W}eastAsia": "宋体", f"{W}hAnsi": "Georgia"})
-                ET.SubElement(rPr, f"{W}sz", {f"{W}val": "19"})
                 if is_hdr:
                     ET.SubElement(rPr, f"{W}b")
+                ET.SubElement(rPr, f"{W}sz", {f"{W}val": "19"})
+                ET.SubElement(rPr, f"{W}szCs", {f"{W}val": "19"})
                 t = ET.SubElement(r, f"{W}t")
                 t.text = str(v or "")
                 if t.text and (t.text[0].isspace() or t.text[-1].isspace()):
@@ -1205,7 +1225,11 @@ def _merge_revision_docs(
     rev_doc_paths: Sequence[Tuple[str, Path]],
     out_path: Path,
 ) -> Path:
-    """Merge multiple revision `.docx` documents into one combined `.docx` preserving all `<w:ins>`/`<w:del>` track changes."""
+    """
+    Merge multiple revision `.docx` documents into one combined `.docx` preserving all `<w:ins>`/`<w:del>`
+    track changes, stripping unmerged chapter comment refs, and re-sequencing `w:id` globally so Word
+    never reports duplicate markup IDs or missing comment targets.
+    """
     if not rev_doc_paths:
         return out_path
     first_title, first_p = rev_doc_paths[0]
@@ -1220,8 +1244,9 @@ def _merge_revision_docs(
         r = ET.SubElement(p, f"{W}r")
         rPr = ET.SubElement(r, f"{W}rPr")
         ET.SubElement(rPr, f"{W}b")
-        ET.SubElement(rPr, f"{W}sz", {f"{W}val": "26"})
         ET.SubElement(rPr, f"{W}color", {f"{W}val": "1F4E79"})
+        ET.SubElement(rPr, f"{W}sz", {f"{W}val": "26"})
+        ET.SubElement(rPr, f"{W}szCs", {f"{W}val": "26"})
         t = ET.SubElement(r, f"{W}t")
         t.text = f"═══ {text} ═══"
         return p
@@ -1233,7 +1258,6 @@ def _merge_revision_docs(
         sub_body = sub_root.find("w:body", NS)
         if sub_body is None:
             continue
-        # Page break + title banner
         pb_p = ET.Element(f"{W}p")
         pb_r = ET.SubElement(pb_p, f"{W}r")
         ET.SubElement(pb_r, f"{W}br", {f"{W}type": "page"})
@@ -1243,10 +1267,45 @@ def _merge_revision_docs(
             if ch.tag.split("}")[-1] != "sectPr":
                 base_body.append(copy.deepcopy(ch))
 
+    # Strip library comment anchors on the combined preview copy & renumber all revision w:id uniquely
+    for tc in base_body.findall(".//w:tc", NS):
+        strip_comments_in_cell(tc)
+    next_rev_id = 1
+    for el in base_body.iter():
+        if el.tag.split("}")[-1] in ("ins", "del"):
+            el.set(f"{W}id", str(next_rev_id))
+            next_rev_id += 1
+
     if sect_pr is not None:
         base_body.append(sect_pr)
-    docx_xml_utils.save_docx_xml(first_p, out_path, base_root, ns_pairs)
+    docx_xml_utils.save_docx_xml(first_p, out_path, base_root, ns_pairs, comments_root=None)
     return out_path
+
+
+def _extract_rows_with_titles(doc_root: ET.Element) -> List[Tuple[str, ET.Element]]:
+    """
+    Walk `w:body` in document order, tracking preceding `<w:p>` chapter titles before each `<w:tbl>`.
+    Returns `[(chapter_title_hint, tr_element), ...]` for all rows with >= 3 cells.
+    """
+    body = doc_root.find("w:body", NS)
+    if body is None:
+        return [("", tr) for tr in doc_root.findall(".//w:tbl/w:tr", NS) if len(tr.findall("w:tc", NS)) >= 3]
+
+    out: List[Tuple[str, ET.Element]] = []
+    cur_title = ""
+    for ch in body:
+        loc = ch.tag.split("}")[-1]
+        if loc == "p":
+            ptxt = "".join(t.text or "" for t in ch.findall(".//w:t", NS)).strip()
+            if ptxt:
+                # Strip common workflow suffixes such as "通读", "改点" while keeping actual chapter title
+                cleaned_t = re.sub(r"(?:\s*[-—_]*\s*(?:通读|改点|初筛|定稿))+$", "", ptxt).strip()
+                cur_title = cleaned_t or ptxt
+        elif loc == "tbl":
+            for tr in ch.findall("w:tr", NS):
+                if len(tr.findall("w:tc", NS)) >= 3:
+                    out.append((cur_title, tr))
+    return out
 
 
 # ---------------------------------------------------------------------------
@@ -1352,7 +1411,8 @@ def run_library_ingestion_pipeline(
         r_root, _, r_ns = docx_xml_utils.load_docx_xml(rf)
         r_comments_map = docx_xml_utils.load_docx_comments_map(rf)
 
-        s_rows = [tr for tr in s_root.findall(".//w:tbl/w:tr", NS) if len(tr.findall("w:tc", NS)) >= 3]
+        s_titled_rows = _extract_rows_with_titles(s_root)
+        s_rows = [tr for _, tr in s_titled_rows]
         r_rows = [tr for tr in r_root.findall(".//w:tbl/w:tr", NS) if len(tr.findall("w:tc", NS)) >= 3]
 
         # Build lookup of returned rows by Col 1 Chinese key (with sequential fallback)
@@ -1377,7 +1437,7 @@ def run_library_ingestion_pipeline(
         mism_rows = [tr for tr in mism_root.findall(".//w:tbl/w:tr", NS) if len(tr.findall("w:tc", NS)) >= 3]
         mism_has_any = False
 
-        for r_i, s_tr in enumerate(s_rows):
+        for r_i, (row_title_hint, s_tr) in enumerate(s_titled_rows):
             s_tcs = s_tr.findall("w:tc", NS)
             s_c1_copy = copy.deepcopy(s_tcs[0])
             reject_all_revisions_in_cell(s_c1_copy)
@@ -1425,21 +1485,33 @@ def run_library_ingestion_pipeline(
                 r_c3_clean, pr_cnt = apply_proofread_updates_to_text(r_c3_clean, proofread_rows)
                 proofread_applied_total += pr_cnt
 
-            # Locate in 3-language library via 5-stage library index search
+            # Locate in 3-language library via 5-stage library index search (with title disambiguation + fallback)
             matched_row, _, _ = step1_extract_and_diff.search_library_row_5stage(
-                cur_title="",
+                cur_title=row_title_hint,
                 tc1=s_c1_copy,
                 tc2=s_c2_rej_full_tc,
                 inp_cn=cn_text,
                 inp_en=s_c2_rej_full,
                 lib_index=lib_index,
             )
+            if matched_row is None and row_title_hint:
+                matched_row, _, _ = step1_extract_and_diff.search_library_row_5stage(
+                    cur_title="",
+                    tc1=s_c1_copy,
+                    tc2=s_c2_rej_full_tc,
+                    inp_cn=cn_text,
+                    inp_en=s_c2_rej_full,
+                    lib_index=lib_index,
+                )
+
             lib_file_p: Optional[Path] = None
             lib_row_idx: int = -1
             lib_c2_text = ""
             lib_c3_text = ""
             is_mismatch = False
             mismatch_reason = ""
+            c2_is_excerpt = False
+            c3_is_excerpt = False
 
             if matched_row is not None:
                 lib_file_p = lib_index.resolve_file_path(matched_row["rel_path"]).resolve()
@@ -1455,20 +1527,26 @@ def run_library_ingestion_pipeline(
                         lib_c2_text = docx_xml_utils.get_cell_plain_text(lt2)
                         lib_c3_text = docx_xml_utils.get_cell_plain_text(lt3)
 
+                        norm_s2 = _norm_compare_text(s_c2_rej_full)
+                        norm_l2 = _norm_compare_text(lib_c2_text)
+                        norm_s3 = _norm_compare_text(s_c3_rej)
+                        norm_l3 = _norm_compare_text(lib_c3_text)
+
+                        c2_is_excerpt = bool(norm_s2 and norm_s2 != norm_l2 and norm_s2 in norm_l2)
+                        c3_is_excerpt = bool(norm_s3 and norm_s3 != norm_l3 and norm_s3 in norm_l3)
+
                         # Step 1A check: compare non-cyan English & Foreign against current library
                         en_diff = False
                         if not has_cyan:
-                            en_diff = _norm_compare_text(s_c2_rej_full) != _norm_compare_text(lib_c2_text)
+                            en_diff = (norm_s2 != norm_l2) and not c2_is_excerpt
                         else:
-                            # When cyan exists, check that non-cyan sentences still exist in library
                             nc_norm = _norm_compare_text(s_c2_non_cyan)
-                            if len(nc_norm) >= 20 and nc_norm not in _norm_compare_text(lib_c2_text):
-                                # Token containment check
-                                sm_nc = difflib.SequenceMatcher(None, nc_norm, _norm_compare_text(lib_c2_text), autojunk=False)
+                            if len(nc_norm) >= 20 and nc_norm not in norm_l2:
+                                sm_nc = difflib.SequenceMatcher(None, nc_norm, norm_l2, autojunk=False)
                                 if sm_nc.ratio() < 0.55 and all(b.size < 18 for b in sm_nc.get_matching_blocks()):
                                     en_diff = True
 
-                        f_diff = _norm_compare_text(s_c3_rej) != _norm_compare_text(lib_c3_text)
+                        f_diff = (norm_s3 != norm_l3) and not c3_is_excerpt
 
                         if en_diff or f_diff:
                             is_mismatch = True
@@ -1486,7 +1564,6 @@ def run_library_ingestion_pipeline(
                                 "cn_preview": cn_text[:50],
                                 "reason": mismatch_reason,
                             })
-                            # Render library diffed onto `发稿` in mism_root
                             if r_i < len(mism_rows):
                                 m_tcs = mism_rows[r_i].findall("w:tc", NS)
                                 if en_diff:
@@ -1530,23 +1607,18 @@ def run_library_ingestion_pipeline(
             if lib_file_p is not None and lib_row_idx >= 0:
                 if is_mismatch and conflict_policy == "skip_paragraph":
                     continue
-                target_c2 = (
-                    merge_keep_library_text(s_c2_rej_full, lib_c2_text, r_c2_clean)
-                    if (is_mismatch and conflict_policy == "keep_library")
-                    else r_c2_clean
-                )
-                target_c3 = (
-                    merge_keep_library_text(s_c3_rej, lib_c3_text, r_c3_clean)
-                    if (is_mismatch and conflict_policy == "keep_library")
-                    else r_c3_clean
-                )
                 lib_updates.setdefault(lib_file_p, []).append({
                     "row_idx": lib_row_idx,
-                    "new_c2": target_c2,
-                    "new_c3": target_c3,
+                    "sent_c2_rej": s_c2_rej_full,
+                    "sent_c3_rej": s_c3_rej,
+                    "ret_c2_clean": r_c2_clean,
+                    "ret_c3_clean": r_c3_clean,
+                    "c2_is_excerpt": c2_is_excerpt,
+                    "c3_is_excerpt": c3_is_excerpt,
                     "c1_cell_fill": c1_cell_fill,
                     "c1_run_spans": c1_run_spans,
                     "had_conflict": is_mismatch,
+                    "conflict_policy": conflict_policy,
                 })
 
         # Save Step 1B annotated diff doc
@@ -1618,6 +1690,28 @@ def run_library_ingestion_pipeline(
     updated_rows_total = 0
     per_chapter_rev_docs: List[Tuple[str, Path]] = []
     lib_files_sorted = sorted(lib_updates.keys(), key=lambda p: p.name.lower())
+    global_rev_ctr = [2000]
+
+    def _resolve_updated_cell_text(
+        cur_cell_text: str,
+        sent_rej: str,
+        ret_clean: str,
+        is_excerpt: bool,
+        had_conflict: bool,
+        pol: str,
+    ) -> str:
+        if is_excerpt:
+            # Substitute only the quoted excerpt inside `cur_cell_text` (preserving unquoted stanzas/paragraphs)
+            s_trim = (sent_rej or "").strip()
+            r_trim = (ret_clean or "").strip()
+            if s_trim and s_trim in cur_cell_text:
+                return cur_cell_text.replace(s_trim, r_trim, 1)
+            loc = docx_xml_utils.find_fuzzy_substring_span(cur_cell_text, s_trim) if s_trim else None
+            if loc is not None:
+                return cur_cell_text[: loc[0]] + r_trim + cur_cell_text[loc[1] :]
+        if had_conflict and pol == "keep_library":
+            return merge_keep_library_text(sent_rej, cur_cell_text, ret_clean)
+        return ret_clean
 
     for c_idx, lib_file in enumerate(lib_files_sorted):
         if progress_fn:
@@ -1638,7 +1732,8 @@ def run_library_ingestion_pipeline(
         # Also prepare a revision copy where track changes are shown on `改后`
         root_rev = copy.deepcopy(root_after)
         trs_rev = root_rev.findall(".//w:tbl/w:tr", NS)
-        rev_ctr = [200]
+        orig_row_texts: Dict[int, Tuple[str, str]] = {}
+        touched_row_indices: List[int] = []
         chapter_changed = False
 
         for upd in lib_updates[lib_file]:
@@ -1650,10 +1745,34 @@ def run_library_ingestion_pipeline(
             if len(tcs_a) < 3:
                 continue
 
-            old_c2 = docx_xml_utils.get_cell_plain_text(tcs_a[1])
-            old_c3 = docx_xml_utils.get_cell_plain_text(tcs_a[2])
-            new_c2 = upd["new_c2"]
-            new_c3 = upd["new_c3"]
+            if r_idx not in orig_row_texts:
+                c2_init = copy.deepcopy(tcs_a[1])
+                c3_init = copy.deepcopy(tcs_a[2])
+                accept_all_revisions_in_cell_safe(c2_init)
+                accept_all_revisions_in_cell_safe(c3_init)
+                orig_row_texts[r_idx] = (
+                    docx_xml_utils.get_cell_plain_text(c2_init),
+                    docx_xml_utils.get_cell_plain_text(c3_init),
+                )
+
+            cur_c2 = docx_xml_utils.get_cell_plain_text(tcs_a[1])
+            cur_c3 = docx_xml_utils.get_cell_plain_text(tcs_a[2])
+            new_c2 = _resolve_updated_cell_text(
+                cur_c2,
+                upd["sent_c2_rej"],
+                upd["ret_c2_clean"],
+                bool(upd.get("c2_is_excerpt")),
+                bool(upd.get("had_conflict")),
+                str(upd.get("conflict_policy") or "keep_library"),
+            )
+            new_c3 = _resolve_updated_cell_text(
+                cur_c3,
+                upd["sent_c3_rej"],
+                upd["ret_c3_clean"],
+                bool(upd.get("c3_is_excerpt")),
+                bool(upd.get("had_conflict")),
+                str(upd.get("conflict_policy") or "keep_library"),
+            )
 
             ch2 = surgical_update_cell_text(tcs_a[1], new_c2)
             ch3 = surgical_update_cell_text(tcs_a[2], new_c3)
@@ -1661,14 +1780,22 @@ def run_library_ingestion_pipeline(
 
             if ch2 or ch3 or shd_cnt > 0:
                 chapter_changed = True
-                updated_rows_total += 1
-                # Render track changes onto `root_rev` (revisions shown on `改后` doc)
-                if ch2:
-                    render_diff_track_changes_into_cell(tcs_r[1], old_c2, new_c2, author="改点入库", rev_id_counter=rev_ctr)
-                if ch3:
-                    render_diff_track_changes_into_cell(tcs_r[2], old_c3, new_c3, author="改点入库", rev_id_counter=rev_ctr)
+                if r_idx not in touched_row_indices:
+                    touched_row_indices.append(r_idx)
+                    updated_rows_total += 1
                 if shd_cnt > 0:
                     apply_col1_shading_overlay(tcs_r[0], upd["c1_cell_fill"], upd["c1_run_spans"])
+
+        for r_idx in touched_row_indices:
+            tcs_a = trs_after[r_idx].findall("w:tc", NS)
+            tcs_r = trs_rev[r_idx].findall("w:tc", NS)
+            orig_c2, orig_c3 = orig_row_texts[r_idx]
+            fin_c2 = docx_xml_utils.get_cell_plain_text(tcs_a[1])
+            fin_c3 = docx_xml_utils.get_cell_plain_text(tcs_a[2])
+            if orig_c2 != fin_c2:
+                render_diff_track_changes_into_cell(tcs_r[1], orig_c2, fin_c2, author="改点入库", rev_id_counter=global_rev_ctr)
+            if orig_c3 != fin_c3:
+                render_diff_track_changes_into_cell(tcs_r[2], orig_c3, fin_c3, author="改点入库", rev_id_counter=global_rev_ctr)
 
         save_docx_without_track_revisions_flag(before_copy, after_copy, root_after, ns_after, comments_root=cmts_after)
         if chapter_changed:

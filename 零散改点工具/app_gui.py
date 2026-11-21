@@ -104,7 +104,7 @@ try:
 except ImportError:
     _updater_mod = None
 
-RAW_APP_VERSION = "1.9.1"
+RAW_APP_VERSION = "1.9.2"
 APP_VERSION = f"v{RAW_APP_VERSION}"
 check_for_updates = getattr(_updater_mod, "check_for_updates", None)
 download_and_apply_update = getattr(_updater_mod, "download_and_apply_update", None)
@@ -6497,8 +6497,8 @@ def _run_frozen_self_test() -> int:
     from ai_client import format_friendly_api_error as _ai_friendly_err
     from ai_client import local_align_col3_spans
 
-    if RAW_APP_VERSION != "1.9.1":
-        raise RuntimeError(f"RAW_APP_VERSION expected '1.9.1', got {RAW_APP_VERSION!r}")
+    if RAW_APP_VERSION != "1.9.2":
+        raise RuntimeError(f"RAW_APP_VERSION expected '1.9.2', got {RAW_APP_VERSION!r}")
 
     is_frozen = bool(getattr(sys, "frozen", False))
     if is_frozen and hasattr(sys, "_MEIPASS"):
@@ -6610,6 +6610,15 @@ def _run_frozen_self_test() -> int:
         if getattr(_iui_test, "IngestTabPanel", None) is None:
             raise RuntimeError("ingest_tab_ui.IngestTabPanel missing in self-test")
 
+        # Self-test Scenario 3A comment attachment (`MarkupIdAllocator.next_id()`)
+        _test_doc = ET.Element(f"{docx_xml_utils.W}document")
+        _test_tc = ET.SubElement(_test_doc, f"{docx_xml_utils.W}tc")
+        _test_cmts = docx_xml_utils.new_comments_root()
+        _test_alloc = docx_xml_utils.CommentIdAllocator(doc_root=_test_doc, comments_root=_test_cmts)
+        _li_test.add_comment_to_cell(_test_tc, "测试验收批注", _test_cmts, _test_alloc)
+        if len(_test_cmts.findall(f"{docx_xml_utils.W}comment")) != 1:
+            raise RuntimeError("library_ingester.add_comment_to_cell self-test failed")
+
         for req_fn in ("parse_titles_text_or_file", "parse_titles_multiline", "resolve_full_articles", "run_full_article_pipeline"):
             if not callable(getattr(_fap_test, req_fn, None)):
                 raise RuntimeError(f"full_article_processor.{req_fn} missing in self-test")
@@ -6621,7 +6630,7 @@ def _run_frozen_self_test() -> int:
             raise RuntimeError("dedup_checker.check_and_export_duplicates missing in self-test")
 
         upd_ver = str(getattr(_upd_test, "APP_VERSION", "")).lstrip("vV")
-        expected_vers = ("1.9.1",) if require_v18_siblings else ("1.7.0", "1.8.0", "1.8.1", "1.9.0", "1.9.1")
+        expected_vers = ("1.9.2",) if require_v18_siblings else ("1.7.0", "1.8.0", "1.8.1", "1.9.0", "1.9.1", "1.9.2")
         if upd_ver not in expected_vers:
             raise RuntimeError(f"updater.APP_VERSION mismatch: {getattr(_upd_test, 'APP_VERSION', None)!r}")
         if not callable(getattr(_upd_test, "check_for_updates", None)) or not callable(
