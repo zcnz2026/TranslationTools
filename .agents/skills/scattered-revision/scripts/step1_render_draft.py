@@ -134,8 +134,9 @@ def _populate_clean_library_cell(
     id_allocator: CommentIdAllocator,
     src_styles_root: ET.Element,
     ensure_cjk_songti: bool = False,
+    preserve_shading_and_highlights: bool = True,
 ) -> None:
-    """Replace `target_tc` content with clean library `src_tc` paragraphs (preserving inline styles & comments, zero shading/highlights)."""
+    """Replace `target_tc` content with library `src_tc` paragraphs, preserving inline styles, comments, and original shading/highlights verbatim."""
     paras = clean_and_migrate_col3_paragraphs(
         src_tc3=src_tc,
         target_tc3=target_tc,
@@ -144,6 +145,7 @@ def _populate_clean_library_cell(
         target_comments_root=target_comments_root,
         id_allocator=id_allocator,
         src_styles_root=src_styles_root,
+        preserve_shading_and_highlights=preserve_shading_and_highlights,
     )
     if ensure_cjk_songti:
         for p_el in paras:
@@ -155,6 +157,14 @@ def _populate_clean_library_cell(
     if tc_Pr is not None:
         for shd_el in list(tc_Pr.findall("w:shd", NS)):
             tc_Pr.remove(shd_el)
+    if preserve_shading_and_highlights:
+        src_tc_pr = src_tc.find("w:tcPr", NS)
+        src_shd = src_tc_pr.find("w:shd", NS) if src_tc_pr is not None else None
+        if src_shd is not None:
+            if tc_Pr is None:
+                tc_Pr = ET.Element(f"{W}tcPr")
+                target_tc.insert(0, tc_Pr)
+            tc_Pr.append(copy.deepcopy(src_shd))
     for ch in list(target_tc):
         if ch is not tc_Pr:
             target_tc.remove(ch)

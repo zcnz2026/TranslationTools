@@ -49,6 +49,7 @@ from pipeline import (  # noqa: E402
     _script_supports_cli_flag,
     _strip_all_highlights_in_root,
     ensure_library_index,
+    resolve_highlight_mode,
 )
 from word_counter import (  # noqa: E402
     balance_trilingual_table_widths,
@@ -1688,6 +1689,7 @@ def run_full_article_pipeline(
     progress_fn: Optional[Callable[[float, str], None]] = None,
     use_title_list: bool = True,
     highlight_colors: bool = True,
+    highlight_mode: Optional[str] = None,
     yellow_gap_words: int = 3,
     cn_en_master_dir: Union[str, Path] = "",
 ) -> dict:
@@ -1713,6 +1715,8 @@ def run_full_article_pipeline(
     if not articles_list:
         raise ValueError("请先至少选择或匹配 1 篇需要对比的章节。")
 
+    _, use_hl, highlight_col1 = resolve_highlight_mode(highlight_mode, highlight_colors)
+    highlight_colors = use_hl
     eff_enable_ai = bool(enable_ai and highlight_colors)
     pool_or_keys, eff_rot, has_keys, effective_ai = _prepare_optional_pool(
         api_key=api_key,
@@ -1751,6 +1755,7 @@ def run_full_article_pipeline(
         step2_render_final, "--no-balance-columns", "balance_trilingual_table_widths"
     )
     supports_no_hl2 = _script_supports_cli_flag(step2_render_final, "--no-highlight-colors")
+    supports_no_col1 = _script_supports_cli_flag(step2_render_final, "--no-col1-highlights")
     supports_keep_row0 = _script_supports_cli_flag(step2_render_final, "--keep-first-title-row")
     step2_native_v17 = supports_no_bal and callable(getattr(docx_xml_utils, "format_up_rv_count_tag", None))
 
@@ -2021,6 +2026,8 @@ def run_full_article_pipeline(
                 argv_full.append("--no-balance-columns")
             if not highlight_colors and supports_no_hl2:
                 argv_full.append("--no-highlight-colors")
+            elif highlight_colors and not highlight_col1 and supports_no_col1:
+                argv_full.append("--no-col1-highlights")
             out_full_txt = _run_module_main(step2_render_final.main, argv_full, log_fn=log_fn)
             m_full = re.search(r"Final Document Saved:\s*(.+)", out_full_txt)
             if not m_full:
@@ -2056,6 +2063,8 @@ def run_full_article_pipeline(
                     argv_trans.append("--no-balance-columns")
                 if not highlight_colors and supports_no_hl2:
                     argv_trans.append("--no-highlight-colors")
+                elif highlight_colors and not highlight_col1 and supports_no_col1:
+                    argv_trans.append("--no-col1-highlights")
                 out_trans_txt = _run_module_main(step2_render_final.main, argv_trans, log_fn=log_fn)
                 m_trans = re.search(r"Final Document Saved:\s*(.+)", out_trans_txt)
                 if not m_trans:

@@ -285,6 +285,28 @@ def _prepare_optional_pool(
     return keys, eff_rot, has_keys, False
 
 
+def resolve_highlight_mode(
+    highlight_mode: Optional[str] = None,
+    highlight_colors: bool = True,
+) -> Tuple[str, bool, bool]:
+    """
+    Normalize 3-way highlight mode into `(mode_id, use_highlights, highlight_col1)`:
+      - `"en_foreign"` (default): Col 2 English yellow/cyan + Col 3 Foreign soft light-blue/lightGray; NO Col 1 highlights.
+      - `"all_three"`: Col 1 Chinese yellow/cyan + Col 2 English yellow/cyan + Col 3 Foreign soft light-blue/lightGray.
+      - `"revisions_only"`: NO highlights on any column, only Col 2 track changes (0 AI calls).
+    """
+    raw = (highlight_mode or "").strip().lower()
+    if raw in ("revisions_only", "none", "off", "false", "0"):
+        return "revisions_only", False, False
+    if raw in ("all_three", "all", "three", "cn_en_foreign"):
+        return "all_three", True, True
+    if raw in ("en_foreign", "en_col3", "default"):
+        return "en_foreign", True, False
+    if not highlight_colors:
+        return "revisions_only", False, False
+    return "en_foreign", True, False
+
+
 def _strip_all_highlights_in_root(root: ET.Element) -> None:
     """Remove all `<w:highlight>` tags across `root` and strip top Blue/Yellow instruction lines."""
     for rPr in root.findall(".//w:rPr", NS):
@@ -374,25 +396,39 @@ def _build_raw_trilingual_docx_from_manifest(
         s_tr = s_trs[rm["source_row_idx"]]
         s_tcs = s_tr.findall("w:tc", NS)
 
-        col1_paras = _clone_clean_col12_paragraphs(s_tcs[0], tcs[0])
-        col2_paras = _clone_clean_col12_paragraphs(s_tcs[1], tcs[1])
-        col3_paras = step1_render_draft.clean_col3_paragraphs(
-            src_tc3=s_tcs[2],
-            target_tc3=tcs[2],
-            target_tc2=tcs[1],
+        step1_render_draft._populate_clean_library_cell(
+            src_tc=s_tcs[0],
+            target_tc=tcs[0],
+            fallback_tc=tcs[0],
             src_comments_map=s_cmap,
             target_comments_root=working_comments,
             id_allocator=id_allocator,
             src_styles_root=s_styles,
+            ensure_cjk_songti=True,
+            preserve_shading_and_highlights=True,
         )
-
-        for tc_target, new_ps in ((tcs[0], col1_paras), (tcs[1], col2_paras), (tcs[2], col3_paras)):
-            tcPr = tc_target.find("w:tcPr", NS)
-            for ch in list(tc_target):
-                if ch is not tcPr:
-                    tc_target.remove(ch)
-            for np in new_ps:
-                tc_target.append(np)
+        step1_render_draft._populate_clean_library_cell(
+            src_tc=s_tcs[1],
+            target_tc=tcs[1],
+            fallback_tc=tcs[1],
+            src_comments_map=s_cmap,
+            target_comments_root=working_comments,
+            id_allocator=id_allocator,
+            src_styles_root=s_styles,
+            ensure_cjk_songti=False,
+            preserve_shading_and_highlights=True,
+        )
+        step1_render_draft._populate_clean_library_cell(
+            src_tc=s_tcs[2],
+            target_tc=tcs[2],
+            fallback_tc=tcs[1],
+            src_comments_map=s_cmap,
+            target_comments_root=working_comments,
+            id_allocator=id_allocator,
+            src_styles_root=s_styles,
+            ensure_cjk_songti=False,
+            preserve_shading_and_highlights=True,
+        )
 
     for sr in manifest.get("skipped_rows", []):
         body_el = body[sr["body_idx"]]
@@ -431,6 +467,7 @@ def run_step1_pipeline(
     enable_ai: bool = True,
     force_full_diff: bool = False,
     highlight_colors: bool = True,
+    highlight_mode: Optional[str] = None,
     yellow_gap_words: int = 3,
     export_raw_trilingual: bool = False,
     raw_trilingual_dir: str = "",
@@ -438,6 +475,8 @@ def run_step1_pipeline(
     date_str: str = "",
     balance_columns: bool = True,
 ) -> dict:
+    _, use_hl, _ = resolve_highlight_mode(highlight_mode, highlight_colors)
+    highlight_colors = use_hl
     eff_enable_ai = bool(enable_ai and highlight_colors)
     pool_or_keys, eff_rot, has_keys, effective_ai = _prepare_optional_pool(
         api_key=api_key,
@@ -725,7 +764,10 @@ def run_step2_pipeline(
     dedup_pkg_dir: str = "",
     date_str: str = "",
     highlight_colors: bool = True,
+    highlight_mode: Optional[str] = None,
 ) -> dict:
+    _, use_hl, highlight_col1 = resolve_highlight_mode(highlight_mode, highlight_colors)
+    highlight_colors = use_hl
     eff_enable_ai = bool(enable_ai and highlight_colors)
     pool_or_keys, eff_rot, has_keys, effective_ai = _prepare_optional_pool(
         api_key=api_key,
@@ -824,6 +866,7 @@ def run_step2_pipeline(
         step2_render_final, "--no-balance-columns", "balance_trilingual_table_widths"
     )
     supports_no_hl2 = _script_supports_cli_flag(step2_render_final, "--no-highlight-colors")
+    supports_no_col1 = _script_supports_cli_flag(step2_render_final, "--no-col1-highlights")
     step2_native_v17 = supports_no_bal and callable(getattr(docx_xml_utils, "format_up_rv_count_tag", None))
 
     saved_files: List[str] = []
@@ -862,6 +905,8 @@ def run_step2_pipeline(
                 argv2b.append("--no-balance-columns")
             if not highlight_colors and supports_no_hl2:
                 argv2b.append("--no-highlight-colors")
+            elif highlight_colors and not highlight_col1 and supports_no_col1:
+                argv2b.append("--no-col1-highlights")
             out_txt = _run_module_main(step2_render_final.main, argv2b, log_fn=log_fn)
             m = re.search(r"Final Document Saved:\s*(.+)", out_txt)
             if m:
@@ -925,6 +970,8 @@ def run_step2_pipeline(
             argv2b.append("--no-balance-columns")
         if not highlight_colors and supports_no_hl2:
             argv2b.append("--no-highlight-colors")
+        elif highlight_colors and not highlight_col1 and supports_no_col1:
+            argv2b.append("--no-col1-highlights")
         out_txt = _run_module_main(step2_render_final.main, argv2b, log_fn=log_fn)
         m = re.search(r"Final Document Saved:\s*(.+)", out_txt)
         if m:
@@ -1035,6 +1082,7 @@ def run_oneclick_pipeline(
     date_mmdd: str = "",
     latest_master_path: str = "",
     highlight_colors: bool = True,
+    highlight_mode: Optional[str] = None,
     yellow_gap_words: int = 3,
     export_raw_trilingual: bool = True,
 ) -> dict:
@@ -1043,7 +1091,7 @@ def run_oneclick_pipeline(
       1. Optionally syncs `input_docx` against `latest_master_path` (`{原名}{YYYYMMDD}更新.docx`);
       2. Warms/loads the persistent multi-threaded library index (checking live `os.stat` on disk);
       3. Runs Step 1 in a fresh ephemeral workdir (optionally exporting `_提取三语原稿_`);
-      4. Runs Step 2 (skipping AI & highlights when `highlight_colors=False`);
+      4. Runs Step 2 (respecting 3-way `highlight_mode`: `en_foreign`, `all_three`, `revisions_only`);
       5. Keeps ALL single-doc outputs flat in `output_dir` (NO subfolders) and cleans up ephemeral workdirs.
     """
     inp_p = Path(input_docx).resolve()
@@ -1055,6 +1103,8 @@ def run_oneclick_pipeline(
         raise FileNotFoundError(f"找不到语种总库文件夹：{lib_p}")
     out_d.mkdir(parents=True, exist_ok=True)
 
+    eff_hl_mode, use_hl, _ = resolve_highlight_mode(highlight_mode, highlight_colors)
+    highlight_colors = use_hl
     eff_enable_ai = bool(enable_ai and highlight_colors)
     pool_or_keys, eff_rot, has_keys, effective_ai = _prepare_optional_pool(
         api_key=api_key,
@@ -1120,6 +1170,7 @@ def run_oneclick_pipeline(
             progress_fn=_prog_s1,
             enable_ai=effective_ai,
             highlight_colors=bool(highlight_colors),
+            highlight_mode=eff_hl_mode,
             yellow_gap_words=yellow_gap_words,
             export_raw_trilingual=bool(export_raw_trilingual),
             raw_trilingual_dir=str(out_d),
@@ -1164,6 +1215,7 @@ def run_oneclick_pipeline(
             dedup_pkg_dir=dedup_pkg_dir,
             date_str=eff_date,
             highlight_colors=bool(highlight_colors),
+            highlight_mode=eff_hl_mode,
         )
         wdir2_str = str(r2.get("workdir") or "")
     finally:

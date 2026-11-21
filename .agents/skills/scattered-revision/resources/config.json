@@ -2,7 +2,7 @@
   "default_author": "整理组",
   "col2_up_highlight": "yellow",
   "col2_rv_highlight": "cyan",
-  "col3_up_highlight": "yellow",
+  "col3_up_highlight": "shd:D9EEF7",
   "col3_rv_highlight": "lightGray",
   "accept_col2_rv_revisions": false,
   "split_col3_rv_paragraph": false,

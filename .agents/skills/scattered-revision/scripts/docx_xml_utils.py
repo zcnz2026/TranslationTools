@@ -130,7 +130,7 @@ DEFAULT_CONFIG = {
     "default_author": "整理组",
     "col2_up_highlight": "yellow",
     "col2_rv_highlight": "cyan",
-    "col3_up_highlight": "yellow",
+    "col3_up_highlight": "shd:D9EEF7",
     "col3_rv_highlight": "lightGray",
     "accept_col2_rv_revisions": False,
     "split_col3_rv_paragraph": False,
@@ -944,6 +944,7 @@ def clean_and_migrate_col3_paragraphs(
     target_comments_root: ET.Element = None,
     id_allocator: CommentIdAllocator = None,
     src_styles_root: ET.Element = None,
+    preserve_shading_and_highlights: bool = False,
 ) -> list:
     """
     Clone text, inline formatting, and Word comments from library Col 3 (`src_tc3`) while:
@@ -979,6 +980,12 @@ def clean_and_migrate_col3_paragraphs(
             _merge_rpr_layer(para_base_rPr, st_el.find(f"{W}rPr"))
 
         new_pPr = _resolve_src_col3_ppr(old_pPr, styles_info, fallback_spacing_el=fallback_spacing)
+        if preserve_shading_and_highlights and old_pPr is not None:
+            p_shd = old_pPr.find(f"{W}shd")
+            if p_shd is not None:
+                cp_pshd = copy.deepcopy(p_shd)
+                _strip_unsafe_attrs_recursive(cp_pshd)
+                insert_ppr_child_ordered(new_pPr, cp_pshd)
         clean_mark_rPr = _finalize_col3_rpr(copy.deepcopy(para_base_rPr), fallback_mark_rPr=p_mark_rPr)
         for non_mark in ("b", "bCs", "i", "iCs", "u", "strike", "dstrike", "color"):
             remove_rpr_child(clean_mark_rPr, non_mark)
@@ -1002,7 +1009,12 @@ def clean_and_migrate_col3_paragraphs(
                 else:
                     old_rPr = ch.find("w:rPr", NS)
                     new_rPr = copy.deepcopy(para_base_rPr)
+                    saved_hl = None
+                    saved_shd = None
                     if old_rPr is not None:
+                        if preserve_shading_and_highlights:
+                            saved_hl = old_rPr.find(f"{W}highlight")
+                            saved_shd = old_rPr.find(f"{W}shd")
                         rs_el = old_rPr.find(f"{W}rStyle")
                         if rs_el is not None:
                             rs_id = rs_el.attrib.get(f"{W}val", "").strip()
@@ -1011,6 +1023,15 @@ def clean_and_migrate_col3_paragraphs(
                         _merge_rpr_layer(new_rPr, old_rPr)
                         ch.remove(old_rPr)
                     _finalize_col3_rpr(new_rPr, fallback_mark_rPr=p_mark_rPr)
+                    if preserve_shading_and_highlights:
+                        if saved_hl is not None:
+                            cp_hl = copy.deepcopy(saved_hl)
+                            _strip_unsafe_attrs_recursive(cp_hl)
+                            insert_rpr_child_ordered(new_rPr, cp_hl)
+                        if saved_shd is not None:
+                            cp_shd = copy.deepcopy(saved_shd)
+                            _strip_unsafe_attrs_recursive(cp_shd)
+                            insert_rpr_child_ordered(new_rPr, cp_shd)
                     if len(new_rPr) > 0:
                         ch.insert(0, new_rPr)
             cp.append(ch)
@@ -3750,25 +3771,25 @@ def apply_highlights_to_col3_cell(tc: ET.Element, char_spans: list):
                 r_hls = r_hls + [None] * (r_len - len(r_hls))
             global_offset += r_len
 
-            # Group contiguous characters with same highlight inside this run
+            def _make_marked_seg(seg_txt: str, mark_spec):
+                shd_el = base_rPr.find("w:shd", NS) if base_rPr is not None else None
+                base_shd_fill = shd_el.attrib.get(f"{W}fill") if shd_el is not None else None
+                if base_shd_fill in ("auto", "FFFFFF", "ffffff"):
+                    base_shd_fill = None
+                if isinstance(mark_spec, str) and mark_spec.lower().startswith("shd:"):
+                    eff_shd = mark_spec.split(":", 1)[1].strip().lstrip("#").upper() or "D9EEF7"
+                    return make_run(seg_txt, base_rPr=base_rPr, highlight=None, shd_fill=eff_shd)
+                return make_run(seg_txt, base_rPr=base_rPr, highlight=mark_spec, shd_fill=base_shd_fill)
+
+            # Group contiguous characters with same highlight/shading inside this run
             seg_start = 0
             cur_hl = r_hls[0]
             for k in range(1, r_len):
                 if r_hls[k] != cur_hl:
-                    seg_txt = r_text[seg_start:k]
-                    shd_el = base_rPr.find("w:shd", NS) if base_rPr is not None else None
-                    shd_fill = shd_el.attrib.get(f"{W}fill") if shd_el is not None else None
-                    if shd_fill in ("auto", "FFFFFF", "ffffff"):
-                        shd_fill = None
-                    new_children.append(make_run(seg_txt, base_rPr=base_rPr, highlight=cur_hl, shd_fill=shd_fill))
+                    new_children.append(_make_marked_seg(r_text[seg_start:k], cur_hl))
                     seg_start = k
                     cur_hl = r_hls[k]
-            seg_txt = r_text[seg_start:r_len]
-            shd_el = base_rPr.find("w:shd", NS) if base_rPr is not None else None
-            shd_fill = shd_el.attrib.get(f"{W}fill") if shd_el is not None else None
-            if shd_fill in ("auto", "FFFFFF", "ffffff"):
-                shd_fill = None
-            new_children.append(make_run(seg_txt, base_rPr=base_rPr, highlight=cur_hl, shd_fill=shd_fill))
+            new_children.append(_make_marked_seg(r_text[seg_start:r_len], cur_hl))
             for cid in extra_crefs:
                 cref_r = _make_comment_ref_run(cid)
                 if base_rPr is not None:
@@ -3828,6 +3849,17 @@ def _ensure_landscape_a4_on_root(root: ET.Element) -> bool:
         sect_prs = [sp]
         changed = True
 
+    # Default page margins: Top 2.0cm (1134), Bottom 2.2cm (1247), Left 2.0cm (1134), Right 2.0cm (1134)
+    default_mar_attrs = {
+        f"{W}top": "1134",
+        f"{W}right": "1134",
+        f"{W}bottom": "1247",
+        f"{W}left": "1134",
+        f"{W}header": "720",
+        f"{W}footer": "720",
+        f"{W}gutter": "0",
+    }
+
     for sp in sect_prs:
         pgSz = sp.find(f"{W}pgSz")
         if pgSz is None:
@@ -3851,6 +3883,16 @@ def _ensure_landscape_a4_on_root(root: ET.Element) -> bool:
                 pgSz.set(f"{W}h", "11906")
                 pgSz.set(f"{W}orient", "landscape")
                 changed = True
+
+        pgMar = sp.find(f"{W}pgMar")
+        if pgMar is None:
+            insert_sectpr_child_ordered(sp, ET.Element(f"{W}pgMar", default_mar_attrs))
+            changed = True
+        else:
+            for k, v in default_mar_attrs.items():
+                if pgMar.attrib.get(k) != v:
+                    pgMar.set(k, v)
+                    changed = True
     return changed
 
 
@@ -4473,12 +4515,50 @@ def merge_same_doc_duplicate_rows(
 
 
 def _compute_text_visual_weight(text: str, cjk_mult: float = 1.0) -> float:
+    import unicodedata
+
     cleaned = re.sub(r"\s+", " ", (text or "").strip())
     if not cleaned:
         return 0.0
-    cjk_cnt = len(_CJK_WEIGHT_RE.findall(cleaned))
-    other_cnt = len(cleaned) - cjk_cnt
-    return cjk_cnt * cjk_mult + other_cnt * 1.0
+    total = 0.0
+    se_cnt = 0
+    latin_cnt = 0
+    non_ws = 0
+    prev_coeng = False
+    for ch in cleaned:
+        cp = ord(ch)
+        if cp == 0x17D2:  # Khmer coeng subscript joiner
+            prev_coeng = True
+            continue
+        if prev_coeng:
+            prev_coeng = False
+            continue
+        cat = unicodedata.category(ch)
+        if cat in ("Mn", "Me", "Cf"):
+            continue
+        if ch == " ":
+            total += 0.55
+            continue
+        non_ws += 1
+        if cat == "Mc":
+            total += 0.65
+        elif _CJK_WEIGHT_RE.match(ch):
+            total += 1.0 * cjk_mult
+        elif 0x1780 <= cp <= 0x17FF or 0x0E80 <= cp <= 0x0EFF or 0x1000 <= cp <= 0x109F:
+            total += 1.32
+            se_cnt += 1
+        elif 0x0E00 <= cp <= 0x0E7F:
+            total += 1.15
+            se_cnt += 1
+        else:
+            total += 1.0
+            latin_cnt += 1
+    if non_ws > 0:
+        if se_cnt > non_ws * 0.35:
+            total *= 1.18
+        elif latin_cnt > non_ws * 0.35:
+            total *= 1.08
+    return total
 
 
 def _project_bounded_pct_triple(weights: tuple, bounds: tuple, target_sum: int = 5000) -> tuple:
@@ -4557,7 +4637,8 @@ def balance_trilingual_table_widths(root: ET.Element) -> int:
         except ValueError:
             printable_dxa = 14560
 
-    bounds = ((950, 1250), (1700, 2050), (1800, 2150))
+    # Flexible bounds (20%..35% Col 1, 24%..42% Col 2, 28%..54% Col 3) so any language equalizes height dynamically
+    bounds = ((1000, 1750), (1200, 2100), (1400, 2700))
     balanced_count = 0
 
     for tbl in root.findall(f".//{W}tbl"):
@@ -4573,30 +4654,32 @@ def balance_trilingual_table_widths(root: ET.Element) -> int:
             c3_txt = get_cell_plain_text(tcs[2])
             if c3_txt.strip() == SKIPPED_ROW_MARKER:
                 c3_txt = ""
-            w0 += _compute_text_visual_weight(get_cell_plain_text(tcs[0]), cjk_mult=1.8)
+            w0 += _compute_text_visual_weight(get_cell_plain_text(tcs[0]), cjk_mult=1.9)
             w1 += _compute_text_visual_weight(get_cell_plain_text(tcs[1]), cjk_mult=1.0)
-            w2 += _compute_text_visual_weight(c3_txt, cjk_mult=1.4)
+            w2 += _compute_text_visual_weight(c3_txt, cjk_mult=1.2)
 
         if w1 <= 0 and w2 <= 0:
-            pcts = (1050, 1950, 2000)
+            pcts = (1200, 1900, 1900)
         elif w2 <= 0:
-            pcts = (1050, 1950, 2000)
+            pcts = (1200, 1900, 1900)
         else:
             pcts = _project_bounded_pct_triple((w0, w1, w2), bounds, target_sum=5000)
 
         g0 = round(printable_dxa * pcts[0] / 5000)
         g1 = round(printable_dxa * pcts[1] / 5000)
         g2 = printable_dxa - g0 - g1
+        dxa_widths = (g0, g1, g2)
 
         tblPr = tbl.find(f"{W}tblPr")
         if tblPr is None:
             tblPr = ET.Element(f"{W}tblPr")
             tbl.insert(0, tblPr)
-        insert_tblpr_child_ordered(tblPr, ET.Element(f"{W}tblW", {f"{W}w": "5000", f"{W}type": "pct"}))
+        insert_tblpr_child_ordered(tblPr, ET.Element(f"{W}tblW", {f"{W}w": str(printable_dxa), f"{W}type": "dxa"}))
+        insert_tblpr_child_ordered(tblPr, ET.Element(f"{W}tblLayout", {f"{W}type": "fixed"}))
 
         old_grid = tbl.find(f"{W}tblGrid")
         new_grid = ET.Element(f"{W}tblGrid")
-        for gw in (g0, g1, g2):
+        for gw in dxa_widths:
             ET.SubElement(new_grid, f"{W}gridCol", {f"{W}w": str(gw)})
         if old_grid is not None:
             idx_g = list(tbl).index(old_grid)
@@ -4615,7 +4698,7 @@ def balance_trilingual_table_widths(root: ET.Element) -> int:
                     tcs[col_i].insert(0, tcPr)
                 insert_tcpr_child_ordered(
                     tcPr,
-                    ET.Element(f"{W}tcW", {f"{W}w": str(pcts[col_i]), f"{W}type": "pct"}),
+                    ET.Element(f"{W}tcW", {f"{W}w": str(dxa_widths[col_i]), f"{W}type": "dxa"}),
                 )
 
         balanced_count += 1

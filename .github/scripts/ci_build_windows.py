@@ -125,6 +125,14 @@ def main() -> None:
         "--hidden-import",
         "dedup_checker",
         "--hidden-import",
+        "sheets_reader",
+        "--hidden-import",
+        "library_ingester",
+        "--hidden-import",
+        "proofread_ingester",
+        "--hidden-import",
+        "ingest_tab_ui",
+        "--hidden-import",
         "updater",
         str(tool_dir / "app_gui.py"),
     ]
@@ -158,13 +166,18 @@ def main() -> None:
     (art_dir / "SHA256SUMS.txt").write_text(sums_txt, encoding="utf-8")
 
     notes_md = (
-        "## 多语种改点与分part稿自动整理工具 v1.8.1 (Windows x64 免安装便携版 · 安全加固版)\n\n"
+        "## 多语种改点与分part稿自动整理工具 v1.9.0 (Windows x64 免安装便携版)\n\n"
         "- 解压 `ScatteredRevisionTool-Windows-x64.zip` 后直接双击 `零散改点整理工具.exe` 即可运行（无需安装 Python 或任何第三方库；支持软件内一键检查并自动更新）。\n"
-        "- **v1.8.1 安全合规全面加固（全维度 0 高/中/低危遗留）**：\n"
-        "  1. **自动更新器 Fail-Closed 双重 SHA-256 强制校验与无 shell 清理**：强制要求官方 `SHA256SUMS.txt` 并同时校验 ZIP 压缩包与解压后 EXE 的双重 SHA-256（缺失或不匹配即拒绝更新）；更新暂存目录迁入防符号链接/重解析点的 `%LOCALAPPDATA%\\ScatteredRevisionTool\\updates\\`，并改用纯 PowerShell `-EncodedCommand` + `-LiteralPath` 清理，彻底消除 `cmd.exe` 拼接风险；\n"
-        "  2. **全模块 OpenXML / ZIP 限流解压与防注入统一加固**：全仓库消除无上限 `zip.read()`，所有 `.docx` 解析统一强制单条目 `≤100 MB` 实际解压流限流与 `DOCTYPE/ENTITY` 拦截；\n"
-        "  3. **全篇对比临时目录统一安全隔离**：单篇对比临时目录统一接入防 NTFS 重解析点的 `%LOCALAPPDATA%` 私有临时工作目录。\n"
-        "- **继承 v1.8.0 全部核心升级**：独立「系统设置」面板、常用语种 `★` 置顶与最近使用 `⏱`、零散改点「核对最新中英底稿」无损保底纹更新、全篇现成双文件夹直连对比与无改点篇目汇总报告、三列同步标色与边界精细规则及内置完整功能说明书。\n"
+        "- **v1.9.0 全新核心模块与排版质量全面升级**：\n"
+        "  1. **新增「改点入库与通读定稿」完整工作台（3A 改点返稿入库 + 3B 通读定稿入库）**：\n"
+        "     - **3A 改点返稿入库**：支持发稿/回稿单文件或文件夹自动配对、全栏位原生拖拽、Step 1A 总库一致性核对（保留总库改动或跳过不一致段）、Step 1B 回稿漏改/错位/多删/青色衔接检查并自动打 Word 批注、Step 2 格式清洗与通读表同步、Step 3 原库零修改安全导出 `改前/`、`改后/`（词句级精准回写保留原有蓝红字与底纹，叠加中文底纹）与 `修订稿/`（支持单份汇总/分批汇总/逐篇输出）；\n"
+        "     - **3B 通读定稿入库**：支持粘贴篇目+多个 Google Sheets 链接（严格按 `gid` 仅读指定 Sheet）或本地 `.xlsx/.csv`、导入 Google JSON 授权文件并浏览器登录授权（DPAPI 加密保存）、自定义 5 列列名、改点标点与首字母大写质检、严格精确匹配替换及多 Part 全篇合并核对；\n"
+        "  2. **零散与全篇改点体验升级**：新增「仅英外标记黄/青（默认） / 中英外同步标记黄/青 / 仅输出对比修订」三选一高亮模式；第 3 列外文局部改点（UP）升级为柔和浅蓝底纹（`#D9EEF7`）；「提取三语原稿」100% 原样保留总库既有高亮与底纹颜色；统一横向 A4 默认页边距（上 2.0cm、下 2.2cm、左 2.0cm、右 2.0cm）；\n"
+        "  3. **分part稿整理/合并深度修复与全语种高度自适应拉齐**：\n"
+        "     - 彻底消除印地语、老挝语等输出文档在 Word 打开时的「发现无法读取的内容」提示（清理 `mc:Ignorable` 残留前缀并强制 `CT_PPr` / `CT_RPr` 标准顺序）；\n"
+        "     - 修复印地语等语种引号内首尾词漏加粗及 SOV 语序颠倒导致的引号外蓝字错标问题；\n"
+        "     - 表格上方蓝色标题自动设为「二级标题层级」（`outlineLvl=1`，导航窗格直接识别显示）；\n"
+        "     - 全语种动态模拟折行高度自动拉齐三列列宽，高棉语默认 `Leelawadee UI`、老挝语默认 `DokChampa`，并支持在「语种库」中永久存档各语种自定义标题/正文/摘自字号与行距。\n"
     )
     (art_dir / "RELEASE_NOTES.md").write_text(notes_md, encoding="utf-8")
     print(sums_txt.strip())

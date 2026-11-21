@@ -93,11 +93,18 @@ except ImportError:
 check_and_export_duplicates = getattr(_dd_mod, "check_and_export_duplicates", None)
 
 try:
+    import ingest_tab_ui as _ingest_ui_mod
+except ImportError:
+    _ingest_ui_mod = None
+
+IngestTabPanel = getattr(_ingest_ui_mod, "IngestTabPanel", None)
+
+try:
     import updater as _updater_mod
 except ImportError:
     _updater_mod = None
 
-RAW_APP_VERSION = "1.8.1"
+RAW_APP_VERSION = "1.9.0"
 APP_VERSION = f"v{RAW_APP_VERSION}"
 check_for_updates = getattr(_updater_mod, "check_for_updates", None)
 download_and_apply_update = getattr(_updater_mod, "download_and_apply_update", None)
@@ -987,10 +994,11 @@ class LanguageManagerDialog(tk.Toplevel):
         entries: list,
         on_saved_callback,
         favorite_codes: list[str] | None = None,
+        initial_code: str | None = None,
     ):
         super().__init__(parent)
         self.withdraw()
-        self.title("常用语种置顶与标准字体配置管理")
+        self.title("语种库、标准字体与特殊语种字号/行距存档管理")
         self.transient(parent)
 
         fav_set = {str(c).strip().upper() for c in (favorite_codes or []) if str(c).strip()}
@@ -1005,13 +1013,19 @@ class LanguageManagerDialog(tk.Toplevel):
         self.code_var = tk.StringVar()
         self.name_var = tk.StringVar()
         self.font_var = tk.StringVar()
+        self.title_pt_var = tk.StringVar()
+        self.body_pt_var = tk.StringVar()
+        self.citation_pt_var = tk.StringVar()
+        self.line_pt_var = tk.StringVar()
         self.kw_var = tk.StringVar()
         self.fav_var = tk.BooleanVar(value=False)
         self.summary_var = tk.StringVar(value="")
 
         self._build_ui()
-        self._refresh_tree()
-        _fit_and_center_window(self, base_w=880, base_h=590, min_w=760, min_h=480, parent=parent)
+        self._refresh_tree(keep_code=initial_code if initial_code and initial_code != "AUTO" else None)
+        if initial_code and initial_code != "AUTO":
+            self._on_select_row()
+        _fit_and_center_window(self, base_w=920, base_h=630, min_w=780, min_h=520, parent=parent)
         self.deiconify()
         try:
             self.grab_set()
@@ -1083,8 +1097,20 @@ class LanguageManagerDialog(tk.Toplevel):
         ttk.Label(form, text="自动识别关键词：").grid(row=1, column=0, sticky=tk.W, pady=4)
         ttk.Entry(form, textvariable=self.kw_var).grid(row=1, column=1, columnspan=5, sticky=tk.EW, pady=4, padx=4)
 
+        sz_row = ttk.Frame(form)
+        sz_row.grid(row=2, column=0, columnspan=6, sticky=tk.EW, pady=4)
+        ttk.Label(sz_row, text="特殊语种参数存档（留空用默认 14 / 12 / 10.5 / 20）：").pack(side=tk.LEFT)
+        ttk.Label(sz_row, text="标题pt：").pack(side=tk.LEFT, padx=(6, 2))
+        ttk.Entry(sz_row, textvariable=self.title_pt_var, width=6).pack(side=tk.LEFT)
+        ttk.Label(sz_row, text="正文pt：").pack(side=tk.LEFT, padx=(10, 2))
+        ttk.Entry(sz_row, textvariable=self.body_pt_var, width=6).pack(side=tk.LEFT)
+        ttk.Label(sz_row, text="摘自pt：").pack(side=tk.LEFT, padx=(10, 2))
+        ttk.Entry(sz_row, textvariable=self.citation_pt_var, width=6).pack(side=tk.LEFT)
+        ttk.Label(sz_row, text="行距(磅)：").pack(side=tk.LEFT, padx=(10, 2))
+        ttk.Entry(sz_row, textvariable=self.line_pt_var, width=6).pack(side=tk.LEFT)
+
         fav_row = ttk.Frame(form)
-        fav_row.grid(row=2, column=0, columnspan=6, sticky=tk.EW, pady=(2, 0))
+        fav_row.grid(row=3, column=0, columnspan=6, sticky=tk.EW, pady=(2, 0))
         self.chk_fav = ttk.Checkbutton(
             fav_row,
             text="设为常用语种（下拉框置顶）",
@@ -1154,11 +1180,15 @@ class LanguageManagerDialog(tk.Toplevel):
                 fav_cnt += 1
             fav_disp = "★ 常用" if is_fav else "-"
             f_val = self._effective_entry_font(e)
-            if f_val and e.get("code") == "TH":
-                t_pt = e.get("title_pt", 18)
-                b_pt = e.get("body_pt", 16)
-                c_pt = e.get("citation_pt", 14)
-                f_disp = f"{f_val} ({t_pt}/{b_pt}/{c_pt}pt)"
+            has_custom_sz = any(e.get(k) is not None for k in ("title_pt", "body_pt", "citation_pt", "line_pt"))
+            if has_custom_sz:
+                t_pt = e.get("title_pt", 14)
+                b_pt = e.get("body_pt", 12)
+                c_pt = e.get("citation_pt", 10.5)
+                l_pt = e.get("line_pt", 20)
+                l_tag = f", 行距{l_pt}pt" if e.get("line_pt") is not None else ""
+                base_f = f_val if f_val else "原字体"
+                f_disp = f"{base_f} ({t_pt}/{b_pt}/{c_pt}pt{l_tag})"
             else:
                 f_disp = f_val if f_val else "（保留原字体）"
             iid = str(idx)
@@ -1187,6 +1217,10 @@ class LanguageManagerDialog(tk.Toplevel):
             self.code_var.set(e["code"])
             self.name_var.set(e["name"])
             self.font_var.set(self._effective_entry_font(e))
+            self.title_pt_var.set("" if e.get("title_pt") is None else str(e.get("title_pt")))
+            self.body_pt_var.set("" if e.get("body_pt") is None else str(e.get("body_pt")))
+            self.citation_pt_var.set("" if e.get("citation_pt") is None else str(e.get("citation_pt")))
+            self.line_pt_var.set("" if e.get("line_pt") is None else str(e.get("line_pt")))
             self.kw_var.set(", ".join(e.get("keywords", [])))
             self.fav_var.set(self._is_entry_fav(e))
 
@@ -1230,10 +1264,30 @@ class LanguageManagerDialog(tk.Toplevel):
 
         kws = build_keywords_list(name, self.kw_var.get())
 
+        custom_pts: dict = {}
+        for pt_key, var_obj, lbl_cn in (
+            ("title_pt", self.title_pt_var, "标题字号"),
+            ("body_pt", self.body_pt_var, "正文字号"),
+            ("citation_pt", self.citation_pt_var, "摘自字号"),
+            ("line_pt", self.line_pt_var, "行距磅数"),
+        ):
+            raw_s = var_obj.get().strip()
+            if raw_s:
+                try:
+                    val_f = float(raw_s)
+                    if val_f <= 0 or val_f > 72:
+                        raise ValueError()
+                    custom_pts[pt_key] = int(val_f) if val_f.is_integer() else val_f
+                except ValueError:
+                    messagebox.showwarning("提示", f"「{lbl_cn}」请输入大于 0 的数字（或留空使用默认值）。", parent=self)
+                    return
+
         updated = False
         for i, e in enumerate(self.entries):
             if e["code"] == raw_code:
                 merged_entry = dict(e)
+                for rm_k in ("title_pt", "body_pt", "citation_pt", "line_pt"):
+                    merged_entry.pop(rm_k, None)
                 merged_entry.update(
                     {
                         "code": raw_code,
@@ -1241,6 +1295,7 @@ class LanguageManagerDialog(tk.Toplevel):
                         "keywords": kws,
                         "font": font_val,
                         "favorite": is_fav,
+                        **custom_pts,
                     }
                 )
                 self.entries[i] = merged_entry
@@ -1255,6 +1310,7 @@ class LanguageManagerDialog(tk.Toplevel):
                     "keywords": kws,
                     "font": font_val,
                     "favorite": is_fav,
+                    **custom_pts,
                 },
             )
 
@@ -1768,6 +1824,7 @@ class ScatteredRevisionApp:
         "main": "零散改点整理",
         "fa": "全篇改点整理",
         "dd": "改点稿查重",
+        "ingest": "改点入库与通读定稿",
         "wc": "英文字数统计",
         "fel": "分part稿整理/合并",
         "settings": "系统设置",
@@ -1776,7 +1833,7 @@ class ScatteredRevisionApp:
     def __init__(self, root: tk.Tk):
         self.root = root
         self.root.title(
-            f"多语种整理工作台 {APP_VERSION}  (零散改点 · 全篇对比 · 改点查重 · 英文字数统计 · 分part稿整理/合并 · 系统设置)"
+            f"多语种整理工作台 {APP_VERSION}  (零散改点 · 全篇对比 · 改点查重 · 改点入库/通读 · 英文字数统计 · 分part稿整理/合并 · 系统设置)"
         )
 
         self.log_queue: queue.Queue = queue.Queue()
@@ -1924,7 +1981,10 @@ class ScatteredRevisionApp:
         self.doc_name_var = tk.StringVar(value="")
         self.dual_outputs_var = tk.BooleanVar(value=True)
         self.sc1_balance_cols_var = tk.BooleanVar(value=bool(self.settings.get("sc1_balance_cols", True)))
-        self.sc1_highlight_colors_var = tk.BooleanVar(value=bool(self.settings.get("sc1_highlight_colors", True)))
+        _init_sc1_hl = str(self.settings.get("sc1_highlight_mode", "")).strip()
+        if _init_sc1_hl not in ("en_foreign", "all_three", "revisions_only"):
+            _init_sc1_hl = "revisions_only" if not bool(self.settings.get("sc1_highlight_colors", True)) else "en_foreign"
+        self.sc1_highlight_mode_var = tk.StringVar(value=_init_sc1_hl)
         self.sc1_export_raw_var = tk.BooleanVar(value=bool(self.settings.get("sc1_export_raw", True)))
         self.sc1_enable_ai_var = tk.BooleanVar(value=bool(self.settings.get("sc1_enable_ai", True)))
         self.sc1_enable_dedup_var = tk.BooleanVar(value=bool(self.settings.get("sc1_enable_dedup", False)))
@@ -1944,7 +2004,10 @@ class ScatteredRevisionApp:
         self.fa_lang_var = tk.StringVar(value=AUTO_COMBO_LABEL)
         self.fa_date_var = tk.StringVar(value=datetime.now().strftime("%Y%m%d"))
         self.fa_balance_cols_var = tk.BooleanVar(value=bool(self.settings.get("fa_balance_cols", True)))
-        self.fa_highlight_colors_var = tk.BooleanVar(value=bool(self.settings.get("fa_highlight_colors", True)))
+        _init_fa_hl = str(self.settings.get("fa_highlight_mode", "")).strip()
+        if _init_fa_hl not in ("en_foreign", "all_three", "revisions_only"):
+            _init_fa_hl = "revisions_only" if not bool(self.settings.get("fa_highlight_colors", True)) else "en_foreign"
+        self.fa_highlight_mode_var = tk.StringVar(value=_init_fa_hl)
         self.fa_enable_ai_var = tk.BooleanVar(value=bool(self.settings.get("fa_enable_ai", True)))
         self.fa_title_count_var = tk.StringVar(value="当前共输入 0 个待提取篇目标题")
 
@@ -2229,7 +2292,10 @@ class ScatteredRevisionApp:
                 self.sc1_keyword_var.set(str(cfg.get("sc1_keyword", "")))
                 self.dual_outputs_var.set(bool(cfg.get("dual_outputs", True)))
                 self.sc1_balance_cols_var.set(bool(cfg.get("sc1_balance_cols", True)))
-                self.sc1_highlight_colors_var.set(bool(cfg.get("sc1_highlight_colors", True)))
+                _cfg_sc1_hl = str(cfg.get("sc1_highlight_mode", "")).strip()
+                if _cfg_sc1_hl not in ("en_foreign", "all_three", "revisions_only"):
+                    _cfg_sc1_hl = "revisions_only" if not bool(cfg.get("sc1_highlight_colors", True)) else "en_foreign"
+                self.sc1_highlight_mode_var.set(_cfg_sc1_hl)
                 self.sc1_export_raw_var.set(bool(cfg.get("sc1_export_raw", True)))
                 self.sc1_enable_ai_var.set(bool(cfg.get("sc1_enable_ai", True)))
                 self.sc1_enable_dedup_var.set(bool(cfg.get("sc1_enable_dedup", False)))
@@ -2245,7 +2311,10 @@ class ScatteredRevisionApp:
                 saved_fa_lang = cfg.get("fa_lang", saved_lang)
                 self.fa_lang_var.set(self._code_to_combo_display(saved_fa_lang))
                 self.fa_balance_cols_var.set(bool(cfg.get("fa_balance_cols", True)))
-                self.fa_highlight_colors_var.set(bool(cfg.get("fa_highlight_colors", True)))
+                _cfg_fa_hl = str(cfg.get("fa_highlight_mode", "")).strip()
+                if _cfg_fa_hl not in ("en_foreign", "all_three", "revisions_only"):
+                    _cfg_fa_hl = "revisions_only" if not bool(cfg.get("fa_highlight_colors", True)) else "en_foreign"
+                self.fa_highlight_mode_var.set(_cfg_fa_hl)
                 self.fa_enable_ai_var.set(bool(cfg.get("fa_enable_ai", True)))
 
                 # Tab 3
@@ -2332,7 +2401,8 @@ class ScatteredRevisionApp:
                 "sc1_keyword": self.sc1_keyword_var.get().strip(),
                 "dual_outputs": self.dual_outputs_var.get(),
                 "sc1_balance_cols": self.sc1_balance_cols_var.get(),
-                "sc1_highlight_colors": self.sc1_highlight_colors_var.get(),
+                "sc1_highlight_mode": self.sc1_highlight_mode_var.get(),
+                "sc1_highlight_colors": self.sc1_highlight_mode_var.get() != "revisions_only",
                 "sc1_export_raw": self.sc1_export_raw_var.get(),
                 "sc1_enable_ai": self.sc1_enable_ai_var.get(),
                 "sc1_enable_dedup": self.sc1_enable_dedup_var.get(),
@@ -2345,7 +2415,8 @@ class ScatteredRevisionApp:
                 "fa_dedup_dir": self.fa_dedup_dir_var.get().strip(),
                 "fa_lang": self._get_fa_lang_code(),
                 "fa_balance_cols": self.fa_balance_cols_var.get(),
-                "fa_highlight_colors": self.fa_highlight_colors_var.get(),
+                "fa_highlight_mode": self.fa_highlight_mode_var.get(),
+                "fa_highlight_colors": self.fa_highlight_mode_var.get() != "revisions_only",
                 "fa_enable_ai": self.fa_enable_ai_var.get(),
                 "dd_pkg_dir": self.dd_pkg_dir_var.get().strip(),
                 "dd_out_dir": self.dd_out_dir_var.get().strip(),
@@ -2363,6 +2434,11 @@ class ScatteredRevisionApp:
                 "fel_sync_red": self.fel_sync_red_var.get(),
             }
         )
+        if getattr(self, "ingest_panel", None) is not None:
+            try:
+                cfg.update(self.ingest_panel.export_settings_dict())
+            except Exception:
+                pass
         self.settings = dict(cfg)
         try:
             with open(SETTINGS_FILE, "w", encoding="utf-8") as f:
@@ -2486,6 +2562,7 @@ class ScatteredRevisionApp:
         self.nav_btn_main = self._create_sidebar_tab(key="main", title="零散改点整理")
         self.nav_btn_fa = self._create_sidebar_tab(key="fa", title="全篇改点整理")
         self.nav_btn_dd = self._create_sidebar_tab(key="dd", title="改点稿查重")
+        self.nav_btn_ingest = self._create_sidebar_tab(key="ingest", title="改点入库与通读定稿")
 
         self._create_sidebar_group_header("字数与分篇定稿", first=False)
         self.nav_btn_wc = self._create_sidebar_tab(key="wc", title="英文字数统计")
@@ -2589,20 +2666,22 @@ class ScatteredRevisionApp:
         )
         self.update_banner_lbl.pack(side=tk.LEFT, fill=tk.X, expand=True)
 
-        # Row 2: 6 Tab Frames
+        # Row 2: 7 Tab Frames
         self.tab_main = ttk.Frame(self.content_area)
         self.tab_fa = ttk.Frame(self.content_area)
         self.tab_dd = ttk.Frame(self.content_area)
+        self.tab_ingest = ttk.Frame(self.content_area)
         self.tab_wc = ttk.Frame(self.content_area)
         self.tab_fel = ttk.Frame(self.content_area)
         self.tab_settings = ttk.Frame(self.content_area)
 
-        for tf in (self.tab_main, self.tab_fa, self.tab_dd, self.tab_wc, self.tab_fel, self.tab_settings):
+        for tf in (self.tab_main, self.tab_fa, self.tab_dd, self.tab_ingest, self.tab_wc, self.tab_fel, self.tab_settings):
             tf.grid(row=2, column=0, sticky=tk.NSEW)
 
         self._build_tab1_pipeline(self.tab_main)
         self._build_tab2_full_article(self.tab_fa)
         self._build_tab3_dedup(self.tab_dd)
+        self.ingest_panel = IngestTabPanel(self, self.tab_ingest) if IngestTabPanel is not None else None
         self._build_tab4_word_counter(self.tab_wc)
         self._build_tab5_part_merge(self.tab_fel)
         self._build_tab6_settings(self.tab_settings)
@@ -2675,6 +2754,7 @@ class ScatteredRevisionApp:
             "main": self.tab_main,
             "fa": self.tab_fa,
             "dd": self.tab_dd,
+            "ingest": self.tab_ingest,
             "wc": self.tab_wc,
             "fel": self.tab_fel,
             "settings": self.tab_settings,
@@ -2894,13 +2974,29 @@ class ScatteredRevisionApp:
             command=self._save_settings,
         ).pack(side=tk.LEFT)
 
-        # Items #2 & #4: Highlight Colors Toggle + Raw Trilingual Export Checkbox
+        # 3-Way Highlight Mode Selector + Raw Trilingual Export Checkbox
         opt_row_hl = ttk.Frame(path_frame)
         opt_row_hl.grid(row=6, column=0, columnspan=4, sticky=tk.EW, pady=1)
-        ttk.Checkbutton(
+        ttk.Label(opt_row_hl, text="高亮模式：").pack(side=tk.LEFT)
+        ttk.Radiobutton(
             opt_row_hl,
-            text="对比标记高亮颜色（中/英/外三列同步标黄/青；取消勾选则仅输出对比修订痕迹）",
-            variable=self.sc1_highlight_colors_var,
+            text="仅英外标记黄/青",
+            value="en_foreign",
+            variable=self.sc1_highlight_mode_var,
+            command=self._save_settings,
+        ).pack(side=tk.LEFT, padx=(2, 8))
+        ttk.Radiobutton(
+            opt_row_hl,
+            text="中英外同步标记黄/青",
+            value="all_three",
+            variable=self.sc1_highlight_mode_var,
+            command=self._save_settings,
+        ).pack(side=tk.LEFT, padx=(0, 8))
+        ttk.Radiobutton(
+            opt_row_hl,
+            text="仅输出对比修订",
+            value="revisions_only",
+            variable=self.sc1_highlight_mode_var,
             command=self._save_settings,
         ).pack(side=tk.LEFT, padx=(0, 14))
         ttk.Checkbutton(
@@ -3176,15 +3272,31 @@ class ScatteredRevisionApp:
 
         opt_row2 = ttk.Frame(cfg_frame)
         opt_row2.grid(row=5, column=0, columnspan=4, sticky=tk.EW, pady=(1, 0))
-        ttk.Checkbutton(
+        ttk.Label(opt_row2, text="高亮模式：").pack(side=tk.LEFT)
+        ttk.Radiobutton(
             opt_row2,
-            text="对比标记高亮颜色（取消勾选则仅输出英文对比修订痕迹）",
-            variable=self.fa_highlight_colors_var,
+            text="仅英外标记黄/青",
+            value="en_foreign",
+            variable=self.fa_highlight_mode_var,
+            command=self._save_settings,
+        ).pack(side=tk.LEFT, padx=(2, 8))
+        ttk.Radiobutton(
+            opt_row2,
+            text="中英外同步标记黄/青",
+            value="all_three",
+            variable=self.fa_highlight_mode_var,
+            command=self._save_settings,
+        ).pack(side=tk.LEFT, padx=(0, 8))
+        ttk.Radiobutton(
+            opt_row2,
+            text="仅输出对比修订",
+            value="revisions_only",
+            variable=self.fa_highlight_mode_var,
             command=self._save_settings,
         ).pack(side=tk.LEFT, padx=(0, 14))
         ttk.Checkbutton(
             opt_row2,
-            text="使用 AI 辅助分级与双列精准对齐（无 Key 自动本地标色）",
+            text="使用 AI 辅助分级与精准对齐（无 Key 自动本地标色）",
             variable=self.fa_enable_ai_var,
             command=self._save_settings,
         ).pack(side=tk.LEFT)
@@ -4211,6 +4323,12 @@ class ScatteredRevisionApp:
         self.dnd.register_target(self.nav_btn_main, lambda ps: (self._switch_tab("main"), self._handle_tab1_drop(ps)))
         self.dnd.register_target(self.nav_btn_fa, lambda ps: (self._switch_tab("fa"), self._handle_tab2_drop(ps)))
         self.dnd.register_target(self.nav_btn_dd, lambda ps: (self._switch_tab("dd"), self._handle_tab3_drop(ps)))
+        if getattr(self, "ingest_panel", None) is not None:
+            self.dnd.register_target(
+                self.nav_btn_ingest,
+                lambda ps: (self._switch_tab("ingest"), self.ingest_panel.handle_fallback_drop(ps)),
+            )
+            self.ingest_panel.register_dnd_targets(self.dnd)
         self.dnd.register_target(self.nav_btn_wc, lambda ps: (self._switch_tab("wc"), self._wc_ingest_paths(ps)))
         self.dnd.register_target(self.nav_btn_fel, lambda ps: (self._switch_tab("fel"), self._fel_ingest_paths(ps)))
 
@@ -4258,6 +4376,9 @@ class ScatteredRevisionApp:
             self._handle_tab2_drop(paths)
         elif self.active_tab_key == "dd":
             self._handle_tab3_drop(paths)
+        elif self.active_tab_key == "ingest":
+            if getattr(self, "ingest_panel", None) is not None:
+                self.ingest_panel.handle_fallback_drop(paths)
         elif self.active_tab_key == "wc":
             self._wc_ingest_paths(paths)
         elif self.active_tab_key == "fel":
@@ -4803,7 +4924,13 @@ class ScatteredRevisionApp:
             messagebox.showerror("组件未就绪", "未找到 full_article_processor.resolve_direct_folder_articles，请确认已合并 v1.8.0 引擎模块。")
             return
 
-        highlight_colors = bool(self.fa_highlight_colors_var.get())
+        highlight_mode = self.fa_highlight_mode_var.get() or "en_foreign"
+        highlight_colors = highlight_mode != "revisions_only"
+        hl_label = (
+            "仅英外标记黄/青"
+            if highlight_mode == "en_foreign"
+            else ("中英外同步标记黄/青" if highlight_mode == "all_three" else "仅输出对比修订")
+        )
         yellow_gap_words = self._get_yellow_gap_words()
         want_ai = bool(self.fa_enable_ai_var.get())
         keys = self._get_all_keys_list()
@@ -4826,11 +4953,11 @@ class ScatteredRevisionApp:
         self._set_running(True, final_stage=init_stage, tab_key="fa")
         self._log("=" * 64, target_tab="fa")
         if not highlight_colors:
-            mode_desc = "仅输出英文对比修订痕迹（不标黄/青高亮，免调 AI）"
+            mode_desc = f"{hl_label}（不标黄/青高亮，免调 AI）"
         elif effective_ai:
-            mode_desc = f"AI 辅助（{model} | {len(keys)} 个 Key | 黄标连片 ≤{yellow_gap_words}词）"
+            mode_desc = f"{hl_label} | AI 辅助（{model} | {len(keys)} 个 Key | 黄标连片 ≤{yellow_gap_words}词）"
         else:
-            mode_desc = f"本地位置估算模式（免 API Key | 黄标连片 ≤{yellow_gap_words}词）"
+            mode_desc = f"{hl_label} | 本地位置估算模式（免 API Key | 黄标连片 ≤{yellow_gap_words}词）"
         src_desc = f"按标题提取 {len(titles)} 篇" if use_titles else "现成双文件夹直连对比"
         self._log(
             f"⚡ 启动【全篇改点整理】 | {src_desc} | {mode_desc} | 语种：{lang_code}",
@@ -4911,6 +5038,7 @@ class ScatteredRevisionApp:
                     date_str=dt_str,
                     use_title_list=use_titles,
                     highlight_colors=highlight_colors,
+                    highlight_mode=highlight_mode,
                     yellow_gap_words=yellow_gap_words,
                     log_fn=lambda m: self._log(m, target_tab="fa"),
                     progress_fn=self._progress,
@@ -5829,7 +5957,23 @@ class ScatteredRevisionApp:
                 target_tab=self.active_tab_key,
             )
 
-        LanguageManagerDialog(self.root, self.languages, _on_saved, favorite_codes=self.favorite_langs)
+        cur_code = "AUTO"
+        if self.active_tab_key == "fel":
+            cur_code = self._get_fel_lang_code()
+        elif self.active_tab_key == "fa":
+            cur_code = self._get_fa_lang_code()
+        elif self.active_tab_key == "wc":
+            cur_code = self._get_wc_lang_code()
+        else:
+            cur_code = self._get_selected_lang_code()
+
+        LanguageManagerDialog(
+            self.root,
+            self.languages,
+            _on_saved,
+            favorite_codes=self.favorite_langs,
+            initial_code=cur_code,
+        )
 
     def _clear_log(self):
         self.log_text.delete("1.0", tk.END)
@@ -6140,7 +6284,13 @@ class ScatteredRevisionApp:
             messagebox.showwarning("提示", "已勾选关联「未入库改点包」查重，请先选择有效的未入库改点包文件夹（或取消勾选）。")
             return
 
-        highlight_colors = bool(self.sc1_highlight_colors_var.get())
+        highlight_mode = self.sc1_highlight_mode_var.get() or "en_foreign"
+        highlight_colors = highlight_mode != "revisions_only"
+        hl_label = (
+            "仅英外标记黄/青"
+            if highlight_mode == "en_foreign"
+            else ("中英外同步标记黄/青" if highlight_mode == "all_three" else "仅输出对比修订")
+        )
         export_raw_trilingual = bool(self.sc1_export_raw_var.get())
         yellow_gap_words = self._get_yellow_gap_words()
         want_ai = bool(self.sc1_enable_ai_var.get())
@@ -6171,11 +6321,11 @@ class ScatteredRevisionApp:
         self._set_running(True, final_stage="正在启动一键输出定稿...", tab_key="main")
         self._log("=" * 64, target_tab="main")
         if not highlight_colors:
-            mode_summary = "仅输出对比修订痕迹（不标黄/青高亮，免调 AI）"
+            mode_summary = f"{hl_label}（不标黄/青高亮，免调 AI）"
         elif effective_enable_ai:
-            mode_summary = f"AI 辅助（模型：{model} | 密钥池：{len(keys)} 个 Key | 黄标连片 ≤{yellow_gap_words}词）"
+            mode_summary = f"{hl_label} | AI 辅助（模型：{model} | 密钥池：{len(keys)} 个 Key | 黄标连片 ≤{yellow_gap_words}词）"
         else:
-            mode_summary = f"本地位置估算模式（免 API Key | 黄标连片 ≤{yellow_gap_words}词）"
+            mode_summary = f"{hl_label} | 本地位置估算模式（免 API Key | 黄标连片 ≤{yellow_gap_words}词）"
         name_desc = (
             f"God's words in {sc_kw}"
             if (naming_mode == "scattered" and sc_kw)
@@ -6187,7 +6337,7 @@ class ScatteredRevisionApp:
             target_tab="main",
         )
         if not highlight_colors:
-            self._log("ℹ️ 已取消勾选「对比标记高亮颜色」：本次仅保留第 2 列修订痕迹，不输出黄/青高亮颜色", target_tab="main")
+            self._log("ℹ️ 当前为「仅输出对比修订」模式：本次仅保留第 2 列修订痕迹，不输出黄/青高亮颜色", target_tab="main")
         elif auto_no_key_local:
             self._log("ℹ️ 未填写 API Key，本次自动使用「本地位置估算模式」完成标色并导出定稿", target_tab="main")
         elif not want_ai:
@@ -6215,6 +6365,7 @@ class ScatteredRevisionApp:
                     date_str="",
                     latest_master_path=latest_master_path,
                     highlight_colors=highlight_colors,
+                    highlight_mode=highlight_mode,
                     yellow_gap_words=yellow_gap_words,
                     export_raw_trilingual=export_raw_trilingual,
                     log_fn=lambda m: self._log(m, target_tab="main"),
@@ -6340,8 +6491,8 @@ def _run_frozen_self_test() -> int:
     from ai_client import format_friendly_api_error as _ai_friendly_err
     from ai_client import local_align_col3_spans
 
-    if RAW_APP_VERSION != "1.8.1":
-        raise RuntimeError(f"RAW_APP_VERSION expected '1.8.1', got {RAW_APP_VERSION!r}")
+    if RAW_APP_VERSION != "1.9.0":
+        raise RuntimeError(f"RAW_APP_VERSION expected '1.9.0', got {RAW_APP_VERSION!r}")
 
     is_frozen = bool(getattr(sys, "frozen", False))
     if is_frozen and hasattr(sys, "_MEIPASS"):
@@ -6439,6 +6590,19 @@ def _run_frozen_self_test() -> int:
         import full_article_processor as _fap_test
         import dedup_checker as _dd_test
         import updater as _upd_test
+        import sheets_reader as _sr_test
+        import library_ingester as _li_test
+        import proofread_ingester as _pi_test
+        import ingest_tab_ui as _iui_test
+
+        if not callable(getattr(_sr_test, "parse_google_sheet_url", None)):
+            raise RuntimeError("sheets_reader.parse_google_sheet_url missing in self-test")
+        if not callable(getattr(_li_test, "run_library_ingestion_pipeline", None)):
+            raise RuntimeError("library_ingester.run_library_ingestion_pipeline missing in self-test")
+        if not callable(getattr(_pi_test, "run_proofread_ingestion_pipeline", None)):
+            raise RuntimeError("proofread_ingester.run_proofread_ingestion_pipeline missing in self-test")
+        if getattr(_iui_test, "IngestTabPanel", None) is None:
+            raise RuntimeError("ingest_tab_ui.IngestTabPanel missing in self-test")
 
         for req_fn in ("parse_titles_text_or_file", "parse_titles_multiline", "resolve_full_articles", "run_full_article_pipeline"):
             if not callable(getattr(_fap_test, req_fn, None)):
@@ -6451,7 +6615,7 @@ def _run_frozen_self_test() -> int:
             raise RuntimeError("dedup_checker.check_and_export_duplicates missing in self-test")
 
         upd_ver = str(getattr(_upd_test, "APP_VERSION", "")).lstrip("vV")
-        expected_vers = ("1.8.1",) if require_v18_siblings else ("1.7.0", "1.8.0", "1.8.1")
+        expected_vers = ("1.9.0",) if require_v18_siblings else ("1.7.0", "1.8.0", "1.8.1", "1.9.0")
         if upd_ver not in expected_vers:
             raise RuntimeError(f"updater.APP_VERSION mismatch: {getattr(_upd_test, 'APP_VERSION', None)!r}")
         if not callable(getattr(_upd_test, "check_for_updates", None)) or not callable(

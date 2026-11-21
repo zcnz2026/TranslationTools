@@ -401,6 +401,7 @@ def main():
     parser.add_argument("--only-unchanged-tables", action="store_true", help="Keep only unchanged rows/tables (unchanged-only version)")
     parser.add_argument("--keep-first-title-row", action="store_true", help="Full-article mode: preserve Row 0 chapter title row in changed tables")
     parser.add_argument("--no-highlight-colors", action="store_true", help="Skip Col 1/Col 3 highlights and top instruction lines")
+    parser.add_argument("--no-col1-highlights", action="store_true", help="Skip Col 1 Chinese yellow/cyan highlights (highlight Col 2 & Col 3 only)")
     parser.add_argument("--no-balance-columns", action="store_true", help="Disable automatic adaptive 3-column width balancing")
     parser.add_argument("--no-header-lines", action="store_true", help="Disable automatic top Blue/Yellow highlight instruction lines")
     args = parser.parse_args()
@@ -408,9 +409,10 @@ def main():
     cfg = load_config()
     col2_up = cfg.get("col2_up_highlight", "yellow")
     col2_rv = cfg.get("col2_rv_highlight", "cyan")
-    col3_up = cfg.get("col3_up_highlight", "yellow")
+    col3_up = cfg.get("col3_up_highlight", "shd:D9EEF7")
     col3_rv = cfg.get("col3_rv_highlight", "lightGray")
     use_hl = not bool(args.no_highlight_colors)
+    highlight_col1 = use_hl and not bool(args.no_col1_highlights)
 
     with open(args.tasks, "r", encoding="utf-8") as f:
         tasks_data = json.load(f)
@@ -455,9 +457,10 @@ def main():
             col3_text = get_cell_plain_text(tc3)
 
             if rt.get("is_full_cell_rv"):
-                c1_full = _full_nonws_char_spans(col1_text, col2_rv)
+                if highlight_col1:
+                    c1_full = _full_nonws_char_spans(col1_text, col2_rv)
+                    apply_highlights_to_col3_cell(tc1, c1_full)
                 c3_full = _full_nonws_char_spans(col3_text, col3_rv)
-                apply_highlights_to_col3_cell(tc1, c1_full)
                 apply_highlights_to_col3_cell(tc3, c3_full)
                 matched_count += len(rt.get("spans", []))
                 continue
@@ -478,8 +481,8 @@ def main():
                     col1_target = ""
                     col3_target = str(entry or "")
 
-                # Synchronous Col 1 Chinese highlight (yellow for 'up', cyan for 'rv')
-                if col1_text.strip():
+                # Synchronous Col 1 Chinese highlight (yellow for 'up', cyan for 'rv') — only when highlight_col1 is enabled
+                if highlight_col1 and col1_text.strip():
                     hl_c1 = col2_rv if sp["type"] == "rv" else col2_up
                     loc1 = (
                         find_fuzzy_substring_span(col1_text, col1_target, search_from=col1_cursor)
@@ -499,7 +502,7 @@ def main():
                         col1_char_spans.append((s1, e1, hl_c1))
                         col1_cursor = e1
 
-                # Synchronous Col 3 Foreign highlight (yellow for 'up', lightGray for 'rv')
+                # Synchronous Col 3 Foreign highlight (soft light-blue shading for 'up', lightGray for 'rv')
                 if not col3_target or not col3_target.strip():
                     unmatched.append((sid, "EMPTY_ALIGNMENT", sp["old_en_in_col3"][:60]))
                     continue
@@ -515,7 +518,8 @@ def main():
                 col3_cursor = e3
                 matched_count += 1
 
-            apply_highlights_to_col3_cell(tc1, col1_char_spans)
+            if highlight_col1:
+                apply_highlights_to_col3_cell(tc1, col1_char_spans)
             apply_highlights_to_col3_cell(tc3, col3_char_spans)
 
     if unmatched:

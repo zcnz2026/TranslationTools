@@ -11,6 +11,7 @@ AUTO_COMBO_LABEL = "AUTO - 自动识别（按总库目录/文件名）"
 DEFAULT_TITLE_PT = 14.0
 DEFAULT_BODY_PT = 12.0
 DEFAULT_CITATION_PT = 10.5
+DEFAULT_LINE_PT = 20.0
 
 # Common alternate language codes used in filenames / legacy configs -> canonical DEFAULT_LANGUAGES code
 _CODE_ALIASES: Dict[str, str] = {
@@ -46,7 +47,7 @@ DEFAULT_LANGUAGES: List[Dict] = [
     {"code": "TL", "name": "塔加洛语", "keywords": ["塔加洛语", "他加禄语", "菲律宾语", "菲语", "中英塔", "中英菲"], "font": "Georgia"},
     {"code": "MY", "name": "缅甸语", "keywords": ["缅甸语", "缅语", "缅甸", "中英缅"], "font": "Myanmar Text"},
     {"code": "KM", "name": "高棉语", "keywords": ["高棉语", "柬埔寨语", "柬语", "中英柬", "中英高棉"], "font": "Leelawadee UI"},
-    {"code": "LO", "name": "老挝语", "keywords": ["老挝语", "老语", "老挝", "中英老"], "font": "DokChampa"},
+    {"code": "LO", "name": "老挝语", "keywords": ["老挝语", "老语", "老挝", "挝语", "中英老", "中英挝"], "font": "DokChampa"},
     {"code": "AR", "name": "阿拉伯语", "keywords": ["阿拉伯语", "阿语", "中英阿"], "font": "Simplified Arabic"},
     {"code": "TR", "name": "土耳其语", "keywords": ["土耳其语", "土语", "中英土"], "font": ""},
     {"code": "FA", "name": "波斯语", "keywords": ["波斯语", "中英波斯"], "font": ""},
@@ -169,11 +170,12 @@ def load_languages() -> List[Dict]:
                 else:
                     entry_out["favorite"] = bool(fav_raw)
 
-            for pt_key in ("title_pt", "body_pt", "citation_pt"):
-                if pt_key in item and item[pt_key] is not None:
+            for pt_key in ("title_pt", "body_pt", "citation_pt", "line_pt"):
+                if pt_key in item and item[pt_key] is not None and str(item[pt_key]).strip() != "":
                     try:
                         val_num = float(item[pt_key])
-                        entry_out[pt_key] = int(val_num) if val_num.is_integer() else val_num
+                        if val_num > 0:
+                            entry_out[pt_key] = int(val_num) if val_num.is_integer() else val_num
                     except (TypeError, ValueError):
                         pass
                 elif def_entry and pt_key in def_entry:
@@ -269,11 +271,27 @@ def get_lang_typography(code: str, entries: Optional[List[Dict]] = None) -> Dict
                 pass
         return int(round(default_pt * 2))
 
+    def _resolve_line_dxa() -> int:
+        raw_lp = None
+        if matched is not None and matched.get("line_pt") is not None:
+            raw_lp = matched.get("line_pt")
+        elif def_entry is not None and def_entry.get("line_pt") is not None:
+            raw_lp = def_entry.get("line_pt")
+        if raw_lp is not None:
+            try:
+                lp = float(raw_lp)
+                if lp > 0:
+                    return int(round(lp * 20))
+            except (TypeError, ValueError):
+                pass
+        return int(round(DEFAULT_LINE_PT * 20))
+
     return {
         "font": font_val,
         "title_sz": _resolve_sz("title_pt", DEFAULT_TITLE_PT),
         "body_sz": _resolve_sz("body_pt", DEFAULT_BODY_PT),
         "citation_sz": _resolve_sz("citation_pt", DEFAULT_CITATION_PT),
+        "line_dxa": _resolve_line_dxa(),
     }
 
 

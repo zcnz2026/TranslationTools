@@ -239,10 +239,10 @@ def balance_trilingual_table_widths(root: ET.Element) -> int:
 
         tot_w = sum(weights)
         if tot_w <= 0:
-            pcts = [1100, 1900, 2000]
+            pcts = [1250, 1850, 1900]
         else:
             raw = [round(5000.0 * w / tot_w) for w in weights]
-            bounds = [(950, 1250), (1700, 2050), (1800, 2150)]
+            bounds = [(1100, 1450), (1650, 2000), (1750, 2100)]
             pcts = [max(lo, min(hi, val)) for val, (lo, hi) in zip(raw, bounds)]
             diff = 5000 - sum(pcts)
             # Distribute remainder across columns that still have headroom within bounds
@@ -275,8 +275,13 @@ def balance_trilingual_table_widths(root: ET.Element) -> int:
         if tblW is None:
             tblW = ET.SubElement(tblPr, f"{W}tblW")
         tblW.attrib.clear()
-        tblW.set(f"{W}w", "5000")
-        tblW.set(f"{W}type", "pct")
+        tblW.set(f"{W}w", str(total_dxa))
+        tblW.set(f"{W}type", "dxa")
+        tblLayout = tblPr.find("w:tblLayout", ns)
+        if tblLayout is None:
+            tblLayout = ET.SubElement(tblPr, f"{W}tblLayout")
+        tblLayout.attrib.clear()
+        tblLayout.set(f"{W}type", "fixed")
 
         tblGrid = tbl.find("w:tblGrid", ns)
         if tblGrid is None:
@@ -308,8 +313,8 @@ def balance_trilingual_table_widths(root: ET.Element) -> int:
                     tcW = ET.Element(f"{W}tcW")
                     tcPr.insert(0, tcW)
                 tcW.attrib.clear()
-                tcW.set(f"{W}w", str(pcts[idx_c]))
-                tcW.set(f"{W}type", "pct")
+                tcW.set(f"{W}w", str(dxa_cols[idx_c]))
+                tcW.set(f"{W}type", "dxa")
 
         balanced_cnt += 1
 

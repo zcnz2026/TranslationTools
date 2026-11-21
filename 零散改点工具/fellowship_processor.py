@@ -122,10 +122,12 @@ REL_PKG_NS = "http://schemas.openxmlformats.org/package/2006/relationships"
 CT_NS = "http://schemas.openxmlformats.org/package/2006/content-types"
 XML_NS = "http://www.w3.org/XML/1998/namespace"
 
+MC_NS = "http://schemas.openxmlformats.org/markup-compatibility/2006"
 W = f"{{{W_NS}}}"
 R_ATTR = f"{{{R_NS}}}"
 WP = f"{{{WP_NS}}}"
 W14 = f"{{{W14_NS}}}"
+MC = f"{{{MC_NS}}}"
 XML_SPACE = f"{{{XML_NS}}}space"
 
 COMMON_NAMESPACES = {
@@ -134,7 +136,7 @@ COMMON_NAMESPACES = {
     "wp": WP_NS,
     "a": "http://schemas.openxmlformats.org/drawingml/2006/main",
     "pic": "http://schemas.openxmlformats.org/drawingml/2006/picture",
-    "mc": "http://schemas.openxmlformats.org/markup-compatibility/2006",
+    "mc": MC_NS,
     "w14": W14_NS,
     "w15": "http://schemas.microsoft.com/office/word/2012/wordml",
     "m": "http://schemas.openxmlformats.org/officeDocument/2006/math",
@@ -143,6 +145,51 @@ COMMON_NAMESPACES = {
 }
 for _pfx, _uri in COMMON_NAMESPACES.items():
     ET.register_namespace(_pfx, _uri)
+
+# Strict ECMA-376 CT_PPr child element ordering so Word never flags out-of-order paragraph properties
+_PPR_TAG_ORDER: Dict[str, int] = {
+    name: idx
+    for idx, name in enumerate(
+        [
+            "pStyle",
+            "keepNext",
+            "keepLines",
+            "pageBreakBefore",
+            "framePr",
+            "widowControl",
+            "numPr",
+            "suppressLineNumbers",
+            "pBdr",
+            "shd",
+            "tabs",
+            "suppressAutoHyphens",
+            "kinsoku",
+            "wordWrap",
+            "overflowPunct",
+            "topLinePunct",
+            "autoSpaceDE",
+            "autoSpaceDN",
+            "bidi",
+            "adjustRightInd",
+            "snapToGrid",
+            "spacing",
+            "ind",
+            "contextualSpacing",
+            "mirrorIndents",
+            "suppressOverlap",
+            "jc",
+            "textDirection",
+            "textAlignment",
+            "textboxTightWrap",
+            "outlineLvl",
+            "divId",
+            "cnfStyle",
+            "rPr",
+            "sectPr",
+            "pPrChange",
+        ]
+    )
+}
 
 # Strict ECMA-376 CT_RPr child element ordering so Word never flags out-of-order run properties
 _RPR_TAG_ORDER: Dict[str, int] = {
@@ -532,14 +579,56 @@ def accept_revisions_and_strip_comments(root: ET.Element) -> Tuple[int, int]:
     return rev_count, cmt_count
 
 
+def _sort_ppr_children(ppr: ET.Element) -> None:
+    """Sort `<w:pPr>` children strictly according to ECMA-376 CT_PPr schema sequence."""
+    children = list(ppr)
+    if len(children) <= 1:
+        return
+    ordered = sorted(
+        enumerate(children),
+        key=lambda pair: (_PPR_TAG_ORDER.get(_local_tag(pair[1]), 900), pair[0]),
+    )
+    if [c for _, c in ordered] != children:
+        for ch in children:
+            ppr.remove(ch)
+        for _, ch in ordered:
+            ppr.append(ch)
+
+
+def _upsert_ppr_child(ppr: ET.Element, local_name: str) -> ET.Element:
+    existing = ppr.find(f"{W}{local_name}")
+    if existing is not None:
+        return existing
+    el = ET.Element(f"{W}{local_name}")
+    target_rank = _PPR_TAG_ORDER.get(local_name, 900)
+    inserted = False
+    for idx, ch in enumerate(list(ppr)):
+        if _PPR_TAG_ORDER.get(_local_tag(ch), 900) > target_rank:
+            ppr.insert(idx, el)
+            inserted = True
+            break
+    if not inserted:
+        ppr.append(el)
+    return el
+
+
 def sanitize_fellowship_ooxml(root: ET.Element, valid_rel_ids: Optional[Set[str]] = None) -> None:
-    """Guarantee 100% valid Word OOXML: clean bookmarks, broken rels, w14:paraId, and assign globally unique IDs."""
-    # 1. Strip w14:paraId / w14:textId (avoids duplicate or >=0x80000000 paraIds across merged tables)
-    para_id_attr = f"{W14}paraId"
-    text_id_attr = f"{W14}textId"
+    """Guarantee 100% valid Word OOXML: clean bookmarks, broken rels, w14/w15/w16 attrs, mc:Ignorable, and CT_PPr/CT_RPr order."""
+    # 1. Strip Word 2010/2012/2016 extension attributes (w14:paraId, w14:textId, w16cid:*, etc.)
+    ext_ns_prefixes = (
+        "{http://schemas.microsoft.com/office/word/2010/",
+        "{http://schemas.microsoft.com/office/word/2012/",
+        "{http://schemas.microsoft.com/office/word/2015/",
+        "{http://schemas.microsoft.com/office/word/2016/",
+        "{http://schemas.microsoft.com/office/word/2018/",
+        "{http://schemas.microsoft.com/office/word/2020/",
+        "{http://schemas.microsoft.com/office/word/2023/",
+        "{http://schemas.microsoft.com/office/drawing/2010/",
+    )
     for el in root.iter():
-        el.attrib.pop(para_id_attr, None)
-        el.attrib.pop(text_id_attr, None)
+        for attr_k in list(el.attrib.keys()):
+            if attr_k.startswith(ext_ns_prefixes):
+                el.attrib.pop(attr_k, None)
 
     # 2. Unwrap <w:hyperlink> whose r:id is missing in target document.xml.rels
     if valid_rel_ids is not None:
@@ -595,6 +684,41 @@ def sanitize_fellowship_ooxml(root: ET.Element, valid_rel_ids: Optional[Set[str]
     for doc_pr in root.findall(f".//{WP}docPr"):
         doc_pr.attrib["id"] = str(next_docpr_id)
         next_docpr_id += 1
+
+    # 5. Enforce strict ECMA-376 CT_PPr and CT_RPr child element ordering
+    for ppr in root.findall(f".//{W}pPr"):
+        _sort_ppr_children(ppr)
+    for rpr in root.findall(f".//{W}rPr"):
+        r_children = list(rpr)
+        if len(r_children) > 1:
+            r_ord = sorted(
+                enumerate(r_children),
+                key=lambda pair: (_RPR_TAG_ORDER.get(_local_tag(pair[1]), 999), pair[0]),
+            )
+            if [c for _, c in r_ord] != r_children:
+                for ch in r_children:
+                    rpr.remove(ch)
+                for _, ch in r_ord:
+                    rpr.append(ch)
+
+    # 6. CRITICAL: Clean `mc:Ignorable` so NO undeclared namespace prefix remains when ElementTree serializes!
+    #    (Word throws '发现无法读取的内容' if `mc:Ignorable` lists any prefix without a matching `xmlns:<prefix>`!)
+    mc_ig_attr = f"{MC}Ignorable"
+    if mc_ig_attr in root.attrib:
+        used_uris: Set[str] = set()
+        for el in root.iter():
+            if el.tag.startswith("{"):
+                used_uris.add(el.tag[1 : el.tag.index("}")])
+            for ak in el.attrib:
+                if ak != mc_ig_attr and ak.startswith("{"):
+                    used_uris.add(ak[1 : ak.index("}")])
+        uri_to_pfx = {uri: pfx for pfx, uri in COMMON_NAMESPACES.items()}
+        declared_pfxs = {uri_to_pfx[u] for u in used_uris if u in uri_to_pfx}
+        kept_ig = [p for p in root.attrib[mc_ig_attr].split() if p in declared_pfxs]
+        if kept_ig:
+            root.attrib[mc_ig_attr] = " ".join(kept_ig)
+        else:
+            root.attrib.pop(mc_ig_attr, None)
 
 
 def disable_track_revisions_in_settings_xml(settings_bytes: bytes) -> bytes:
@@ -968,7 +1092,7 @@ def clean_body_header_and_extract_title(
 
 
 def set_clean_top_title_paragraph(p: ET.Element, title_text: str):
-    """Format the single top title paragraph above the table cleanly (Blue #0000FF, Bold, 14pt)."""
+    """Format the single top title paragraph above the table cleanly (Blue #0000FF, Bold, 14pt, Outline Level 2 '二层级')."""
     ppr = p.find(f"{W}pPr")
     if ppr is None:
         ppr = ET.Element(f"{W}pPr")
@@ -976,13 +1100,18 @@ def set_clean_top_title_paragraph(p: ET.Element, title_text: str):
     for ch in list(p):
         p.remove(ch)
 
-    sp = ppr.find(f"{W}spacing")
-    if sp is None:
-        sp = ET.SubElement(ppr, f"{W}spacing")
+    sp = _upsert_ppr_child(ppr, "spacing")
+    for rm_attr in ("beforeLines", "afterLines", "beforeAutospacing", "afterAutospacing"):
+        sp.attrib.pop(f"{W}{rm_attr}", None)
     sp.attrib[f"{W}before"] = "0"
     sp.attrib[f"{W}after"] = "60"
     sp.attrib[f"{W}line"] = "400"
     sp.attrib[f"{W}lineRule"] = "exact"
+
+    # Set Outline Level 2 (w:val="1" in 0-indexed OOXML -> Word 导航窗格显示为 2 级标题)
+    ol = _upsert_ppr_child(ppr, "outlineLvl")
+    ol.attrib[f"{W}val"] = "1"
+    _sort_ppr_children(ppr)
 
     p.append(ppr)
     r = ET.SubElement(p, f"{W}r")
@@ -1978,6 +2107,102 @@ def _detect_leading_styled_prefix(
     return None
 
 
+def _extract_pre_quote_introducer_style(
+    en_txt: str,
+    en_colors: List[str],
+    en_bolds: List[bool],
+    s0: int,
+    s1: int,
+) -> Optional[Tuple[str, bool, int]]:
+    """
+    Detect a 2-state pre-quote gap where plain narrative is followed immediately by a styled
+    quote-introducer ending right at the opening quote (e.g. `... In the Age of Grace, <BL>the Lord Jesus said:</BL> `).
+    Returns `(intro_col, intro_bold, en_intro_word_count)` if matched, else None.
+    """
+    non_ws = [k for k in range(s0, s1) if not en_txt[k].isspace()]
+    if len(non_ws) < 2:
+        return None
+
+    # Walk transitions across non-whitespace chars in [s0, s1)
+    runs: List[Tuple[str, bool, int, int]] = []
+    for k in non_ws:
+        ck = "blue" if en_colors[k] == "blue" else "none"
+        bd = bool(en_bolds[k])
+        if not runs or (runs[-1][0], runs[-1][1]) != (ck, bd):
+            runs.append((ck, bd, k, k + 1))
+        else:
+            runs[-1] = (ck, bd, runs[-1][2], k + 1)
+
+    if len(runs) == 2 and runs[0][0] == "none" and not runs[0][1]:
+        intro_col, intro_bd, i_s, i_e = runs[1]
+        en_intro_str = en_txt[i_s:i_e].strip()
+        w_cnt = max(1, len(en_intro_str.split()))
+        return intro_col, intro_bd, w_cnt
+    return None
+
+
+def _apply_fl_pre_quote_introducer(
+    fl_txt: str,
+    s0: int,
+    s1: int,
+    intro_col: str,
+    intro_bd: bool,
+    en_intro_words: int,
+    out_colors: List[str],
+    out_bolds: List[bool],
+    preserve_fl_red: List[bool],
+) -> None:
+    """
+    In Col 3 gap `[s0, s1)` right before an opening quote, keep leading narrative plain and apply
+    `(intro_col, intro_bd)` ONLY to the trailing quote-introducer clause (e.g. `प्रभु यीशु ने कहा था : `).
+    """
+    # 1. Initialize entire gap to plain
+    for k in range(s0, s1):
+        out_colors[k] = "red" if preserve_fl_red[k] else "none"
+        out_bolds[k] = False
+
+    gap_sub = fl_txt[s0:s1]
+    if not gap_sub.strip():
+        return
+
+    # Strip trailing colon / dash / spaces at the very end when searching for preceding clause boundary
+    trimmed_end = len(gap_sub.rstrip())
+    body_end = trimmed_end
+    while body_end > 0 and gap_sub[body_end - 1] in ":：—–-,， ":
+        body_end -= 1
+
+    # Prefer last sentence/clause boundary before the introducer (e.g. `,` in `अनुग्रह के युग में, प्रभु यीशु ने कहा था :`)
+    boundary_chars = "।.?!;।？！；。，,\n"
+    last_brk = -1
+    for idx in range(body_end - 1, -1, -1):
+        if gap_sub[idx] in boundary_chars:
+            last_brk = idx
+            break
+
+    if last_brk != -1:
+        cand_rel = last_brk + 1
+        while cand_rel < len(gap_sub) and gap_sub[cand_rel].isspace():
+            cand_rel += 1
+        # Sanity check: ensure trailing clause isn't abnormally tiny or empty
+        if cand_rel < trimmed_end:
+            intro_start = s0 + cand_rel
+        else:
+            intro_start = s0
+    else:
+        # Space-delimited or proportional fallback at tail of gap
+        words = list(re.finditer(r"\S+", gap_sub[:trimmed_end]))
+        if len(words) > en_intro_words + 1:
+            take_n = min(len(words), max(2, round(en_intro_words * 1.25)))
+            intro_start = s0 + words[-take_n].start()
+        else:
+            intro_start = s0 + (len(gap_sub) - len(gap_sub.lstrip()))
+
+    b_end = s0 + trimmed_end
+    for k in range(intro_start, s1):
+        out_colors[k] = intro_col
+        out_bolds[k] = bool(intro_bd and not fl_txt[k].isspace() and k < b_end)
+
+
 def _try_quote_pair_blue_bold_alignment(
     en_txt: str,
     en_colors: List[str],
@@ -1990,8 +2215,9 @@ def _try_quote_pair_blue_bold_alignment(
     preserve_fl_red: List[bool],
 ) -> bool:
     """When Col 2's Blue/Bold spans correspond cleanly to top-level quotation spans and `len(en_quotes) == len(fl_quotes)`,
-    deterministically map every quote's outer marks, inner speech, inter-quote narrative bridge, and post-quote citation
-    onto Col 3 — fixing both unstyled Col 3 and erroneously all-bold Col 3 (e.g. Greek 'Ο Ησαΐας απάντησε:')!
+    deterministically map every quote's outer marks, inner speech, inter-quote narrative bridge, pre-quote introducer
+    (e.g. `In the Age of Grace, <BL>the Lord Jesus said:</BL>`), and post-quote citation onto Col 3 — guaranteeing 100%
+    complete bold/blue inside quotes and zero bleed onto SOV post-quote clauses (e.g. Hindi `का क्या अर्थ है?`)!
     """
     en_quotes = find_top_level_quotes(en_txt, start=en_start)
     fl_quotes = find_top_level_quotes(fl_txt, start=fl_start)
@@ -2022,19 +2248,33 @@ def _try_quote_pair_blue_bold_alignment(
             return next(iter(seen))
         return None
 
-    # Verify every non-quote gap in en_txt[en_start:] has a single uniform (blue/none, bold) style
-    gap_styles: List[Tuple[str, bool]] = []
+    # Inspect each non-quote gap: allow either uniform `(col, bold)` OR 2-state `plain + pre-quote introducer`!
+    gap_specs: List[Tuple[str, Tuple]] = []
     prev_e = en_start
     for q_open, q_in_s, q_in_e, q_close in en_quotes:
+        # Advance prev_e past any post-quote citation attached to the previous quote
+        for cs, ce in en_cits:
+            if 0 <= cs - prev_e <= 4:
+                prev_e = ce + (1 if ce < len(en_txt) and en_txt[ce] in ".。" else 0)
+                break
         g_style = _region_bb_uniform(prev_e, q_open, skip_cits=True)
-        if g_style is None:
-            return False
-        gap_styles.append(g_style)
+        if g_style is not None:
+            gap_specs.append(("uniform", g_style))
+        else:
+            intro_spec = _extract_pre_quote_introducer_style(en_txt, en_colors, en_bolds, prev_e, q_open)
+            if intro_spec is None:
+                return False
+            gap_specs.append(("intro", intro_spec))
         prev_e = q_close
+
+    for cs, ce in en_cits:
+        if 0 <= cs - prev_e <= 4:
+            prev_e = ce + (1 if ce < len(en_txt) and en_txt[ce] in ".。" else 0)
+            break
     tail_style = _region_bb_uniform(prev_e, len(en_txt), skip_cits=True)
     if tail_style is None:
         return False
-    gap_styles.append(tail_style)
+    gap_specs.append(("uniform", tail_style))
 
     # Verify inside each quote in en_txt has a uniform inner (blue/none, bold) style
     quote_inner_styles: List[Tuple[str, bool, str]] = []
@@ -2064,8 +2304,15 @@ def _try_quote_pair_blue_bold_alignment(
 
     fl_prev = fl_start
     for qi, (fq_open, fq_in_s, fq_in_e, fq_close) in enumerate(fl_quotes):
-        g_col, g_bd = gap_styles[qi]
-        _set_fl_range(fl_prev, fq_open, g_col, g_bd)
+        g_kind, g_payload = gap_specs[qi]
+        if g_kind == "uniform":
+            g_col, g_bd = g_payload
+            _set_fl_range(fl_prev, fq_open, g_col, g_bd)
+        else:
+            i_col, i_bd, i_words = g_payload
+            _apply_fl_pre_quote_introducer(
+                fl_txt, fl_prev, fq_open, i_col, i_bd, i_words, out_colors, out_bolds, preserve_fl_red
+            )
 
         in_col, in_bd, outer_col = quote_inner_styles[qi]
         _set_fl_range(fq_open, fq_in_s, outer_col, False)
@@ -2084,7 +2331,7 @@ def _try_quote_pair_blue_bold_alignment(
             else:
                 cit_col = outer_col
             _set_fl_range(fq_close, ce_f, cit_col, False)
-            if ce_f < len(fl_txt) and fl_txt[ce_f] in ".。։":
+            if ce_f < len(fl_txt) and fl_txt[ce_f] in ".。։।":
                 _set_fl_range(ce_f, ce_f + 1, cit_col, False)
                 fl_prev = ce_f + 1
             else:
@@ -2092,7 +2339,7 @@ def _try_quote_pair_blue_bold_alignment(
         else:
             fl_prev = fq_close
 
-    t_col, t_bd = gap_styles[-1]
+    _, (t_col, t_bd) = gap_specs[-1]
     _set_fl_range(fl_prev, len(fl_txt), t_col, t_bd)
     return True
 
@@ -2998,6 +3245,7 @@ def enforce_table_spacing_and_typography(
     col3_title_sz = int(typo.get("title_sz", 28))
     col3_body_sz = int(typo.get("body_sz", 24))
     col3_cit_sz = int(typo.get("citation_sz", 21))
+    col3_line_dxa = int(typo.get("line_dxa", 400))
 
     rows = tbl.findall(f"{W}tr")
     citation_total = 0
@@ -3008,26 +3256,25 @@ def enforce_table_spacing_and_typography(
         tcs = tr.findall(f"{W}tc")
         for c_idx, tc in enumerate(tcs):
             if c_idx == 0:
-                c_font, c_tsz, c_bsz, c_csz = "宋体", 28, 24, 21
+                c_font, c_tsz, c_bsz, c_csz, c_ldxa = "宋体", 28, 24, 21, 400
             elif c_idx == 1:
-                c_font, c_tsz, c_bsz, c_csz = "Georgia", 28, 24, 21
+                c_font, c_tsz, c_bsz, c_csz, c_ldxa = "Georgia", 28, 24, 21, 400
             else:
-                c_font, c_tsz, c_bsz, c_csz = col3_font, col3_title_sz, col3_body_sz, col3_cit_sz
+                c_font, c_tsz, c_bsz, c_csz, c_ldxa = col3_font, col3_title_sz, col3_body_sz, col3_cit_sz, col3_line_dxa
 
             for p_idx, p in enumerate(tc.findall(f"{W}p")):
                 ppr = p.find(f"{W}pPr")
                 if ppr is None:
                     ppr = ET.Element(f"{W}pPr")
                     p.insert(0, ppr)
-                sp = ppr.find(f"{W}spacing")
-                if sp is None:
-                    sp = ET.SubElement(ppr, f"{W}spacing")
+                sp = _upsert_ppr_child(ppr, "spacing")
                 for rm_attr in ("beforeLines", "afterLines", "beforeAutospacing", "afterAutospacing"):
                     sp.attrib.pop(f"{W}{rm_attr}", None)
                 sp.attrib[f"{W}before"] = "0"
                 sp.attrib[f"{W}after"] = "0"
-                sp.attrib[f"{W}line"] = "400"
+                sp.attrib[f"{W}line"] = str(c_ldxa)
                 sp.attrib[f"{W}lineRule"] = "exact"
+                _sort_ppr_children(ppr)
 
                 p_hints = citation_hints_map.get((r_idx, p_idx))
                 citation_total += apply_font_sizes_to_paragraph(
@@ -3044,17 +3291,41 @@ def enforce_table_spacing_and_typography(
     return citation_total
 
 
-def _estimate_visual_dxa_length(text: str) -> float:
-    """Estimate horizontal unwrapped line length (in dxa) to equalize vertical column heights."""
+def _estimate_visual_dxa_length(text: str, half_pt_sz: int = 24) -> float:
+    """
+    Estimate effective horizontal unwrapped line length (in dxa, including word-wrap raggedness)
+    for a single paragraph at `half_pt_sz` (default 24 = 12pt) to equalize vertical column heights
+    across ALL scripts (CJK, Latin/Cyrillic, Khmer, Lao, Thai, Myanmar, Devanagari, Arabic, etc.).
+    """
+    if not text:
+        return 0.0
+    sz_scale = max(0.6, float(half_pt_sz) / 24.0)
     total = 0.0
+    se_asian_chars = 0
+    latin_chars = 0
+    non_ws_chars = 0
+
+    prev_is_coeng = False
     for ch in text:
         if ch in "\r\n":
             continue
-        if unicodedata.category(ch) == "Mn":
-            continue
+        cat = unicodedata.category(ch)
         cp = ord(ch)
+        if cp == 0x17D2:  # Khmer coeng (makes next consonant subscript, 0 horizontal advance)
+            prev_is_coeng = True
+            continue
+        if prev_is_coeng:
+            prev_is_coeng = False
+            continue
+        if cat in ("Mn", "Me", "Cf"):
+            continue
         if ch == " ":
-            total += 68.0
+            total += 68.0 * sz_scale
+            continue
+        non_ws_chars += 1
+        if cat == "Mc":
+            # Spacing vowel signs (Khmer ា, ើ, ៅ, Devanagari ी, ा, etc.) DO occupy horizontal width!
+            total += 82.0 * sz_scale
         elif (
             0x4E00 <= cp <= 0x9FFF
             or 0x3400 <= cp <= 0x4DBF
@@ -3062,14 +3333,119 @@ def _estimate_visual_dxa_length(text: str) -> float:
             or 0xFF00 <= cp <= 0xFFEF
             or 0xAC00 <= cp <= 0xD7AF
         ):
-            total += 240.0
-        elif 0x1000 <= cp <= 0x109F or 0x0E00 <= cp <= 0x0FFF or 0x1780 <= cp <= 0x17FF or 0x0900 <= cp <= 0x097F:
-            total += 145.0
+            total += 240.0 * sz_scale
+        elif 0x1780 <= cp <= 0x17FF:  # Khmer (Leelawadee UI wide glyphs + cluster wrapping)
+            total += 168.0 * sz_scale
+            se_asian_chars += 1
+        elif 0x0E80 <= cp <= 0x0EFF:  # Lao (DokChampa wide rounded glyphs + phrase wrapping)
+            total += 162.0 * sz_scale
+            se_asian_chars += 1
+        elif 0x1000 <= cp <= 0x109F:  # Myanmar
+            total += 155.0 * sz_scale
+            se_asian_chars += 1
+        elif 0x0E00 <= cp <= 0x0E7F:  # Thai (Note: Angsana New is condensed per pt)
+            total += 112.0 * sz_scale
+            se_asian_chars += 1
+        elif 0x0900 <= cp <= 0x0DFF:  # Devanagari / Indic scripts
+            total += 145.0 * sz_scale
+            latin_chars += 1
         elif ch.isupper():
-            total += 152.0
+            total += 152.0 * sz_scale
+            latin_chars += 1
         else:
-            total += 120.0
+            total += 122.0 * sz_scale
+            latin_chars += 1
+
+    if non_ws_chars > 0:
+        # Word-wrap ragged right margin factor: CJK wraps at any char (~1.03x); space/cluster scripts
+        # leave unused space at the end of wrapped lines (~1.12x for Latin, ~1.22x for Khmer/Lao phrases).
+        if se_asian_chars > non_ws_chars * 0.35:
+            total *= 1.22
+        elif latin_chars > non_ws_chars * 0.35:
+            total *= 1.11
+        else:
+            total *= 1.03
     return total
+
+
+def _solve_equal_height_widths(
+    row_para_dxa: List[Tuple[List[float], List[float], List[float]]],
+    line_dxas: Tuple[int, int, int],
+    total_w: int,
+) -> Tuple[int, int, int]:
+    """
+    Find `(w1, w2, w3)` summing to `total_w` that minimizes total row-by-row vertical height
+    discrepancy across all 3 columns after content wrapping — adapting automatically to ANY
+    language (whether `20:35:45`, `18:27:55`, or `30:33:37`)!
+    """
+    CELL_PAD_DXA = 216
+    if not row_para_dxa:
+        w1 = int(round(total_w * 0.26))
+        w2 = int(round(total_w * 0.37))
+        return w1, w2, total_w - w1 - w2
+
+    def _loss(r1: float, r2: float) -> float:
+        r3 = 1.0 - r1 - r2
+        u1 = max(1200.0, total_w * r1 - CELL_PAD_DXA)
+        u2 = max(1400.0, total_w * r2 - CELL_PAD_DXA)
+        u3 = max(1500.0, total_w * r3 - CELL_PAD_DXA)
+        usables = (u1, u2, u3)
+        total_loss = 0.0
+        col_totals = [0.0, 0.0, 0.0]
+        for p_lists in row_para_dxa:
+            h_cols = [0.0, 0.0, 0.0]
+            for c_i in range(3):
+                u_c = usables[c_i]
+                ld = line_dxas[c_i]
+                lines_c = 0
+                for pdxa in p_lists[c_i]:
+                    if pdxa <= 1.0:
+                        lines_c += 1
+                    else:
+                        lines_c += max(1, int((pdxa + u_c - 1.0) // u_c))
+                h_cols[c_i] = lines_c * ld
+                col_totals[c_i] += h_cols[c_i]
+            gap = max(h_cols) - min(h_cols)
+            total_loss += gap * gap
+        # Also penalize overall cumulative column height imbalance across the whole table
+        tot_gap = max(col_totals) - min(col_totals)
+        return total_loss + 0.35 * (tot_gap * tot_gap) / max(1, len(row_para_dxa))
+
+    # Coarse grid search (step = 0.01) within readable column bounds:
+    # Col 1 Chinese: 18% .. 36% | Col 2 English: 21% .. 45% | Col 3 Foreign: 25% .. 58%
+    best_r1, best_r2 = 0.25, 0.36
+    best_score = float("inf")
+    for i1 in range(18, 37):
+        r1 = i1 / 100.0
+        for i2 in range(21, 46):
+            r2 = i2 / 100.0
+            r3 = 1.0 - r1 - r2
+            if r3 < 0.25 or r3 > 0.58:
+                continue
+            sc = _loss(r1, r2)
+            if sc < best_score:
+                best_score = sc
+                best_r1, best_r2 = r1, r2
+
+    # Fine local refinement (step = 0.0025)
+    for d1 in range(-4, 5):
+        r1 = best_r1 + d1 * 0.0025
+        if not (0.18 <= r1 <= 0.36):
+            continue
+        for d2 in range(-4, 5):
+            r2 = best_r2 + d2 * 0.0025
+            r3 = 1.0 - r1 - r2
+            if not (0.21 <= r2 <= 0.45 and 0.25 <= r3 <= 0.58):
+                continue
+            sc = _loss(r1, r2)
+            if sc < best_score:
+                best_score = sc
+                best_r1, best_r2 = r1, r2
+
+    w1 = int(round(total_w * best_r1))
+    w2 = int(round(total_w * best_r2))
+    w3 = total_w - w1 - w2
+    return w1, w2, w3
 
 
 def _ensure_standard_table_borders(tblPr: ET.Element) -> None:
@@ -3090,9 +3466,13 @@ def _ensure_standard_table_borders(tblPr: ET.Element) -> None:
         tblPr.append(tblBorders)
 
 
-def balance_three_column_widths(root: ET.Element, tbl: ET.Element) -> Tuple[int, int, int]:
+def balance_three_column_widths(
+    root: ET.Element,
+    tbl: ET.Element,
+    lang_typo: Optional[Dict] = None,
+) -> Tuple[int, int, int]:
     """Strip any staggered gridSpan/gridBefore/vMerge props, rebuild a strict 3-column <w:tblGrid>,
-    and set uniform <w:tcW> across all 3 cells in every row.
+    and dynamically solve for `(w1, w2, w3)` so the rendered heights of all 3 columns match closely.
     """
     strip_staggered_grid_props_from_table(tbl)
 
@@ -3126,28 +3506,28 @@ def balance_three_column_widths(root: ET.Element, tbl: ET.Element) -> Tuple[int,
     if total_w < 6000:
         total_w = 14570
 
-    vis_sums = [0.0, 0.0, 0.0]
+    col3_bsz = int((lang_typo or {}).get("body_sz", 24))
+    col3_ldxa = int((lang_typo or {}).get("line_dxa", 400))
+    col_szs = (24, 24, col3_bsz)
+    line_dxas = (400, 400, col3_ldxa)
+
+    row_para_dxa: List[Tuple[List[float], List[float], List[float]]] = []
     for tr in tbl.findall(f"{W}tr"):
         tcs = tr.findall(f"{W}tc")
         if len(tcs) < 3:
             continue
+        p_lists: List[List[float]] = [[], [], []]
+        has_any = False
         for c_i in range(3):
-            vis_sums[c_i] += _estimate_visual_dxa_length(_get_tc_text(tcs[c_i]))
+            for p in tcs[c_i].findall(f"{W}p"):
+                ptxt = _get_p_text(p)
+                if ptxt.strip():
+                    has_any = True
+                p_lists[c_i].append(_estimate_visual_dxa_length(ptxt, half_pt_sz=col_szs[c_i]))
+        if has_any:
+            row_para_dxa.append((p_lists[0], p_lists[1], p_lists[2]))
 
-    sum_all = sum(vis_sums)
-    if sum_all <= 1.0:
-        ratios = [1.0 / 3.0, 1.0 / 3.0, 1.0 / 3.0]
-    else:
-        raw_ratios = [v / sum_all for v in vis_sums]
-        clamped = [max(0.21, min(0.48, r)) for r in raw_ratios]
-        c_sum = sum(clamped)
-        ratios = [r / c_sum for r in clamped]
-
-    CELL_PAD_DXA = 216
-    usable_total = max(3000, total_w - 3 * CELL_PAD_DXA)
-    w1 = int(round(usable_total * ratios[0])) + CELL_PAD_DXA
-    w2 = int(round(usable_total * ratios[1])) + CELL_PAD_DXA
-    w3 = total_w - w1 - w2
+    w1, w2, w3 = _solve_equal_height_widths(row_para_dxa, line_dxas=line_dxas, total_w=total_w)
 
     tblW = tblPr.find(f"{W}tblW")
     if tblW is None:
@@ -3221,7 +3601,10 @@ def write_cleaned_docx(
                 cleaned_rels_bytes, valid_rel_ids = strip_comment_and_people_rels_bytes(raw_rels)
 
             sanitize_fellowship_ooxml(doc_root, valid_rel_ids=valid_rel_ids)
-            doc_bytes = ET.tostring(doc_root, encoding="utf-8", xml_declaration=True)
+            for _pfx, _uri in COMMON_NAMESPACES.items():
+                ET.register_namespace(_pfx, _uri)
+            doc_xml_body = ET.tostring(doc_root, encoding="unicode")
+            doc_bytes = ('<?xml version="1.0" encoding="UTF-8" standalone="yes"?>\r\n' + doc_xml_body).encode("utf-8")
 
             for item in zin.infolist():
                 fn = item.filename
@@ -3490,7 +3873,7 @@ def run_fellowship_pipeline(
         )
 
         # 11. Strip staggered gridSpan props & balance 3-column widths
-        w_tuple = balance_three_column_widths(doc_root, tbl)
+        w_tuple = balance_three_column_widths(doc_root, tbl, lang_typo=lang_typo)
 
         merge_note = f" | 文档内合并 {merged_extra_tbls + 1} 个part表" if was_internally_merged else ""
         font_note = f" | 外文字体 {lang_typo['font']}" if lang_typo.get("font") else ""
@@ -3556,7 +3939,7 @@ def run_fellowship_pipeline(
         for extra in processed_docs[1:]:
             _append_part_rows_into_table(merged_tbl, extra["tbl"], p1_headers, deep_copy=True)
 
-        merged_widths = balance_three_column_widths(merged_root, merged_tbl)
+        merged_widths = balance_three_column_widths(merged_root, merged_tbl, lang_typo=lang_typo)
         total_merged_rows = len(merged_tbl.findall(f"{W}tr"))
 
         merged_name = build_fellowship_output_name(
