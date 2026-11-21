@@ -1,4 +1,3 @@
-import base64
 import hashlib
 import json
 import os
@@ -9,6 +8,8 @@ import ssl
 import subprocess
 import sys
 import tempfile
+import threading
+import time
 from typing import Callable, Optional, Tuple
 import urllib.error
 import urllib.parse
@@ -20,12 +21,13 @@ try:
 except ImportError:
     create_secure_update_stagedir = None
 
-APP_VERSION = "1.9.0"
+APP_VERSION = "1.9.1"
 GITHUB_REPO = "zcnz2026/TranslationTools"
 
 ZIP_ASSET_NAME = "ScatteredRevisionTool-Windows-x64.zip"
 SHA256_ASSET_NAME = "SHA256SUMS.txt"
 EXE_ENTRY_NAME = "零散改点整理工具.exe"
+HELPER_EXE_SUFFIX = "_update_helper.exe"
 
 MAX_RELEASE_JSON_BYTES = 2 * 1024 * 1024     # 2 MB upper bound for GitHub release metadata
 MAX_UPDATE_ZIP_BYTES = 250 * 1024 * 1024     # 250 MB upper bound for portable ZIP download
@@ -45,6 +47,14 @@ _SEMVER_RE = re.compile(
     r"^\s*[vV]?(\d+)(?:\.(\d+))?(?:\.(\d+))?(?:\.(\d+))?(?:[-+]([0-9A-Za-z.-]+))?\s*$"
 )
 _SHA256_LINE_RE = re.compile(r"^([0-9a-fA-F]{64})\s+\*?(.+?)\s*$")
+
+_ARCHIVE_TEMP_PART_PATTERNS = (
+    re.compile(r"(?i)^temp\d+_.*\.zip$"),
+    re.compile(r"(?i)^rar\$ex"),
+    re.compile(r"(?i)^7z[oe][0-9a-f]+"),
+    re.compile(r"(?i)^bnz\.[0-9a-f]+"),
+    re.compile(r"(?i)^wz[0-9a-f]{4,}$"),
+)
 
 
 def validate_github_https_url(url: str) -> str:
@@ -159,16 +169,6 @@ def _user_agent_header(version_str: str = APP_VERSION) -> str:
 def check_for_updates(current_version: str = APP_VERSION, timeout: float = 8.0) -> dict:
     """
     Query GitHub Releases API for the latest published release of `GITHUB_REPO`.
-    Returns:
-      {
-        "has_update": bool,
-        "current_version": str,
-        "latest_version": str,
-        "release_notes": str,
-        "html_url": str,
-        "zip_url": str,
-        "sha256_url": str,
-      }
     """
     cur_clean = normalize_version_str(current_version or APP_VERSION)
     api_url = f"https://api.github.com/repos/{GITHUB_REPO}/releases/latest"
@@ -279,7 +279,6 @@ def _validate_and_extract_exe_from_zip(zip_path: Path, stage_dir: Path) -> Path:
                     raise ValueError("主程序解压体积超出安全上限。")
                 dst_fp.write(chunk)
 
-    # Verify Windows PE MZ header
     with open(staged_exe, "rb") as f_chk:
         magic = f_chk.read(2)
     if magic != b"MZ":
@@ -288,96 +287,123 @@ def _validate_and_extract_exe_from_zip(zip_path: Path, stage_dir: Path) -> Path:
     return staged_exe
 
 
-def _ps_quote(val: str) -> str:
-    """Safely quote a literal string for PowerShell single-quoted literal syntax."""
-    return "'" + (val or "").replace("'", "''") + "'"
+def _check_not_running_inside_archive_temp(target_exe: Path) -> None:
+    """Detect when a user double-clicked the EXE directly inside WinRAR/7-Zip/Explorer ZIP preview."""
+    try:
+        resolved = target_exe.resolve()
+        temp_root = Path(tempfile.gettempdir()).resolve()
+        rel_parts = resolved.relative_to(temp_root).parts
+    except Exception:
+        return
+    for part in rel_parts[:-1]:
+        if any(rx.search(part) for rx in _ARCHIVE_TEMP_PART_PATTERNS):
+            raise ValueError(
+                "检测到您当前是直接在压缩包临时目录中打开的程序！\n"
+                "请先将压缩包完整解压到桌面或普通文件夹后再运行软件，否则更新无法写回原压缩包。"
+            )
 
 
-def _write_and_launch_windows_updater_script(
-    stage_dir: Path,
-    staged_exe: Path,
-    target_exe: Path,
-    wait_pid: int,
-) -> Path:
+def _build_clean_relaunch_env() -> dict:
     """
-    Write a UTF-8-BOM PowerShell script in `stage_dir` that:
-      1. Waits for `wait_pid` to exit;
-      2. Copies ONLY `staged_exe` over `target_exe` (leaving app_settings.json & languages.json untouched);
-      3. Relaunches `target_exe`;
-      4. Deletes temporary staging files.
+    Strip PyInstaller single-file runtime environment variables (`_PYI_*`, `_MEI*`, `PYINSTALLER_*`)
+    and Tcl/Tk overrides so a newly launched executable unpacks its own archive cleanly.
     """
-    script_path = stage_dir / "apply_update.ps1"
-    target_dir = target_exe.parent
+    clean_env = {}
+    blocked_prefixes = ("_PYI_", "_MEI", "PYINSTALLER_", "TCL_LIBRARY", "TK_LIBRARY")
+    for k, v in os.environ.items():
+        if k.upper().startswith(blocked_prefixes):
+            continue
+        clean_env[k] = v
+    clean_env["PYINSTALLER_RESET_ENVIRONMENT"] = "1"
+    return clean_env
 
-    ps_lines = [
-        "$ErrorActionPreference = 'Stop'",
-        f"$WaitPid = {int(wait_pid)}",
-        f"$StagedExe = {_ps_quote(str(staged_exe))}",
-        f"$TargetExe = {_ps_quote(str(target_exe))}",
-        f"$TargetDir = {_ps_quote(str(target_dir))}",
-        f"$StageDir = {_ps_quote(str(stage_dir))}",
-        "",
-        "try {",
-        "    Wait-Process -Id $WaitPid -Timeout 45 -ErrorAction SilentlyContinue",
-        "} catch {}",
-        "",
-        "$Copied = $false",
-        "for ($i = 0; $i -lt 30; $i++) {",
-        "    try {",
-        "        Copy-Item -LiteralPath $StagedExe -Destination $TargetExe -Force",
-        "        $Copied = $true",
-        "        break",
-        "    } catch {",
-        "        Start-Sleep -Milliseconds 400",
-        "    }",
-        "}",
-        "",
-        "if ($Copied) {",
-        "    Start-Process -FilePath $TargetExe -WorkingDirectory $TargetDir",
-        "}",
-        "",
-        "Start-Sleep -Milliseconds 600",
-        "try {",
-        "    Remove-Item -LiteralPath $StagedExe -Force -ErrorAction SilentlyContinue",
-        "} catch {}",
-    ]
-    # Pure PowerShell -EncodedCommand cleanup (eliminates shell string interpolation & %VAR% / & hazards)
-    clean_ps_code = (
-        f"Start-Sleep -Seconds 2; "
-        f"Remove-Item -LiteralPath {_ps_quote(str(stage_dir))} -Recurse -Force -ErrorAction SilentlyContinue"
-    )
-    clean_b64 = base64.b64encode(clean_ps_code.encode("utf-16-le")).decode("ascii")
-    ps_lines.append(
-        f"Start-Process -FilePath 'powershell.exe' "
-        f"-ArgumentList '-NoProfile', '-NonInteractive', '-WindowStyle', 'Hidden', '-EncodedCommand', '{clean_b64}' "
-        f"-WindowStyle Hidden"
-    )
-    script_path.write_text("\r\n".join(ps_lines) + "\r\n", encoding="utf-8-sig")
 
-    creation_flags = 0
-    if sys.platform == "win32":
-        creation_flags = getattr(subprocess, "CREATE_NO_WINDOW", 0x08000000) | getattr(
-            subprocess, "DETACHED_PROCESS", 0x00000008
+def cleanup_stale_update_backups(exe_path: Optional[Path] = None, wait_first: float = 0.0) -> None:
+    """
+    Remove leftover `*_update_helper.exe` or `.old` update files in the application folder
+    using a non-blocking background thread.
+    """
+    if exe_path is None:
+        if not bool(getattr(sys, "frozen", False)):
+            return
+        exe_path = Path(sys.executable)
+
+    try:
+        resolved = exe_path.resolve()
+        parent = resolved.parent
+        stem = resolved.stem
+    except Exception:
+        return
+    if not parent.is_dir():
+        return
+
+    def _worker():
+        if wait_first > 0:
+            time.sleep(wait_first)
+        patterns = (
+            f"{stem}{HELPER_EXE_SUFFIX}",
+            f"*{HELPER_EXE_SUFFIX}",
+            f"{stem}.old*.exe",
         )
+        for _ in range(15):
+            remaining = False
+            for pat in patterns:
+                for cand in parent.glob(pat):
+                    if cand == resolved:
+                        continue
+                    try:
+                        cand.unlink()
+                    except OSError:
+                        remaining = True
+            if not remaining:
+                break
+            time.sleep(0.4)
 
-    safe_cwd = str(stage_dir.parent if stage_dir.parent.is_dir() else Path(tempfile.gettempdir()))
+    threading.Thread(target=_worker, daemon=True).start()
+
+
+def run_finish_update_mode(target_exe_arg: str) -> int:
+    """
+    Executed by the newly downloaded `<stem>_update_helper.exe` in pure Python (no external shell):
+      1. Waits until the previous `<stem>.exe` finishes exiting and releases its file lock;
+      2. Copies itself (`sys.executable`) cleanly over `<stem>.exe`;
+      3. Launches the updated `<stem>.exe` with clean environment variables and exits.
+    """
+    if not bool(getattr(sys, "frozen", False)):
+        return 1
+    try:
+        current_exe = Path(sys.executable).resolve()
+        target_exe = Path(target_exe_arg).resolve()
+    except Exception:
+        return 1
+
+    if (
+        target_exe == current_exe
+        or target_exe.parent != current_exe.parent
+        or target_exe.suffix.lower() != ".exe"
+    ):
+        return 1
+
+    copied = False
+    for _ in range(80):
+        try:
+            shutil.copy2(current_exe, target_exe)
+            copied = True
+            break
+        except OSError:
+            time.sleep(0.3)
+
+    if not copied:
+        return 2
+
+    clean_env = _build_clean_relaunch_env()
     subprocess.Popen(
-        [
-            "powershell.exe",
-            "-NoProfile",
-            "-NonInteractive",
-            "-ExecutionPolicy",
-            "Bypass",
-            "-WindowStyle",
-            "Hidden",
-            "-File",
-            str(script_path),
-        ],
-        cwd=safe_cwd,
+        [str(target_exe), "--cleanup-helper"],
+        cwd=str(target_exe.parent),
+        env=clean_env,
         close_fds=True,
-        creationflags=creation_flags,
     )
-    return script_path
+    return 0
 
 
 def download_and_apply_update(
@@ -387,11 +413,15 @@ def download_and_apply_update(
 ) -> dict:
     """
     Download release ZIP, strictly enforce SHA-256 verification against `SHA256SUMS.txt`
-    (both archive and extracted executable, fail-closed), safely extract `零散改点整理工具.exe`,
-    and stage detached auto-restart replacement when frozen.
+    (both archive and extracted executable, fail-closed), stage `<stem>_update_helper.exe`
+    in the application folder, and launch pure-Python `--finish-update` auto-restart.
     """
     if not isinstance(update_info, dict):
         raise ValueError("更新信息格式无效。")
+
+    is_frozen = bool(getattr(sys, "frozen", False))
+    if is_frozen:
+        _check_not_running_inside_archive_temp(Path(sys.executable))
 
     zip_url = str(update_info.get("zip_url") or "").strip()
     sha256_url = str(update_info.get("sha256_url") or "").strip()
@@ -487,28 +517,44 @@ def download_and_apply_update(
         if actual_exe_sha != expected_exe_sha:
             raise ValueError("解压后的主程序 SHA-256 校验不匹配，已安全中止更新！")
 
-        # Remove downloaded ZIP now that EXE is verified & staged
         try:
             zip_path.unlink(missing_ok=True)
         except OSError:
             pass
 
-        is_frozen = bool(getattr(sys, "frozen", False))
         if is_frozen:
             target_exe = Path(sys.executable).resolve()
+            helper_exe = target_exe.parent / f"{target_exe.stem}{HELPER_EXE_SUFFIX}"
             if progress_fn:
-                progress_fn(97.0, "正在准备自动替换脚本并重启软件...")
-            _write_and_launch_windows_updater_script(
-                stage_dir=stage_dir,
-                staged_exe=staged_exe,
-                target_exe=target_exe,
-                wait_pid=os.getpid(),
+                progress_fn(96.0, "正在写入新版程序并校验完整性...")
+            try:
+                shutil.copy2(staged_exe, helper_exe)
+            except PermissionError as pe:
+                raise PermissionError(
+                    f"当前程序所在目录（{target_exe.parent}）需要管理员写入权限，无法直接写入新版本。\n"
+                    "请将软件文件夹移至桌面或普通磁盘目录后重试，或点击「打开 GitHub 发布页」手动下载覆盖。"
+                ) from pe
+
+            if compute_file_sha256(helper_exe) != expected_exe_sha:
+                helper_exe.unlink(missing_ok=True)
+                raise ValueError("写入本地目录的新版程序 SHA-256 校验异常，已安全中止。")
+
+            shutil.rmtree(stage_dir, ignore_errors=True)
+
+            if progress_fn:
+                progress_fn(99.0, "正在启动新版程序完成自动替换...")
+            clean_env = _build_clean_relaunch_env()
+            subprocess.Popen(
+                [str(helper_exe), "--finish-update", str(target_exe)],
+                cwd=str(target_exe.parent),
+                env=clean_env,
+                close_fds=True,
             )
             if progress_fn:
                 progress_fn(100.0, "更新就绪，正在自动重启至新版本...")
             return {
                 "ready_to_restart": True,
-                "staged_exe": str(staged_exe),
+                "staged_exe": str(helper_exe),
                 "html_url": html_url,
             }
 

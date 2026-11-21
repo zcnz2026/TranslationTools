@@ -68,16 +68,20 @@ def main() -> None:
 
     add_scripts_arg = f"{skill_scripts_dir}{os.pathsep}skill_scripts"
     add_resources_arg = f"{skill_resources_dir}{os.pathsep}resources"
+    version_file = tool_dir / "version_info.txt"
     pyi_cmd = [
         sys.executable,
         "-m",
         "PyInstaller",
         "--noconfirm",
         "--clean",
+        "--noupx",
         "--onefile",
         "--windowed",
         "--name",
         "ScatteredRevisionTool",
+        "--version-file",
+        str(version_file),
         "--distpath",
         str(dist_dir),
         "--workpath",
@@ -166,9 +170,13 @@ def main() -> None:
     (art_dir / "SHA256SUMS.txt").write_text(sums_txt, encoding="utf-8")
 
     notes_md = (
-        "## 多语种改点与分part稿自动整理工具 v1.9.0 (Windows x64 免安装便携版)\n\n"
+        "## 多语种改点与分part稿自动整理工具 v1.9.1 (Windows x64 免安装便携版)\n\n"
         "- 解压 `ScatteredRevisionTool-Windows-x64.zip` 后直接双击 `零散改点整理工具.exe` 即可运行（无需安装 Python 或任何第三方库；支持软件内一键检查并自动更新）。\n"
-        "- **v1.9.0 全新核心模块与排版质量全面升级**：\n"
+        "- **⚠️ 旧版升级提醒**：由于 `v1.8.0`～`v1.9.0` 客户端内置的旧版热更新启动参数存在兼容缺陷（点击更新后退出未能完成文件替换），**正在使用 `v1.9.0` 及更早版本的用户请手动下载本版覆盖一次**；升级至 `v1.9.1` 后，后续所有新版本均可正常一键自动热替换重启！\n"
+        "- **v1.9.1 修复内容（客户端自动热更新彻底根治 & 消除杀软误报）**：\n"
+        "  - 彻底移除旧版后台脚本与隐式命令行调用，重构为**纯 Python 原生自复制替换架构**（无任何外部命令行脚本、无隐藏文件属性，避免 Windows Defender / 360 / 火绒等安全软件拦截误杀）；\n"
+        "  - 自动清理 PyInstaller 单文件 `_PYI_*` / `_MEI*` 运行时环境变量并重置 `PYINSTALLER_RESET_ENVIRONMENT=1`，等待旧版完全退出释放句柄后安全替换并自动重启新版本，同时补充标准 Windows PE 版本元数据并增加压缩包内直接双击未解压运行的防呆提示。\n"
+        "- **v1.9.0 全新核心模块与排版质量全面升级（完整包含于本版）**：\n"
         "  1. **新增「改点入库与通读定稿」完整工作台（3A 改点返稿入库 + 3B 通读定稿入库）**：\n"
         "     - **3A 改点返稿入库**：支持发稿/回稿单文件或文件夹自动配对、全栏位原生拖拽、Step 1A 总库一致性核对（保留总库改动或跳过不一致段）、Step 1B 回稿漏改/错位/多删/青色衔接检查并自动打 Word 批注、Step 2 格式清洗与通读表同步、Step 3 原库零修改安全导出 `改前/`、`改后/`（词句级精准回写保留原有蓝红字与底纹，叠加中文底纹）与 `修订稿/`（支持单份汇总/分批汇总/逐篇输出）；\n"
         "     - **3B 通读定稿入库**：支持粘贴篇目+多个 Google Sheets 链接（严格按 `gid` 仅读指定 Sheet）或本地 `.xlsx/.csv`、导入 Google JSON 授权文件并浏览器登录授权（DPAPI 加密保存）、自定义 5 列列名、改点标点与首字母大写质检、严格精确匹配替换及多 Part 全篇合并核对；\n"

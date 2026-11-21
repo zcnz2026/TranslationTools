@@ -104,10 +104,12 @@ try:
 except ImportError:
     _updater_mod = None
 
-RAW_APP_VERSION = "1.9.0"
+RAW_APP_VERSION = "1.9.1"
 APP_VERSION = f"v{RAW_APP_VERSION}"
 check_for_updates = getattr(_updater_mod, "check_for_updates", None)
 download_and_apply_update = getattr(_updater_mod, "download_and_apply_update", None)
+cleanup_stale_update_backups = getattr(_updater_mod, "cleanup_stale_update_backups", None)
+run_finish_update_mode = getattr(_updater_mod, "run_finish_update_mode", None)
 GITHUB_RELEASES_URL = "https://github.com/zcnz2026/TranslationTools/releases"
 
 from security_utils import (
@@ -1789,9 +1791,9 @@ class SoftwareUpdateDialog(tk.Toplevel):
                     self.prog_var.set(100.0)
                     res = payload if isinstance(payload, dict) else {}
                     if res.get("ready_to_restart"):
-                        self.status_var.set("更新包 SHA-256 校验通过！正在保存配置并自动重启新版本...")
+                        self.status_var.set("更新包替换校验通过！正在保存配置并自动重启新版本...")
                         self.app._save_settings()
-                        self.after(350, self.app._on_close)
+                        self.after(200, self.app._exit_for_update_restart)
                         return
                     else:
                         staged = str(res.get("staged_exe") or "")
@@ -6479,6 +6481,10 @@ class ScatteredRevisionApp:
         except Exception:
             pass
 
+    def _exit_for_update_restart(self):
+        self._on_close()
+        sys.exit(0)
+
 
 def _run_frozen_self_test() -> int:
     import docx_xml_utils
@@ -6491,8 +6497,8 @@ def _run_frozen_self_test() -> int:
     from ai_client import format_friendly_api_error as _ai_friendly_err
     from ai_client import local_align_col3_spans
 
-    if RAW_APP_VERSION != "1.9.0":
-        raise RuntimeError(f"RAW_APP_VERSION expected '1.9.0', got {RAW_APP_VERSION!r}")
+    if RAW_APP_VERSION != "1.9.1":
+        raise RuntimeError(f"RAW_APP_VERSION expected '1.9.1', got {RAW_APP_VERSION!r}")
 
     is_frozen = bool(getattr(sys, "frozen", False))
     if is_frozen and hasattr(sys, "_MEIPASS"):
@@ -6615,13 +6621,21 @@ def _run_frozen_self_test() -> int:
             raise RuntimeError("dedup_checker.check_and_export_duplicates missing in self-test")
 
         upd_ver = str(getattr(_upd_test, "APP_VERSION", "")).lstrip("vV")
-        expected_vers = ("1.9.0",) if require_v18_siblings else ("1.7.0", "1.8.0", "1.8.1", "1.9.0")
+        expected_vers = ("1.9.1",) if require_v18_siblings else ("1.7.0", "1.8.0", "1.8.1", "1.9.0", "1.9.1")
         if upd_ver not in expected_vers:
             raise RuntimeError(f"updater.APP_VERSION mismatch: {getattr(_upd_test, 'APP_VERSION', None)!r}")
         if not callable(getattr(_upd_test, "check_for_updates", None)) or not callable(
             getattr(_upd_test, "download_and_apply_update", None)
         ):
             raise RuntimeError("updater functions missing in self-test")
+        clean_env_fn = getattr(_upd_test, "_build_clean_relaunch_env", None)
+        if not callable(clean_env_fn):
+            raise RuntimeError("updater._build_clean_relaunch_env missing in self-test")
+        sample_clean_env = clean_env_fn()
+        if sample_clean_env.get("PYINSTALLER_RESET_ENVIRONMENT") != "1" or any(
+            k.upper().startswith(("_PYI_", "_MEI")) for k in sample_clean_env
+        ):
+            raise RuntimeError(f"_build_clean_relaunch_env did not sanitize _PYI_/_MEI vars: {sample_clean_env!r}")
 
     if require_v18_siblings:
         import master_sync as _ms_test
@@ -6671,6 +6685,15 @@ def _run_frozen_self_test() -> int:
 def main():
     if "--self-test" in sys.argv:
         sys.exit(_run_frozen_self_test())
+    if len(sys.argv) >= 3 and sys.argv[1] == "--finish-update":
+        if callable(run_finish_update_mode):
+            sys.exit(run_finish_update_mode(sys.argv[2]))
+        sys.exit(1)
+    if callable(cleanup_stale_update_backups):
+        try:
+            cleanup_stale_update_backups(wait_first=1.5 if "--cleanup-helper" in sys.argv else 0.0)
+        except Exception:
+            pass
     _enable_high_dpi()
     root = tk.Tk()
     ScatteredRevisionApp(root)
