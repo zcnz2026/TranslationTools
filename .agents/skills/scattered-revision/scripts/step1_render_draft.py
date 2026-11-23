@@ -25,6 +25,7 @@ from docx_xml_utils import (
     get_clean_col2_base_rpr,
     get_first_run_rpr,
     insert_rpr_child_ordered,
+    insert_tcpr_child_ordered,
     load_config,
     load_docx_comments_map,
     load_docx_comments_xml,
@@ -164,7 +165,7 @@ def _populate_clean_library_cell(
             if tc_Pr is None:
                 tc_Pr = ET.Element(f"{W}tcPr")
                 target_tc.insert(0, tc_Pr)
-            tc_Pr.append(copy.deepcopy(src_shd))
+            insert_tcpr_child_ordered(tc_Pr, copy.deepcopy(src_shd))
     for ch in list(target_tc):
         if ch is not tc_Pr:
             target_tc.remove(ch)

@@ -380,3 +380,12 @@ def create_secure_update_stagedir(max_age_hours: float = 2.0) -> Path:
         return target.resolve()
 
     raise RuntimeError(f"无法创建安全的更新暂存目录：{updates_root}")
+
+
+def cleanup_stale_ephemeral_workdirs(max_age_seconds: float = 0.0) -> int:
+    """Prune ephemeral workdirs under `%LOCALAPPDATA%\\ScatteredRevisionTool\\work`."""
+    try:
+        app_root = _resolve_secure_work_root()
+        return _prune_stale_workdirs(app_root, max_age_seconds=max(0.0, float(max_age_seconds)))
+    except Exception:
+        return 0

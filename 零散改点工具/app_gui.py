@@ -104,7 +104,7 @@ try:
 except ImportError:
     _updater_mod = None
 
-RAW_APP_VERSION = "1.9.3"
+RAW_APP_VERSION = "1.9.4"
 APP_VERSION = f"v{RAW_APP_VERSION}"
 check_for_updates = getattr(_updater_mod, "check_for_updates", None)
 download_and_apply_update = getattr(_updater_mod, "download_and_apply_update", None)
@@ -113,6 +113,7 @@ run_finish_update_mode = getattr(_updater_mod, "run_finish_update_mode", None)
 GITHUB_RELEASES_URL = "https://github.com/zcnz2026/TranslationTools/releases"
 
 from security_utils import (
+    cleanup_stale_ephemeral_workdirs,
     dpapi_decrypt_str,
     dpapi_encrypt_str,
     load_api_key_from_env,
@@ -2043,6 +2044,10 @@ class ScatteredRevisionApp:
         )
 
         # Tab 5: Part Manuscript Formatting & Merging (分part稿整理/合并)
+        self._fel_batch_completed = False
+        self._fel_output_was_auto = False
+        self._dd_batch_completed = False
+        self._wc_batch_completed = False
         self.fel_output_dir_var = tk.StringVar(value="")
         self.fel_lang_var = tk.StringVar(value=AUTO_COMBO_LABEL)
         self.fel_tri_prefix_var = tk.StringVar(value="")
@@ -2050,7 +2055,7 @@ class ScatteredRevisionApp:
         self.fel_quote_label_var = tk.StringVar(value=QUOTE_MODES[0][0])
         self.fel_output_mode_var = tk.StringVar(value="single_only")
         self.fel_enable_ai_var = tk.BooleanVar(value=True)
-        self.fel_sync_red_var = tk.BooleanVar(value=False)
+        self.fel_sync_red_var = tk.BooleanVar(value=True)
         self.fel_summary_var = tk.StringVar(
             value="当前共 0 份文档  |  支持多篇 Part 1..N 排序合并，或单文档内多 Part 表格一键合并"
         )
@@ -2547,6 +2552,14 @@ class ScatteredRevisionApp:
             command=lambda: self._switch_tab("settings"),
         )
         self.top_settings_btn.pack(side=tk.RIGHT, padx=(0, 6))
+
+        self.top_clear_cache_btn = ttk.Button(
+            self.top_toolbar,
+            text="🧹 清理缓存",
+            style="Compact.TButton",
+            command=self._on_clear_all_caches,
+        )
+        self.top_clear_cache_btn.pack(side=tk.RIGHT, padx=(0, 6))
 
         self.top_status_lbl = tk.Label(
             self.top_toolbar,
@@ -5074,6 +5087,10 @@ class ScatteredRevisionApp:
             for p in self._extract_docx_from_paths(paths)
             if not p.name.startswith("查重结果")
         ]
+        if found and self._dd_batch_completed:
+            self.dd_files.clear()
+            self._dd_batch_completed = False
+            self._append_log("🧹 已自动清空上一轮已完成查重列表，载入新文档。", target_tab="dd")
         if not found:
             messagebox.showinfo("提示", "所选项目中未找到待查重的有效 .docx 文档。")
             return
@@ -5274,6 +5291,18 @@ class ScatteredRevisionApp:
         if not found_docx:
             messagebox.showinfo("提示", "拖入或选择的项目中未找到任何有效的 .docx 文档。")
             return
+
+        # Anti-mixing (`防串稿`): if the previous batch already finished running, auto-clear it before loading new files!
+        if self._fel_batch_completed and self.fel_files:
+            self.fel_files.clear()
+            self._fel_inspect_cache.clear()
+            if self._get_fel_lang_code() == "AUTO":
+                self.fel_tri_prefix_var.set("")
+            if self._fel_output_was_auto:
+                self.fel_output_dir_var.set("")
+            self._fel_batch_completed = False
+            self._append_log("🧹 已自动清空上一轮已完成的分part列表，载入新一批文稿（防串稿）。", target_tab="fel")
+
         existing_norm = {os.path.normcase(str(Path(x).resolve())) for x in self.fel_files}
         for rp in found_docx:
             key = os.path.normcase(str(rp))
@@ -5286,6 +5315,7 @@ class ScatteredRevisionApp:
 
         if not self.fel_output_dir_var.get().strip() and sorted_ps:
             self.fel_output_dir_var.set(str(sorted_ps[0].parent))
+            self._fel_output_was_auto = True
 
         self._fel_auto_sync_prefix()
         self._fel_refresh_previews()
@@ -5352,12 +5382,16 @@ class ScatteredRevisionApp:
     def _fel_clear_all(self):
         self.fel_files.clear()
         self._fel_inspect_cache.clear()
+        self._fel_batch_completed = False
+        if self._get_fel_lang_code() == "AUTO":
+            self.fel_tri_prefix_var.set("")
         self._fel_refresh_previews()
 
     def _fel_browse_output(self):
         d = filedialog.askdirectory(title="选择分part稿整理/合并输出保存目录")
         if d:
             self.fel_output_dir_var.set(d)
+            self._fel_output_was_auto = False
             self._save_settings()
 
     def _fel_open_output_dir(self):
@@ -5482,6 +5516,7 @@ class ScatteredRevisionApp:
         out_mode = self.fel_output_mode_var.get()
         dt_str = self.fel_date_var.get().strip()
         pool = ApiKeyPool(keys, rotation_mode=rot_mode) if (use_ai and keys) else None
+        self._fel_inspect_cache.clear()
         files_snapshot = list(self.fel_files)
 
         ai_tag = "AI开启" if (use_ai and keys) else "纯本地离线极速模式"
@@ -5515,12 +5550,16 @@ class ScatteredRevisionApp:
                 )
                 saved = res["saved_files"]
                 failed_ai = res.get("ai_failed_items") or []
+                retained_cmts = res.get("retained_comments") or []
                 files_str = "\n".join(saved)
                 self._log(f"🎉 分part稿整理/合并全部完成！共输出 {len(saved)} 份文档（修订状态：关闭）：\n{files_str}", target_tab="fel")
                 warn_block = ""
+                if retained_cmts:
+                    rc_list = "\n".join(f"• {x}" for x in retained_cmts)
+                    warn_block += f"\n\n📌 批注核对提醒（以下行批注与正文/颜色不一致，已原样保留供复核）：\n{rc_list}"
                 if failed_ai:
                     warn_list = "\n".join(f"• {x}" for x in failed_ai)
-                    warn_block = f"\n\n⚠️ 以下段落因模型接口繁忙暂未调用 AI 对齐段内局部样式（其余全部已完成导出，建议在 Word 中核对该行）：\n{warn_list}"
+                    warn_block += f"\n\n⚠️ 以下段落因模型接口繁忙暂未调用 AI 对齐段内局部样式（其余全部已完成导出，建议在 Word 中核对该行）：\n{warn_list}"
                 self.log_queue.put(("done", (True, f"整理/合并完成！共输出 {len(saved)} 份文档（修订: 关闭）", "fel")))
                 self.log_queue.put(
                     (
@@ -5562,6 +5601,9 @@ class ScatteredRevisionApp:
         if not found_docx:
             messagebox.showinfo("提示", "拖入或选择的项目中未找到任何有效的 .docx 文档。")
             return
+        if self._wc_batch_completed and self.wc_files:
+            self.wc_files.clear()
+            self._wc_batch_completed = False
         existing_norm = {os.path.normcase(str(Path(x).resolve())) for x in self.wc_files}
         for rp in found_docx:
             key = os.path.normcase(str(rp))
@@ -5741,6 +5783,7 @@ class ScatteredRevisionApp:
                     values=(p.name, "-", "-", "-", clean_ex, "❌ 失败"),
                 )
 
+        self._wc_batch_completed = True
         self._save_settings()
         self.wc_summary_var.set(
             f"处理完成：成功 {ok_cnt}/{len(self.wc_files)} 份  |  合计：RV {sum_rv} words, UP {sum_up} words"
@@ -5921,6 +5964,51 @@ class ScatteredRevisionApp:
 
     def _clear_log(self):
         self.log_text.delete("1.0", tk.END)
+
+    def _on_clear_all_caches(self):
+        if self.is_running or (getattr(self, "ingest_panel", None) is not None and getattr(self.ingest_panel, "_running", False)):
+            messagebox.showwarning("任务执行中", "当前正在后台处理文稿，请等待任务完成后再点击「清理缓存」。")
+            return
+
+        cleared_items: list[str] = []
+        try:
+            import library_index as _li_mod
+            mem_cnt = len(getattr(_li_mod, "_MEM_INDEX_CACHE", {}))
+            if hasattr(_li_mod, "_MEM_INDEX_CACHE"):
+                _li_mod._MEM_INDEX_CACHE.clear()
+            cleared_items.append(f"总库内存索引 ({mem_cnt} 项)")
+        except Exception:
+            pass
+
+        try:
+            import full_article_processor as _fap_mod
+            for cache_attr in ("_MASTER_MEM_CACHE", "_MEM_MASTER_CACHE"):
+                if hasattr(_fap_mod, cache_attr) and isinstance(getattr(_fap_mod, cache_attr), dict):
+                    getattr(_fap_mod, cache_attr).clear()
+        except Exception:
+            pass
+
+        try:
+            cleanup_stale_ephemeral_workdirs(max_age_seconds=0)
+            cleared_items.append("临时工作目录")
+        except Exception:
+            pass
+
+        # Clear inspect cache & residual completed document lists across tabs to prevent cross-document mixing
+        self._fel_inspect_cache.clear()
+        had_files = len(self.fel_files) + len(self.dd_files) + len(self.wc_files)
+        self._fel_clear_all()
+        self.dd_files.clear()
+        self._dd_batch_completed = False
+        if hasattr(self, "dd_tree"):
+            self._dd_refresh_tree()
+        self._wc_clear_all()
+        self._wc_batch_completed = False
+        cleared_items.append(f"各板块文档预览/列表缓存 ({had_files} 份)")
+
+        msg = "🧹 已一键清理：" + "、".join(cleared_items) + "。"
+        self._append_log(msg, target_tab=self.active_tab_key)
+        messagebox.showinfo("缓存清理完成", msg + "\n\n（API 密钥池与系统语种设置已安全保留）")
 
     def _toggle_key_visibility(self):
         if self.key_entry is not None:
@@ -6119,6 +6207,11 @@ class ScatteredRevisionApp:
         self.is_running = running
         if running:
             self._running_tab_key = tab_key
+        elif ok:
+            if tab_key == "fel":
+                self._fel_batch_completed = True
+            elif tab_key == "dd":
+                self._dd_batch_completed = True
         state = tk.DISABLED if running else tk.NORMAL
         for b in (
             self.btn_oneclick,
@@ -6440,8 +6533,8 @@ def _run_frozen_self_test() -> int:
     from ai_client import format_friendly_api_error as _ai_friendly_err
     from ai_client import local_align_col3_spans
 
-    if RAW_APP_VERSION != "1.9.3":
-        raise RuntimeError(f"RAW_APP_VERSION expected '1.9.3', got {RAW_APP_VERSION!r}")
+    if RAW_APP_VERSION != "1.9.4":
+        raise RuntimeError(f"RAW_APP_VERSION expected '1.9.4', got {RAW_APP_VERSION!r}")
 
     is_frozen = bool(getattr(sys, "frozen", False))
     if is_frozen and hasattr(sys, "_MEIPASS"):
@@ -6571,6 +6664,8 @@ def _run_frozen_self_test() -> int:
         _test_tc = _test_tr.findall(f"{docx_xml_utils.W}tc")[0]
         _test_cmts = docx_xml_utils.new_comments_root()
         _test_alloc = docx_xml_utils.CommentIdAllocator(doc_root=_test_doc, comments_root=_test_cmts)
+        if _test_alloc.allocate() < 1:
+            raise RuntimeError("MarkupIdAllocator.allocate() backward-compat alias failed")
         _li_test.add_comment_to_cell(_test_tc, "测试验收批注", _test_cmts, _test_alloc)
         if len(_test_cmts.findall(f"{docx_xml_utils.W}comment")) != 1:
             raise RuntimeError("library_ingester.add_comment_to_cell self-test failed")
@@ -6579,6 +6674,15 @@ def _run_frozen_self_test() -> int:
         docx_xml_utils.apply_highlights_to_col3_cell(_test_tc, [(0, 2, "u:single")])
         if _test_tc.find(f".//{docx_xml_utils.W}u") is None or _test_tc.find(f".//{docx_xml_utils.W}highlight") is not None:
             raise RuntimeError("Col 1 u:single underline self-test failed")
+        # Self-test v1.9.4 universal OOXML sanitizer & fellowship comment verification
+        _hl_bad = ET.SubElement(_test_tc.find(f"{docx_xml_utils.W}p"), f"{docx_xml_utils.W}hyperlink", {f"{{{docx_xml_utils.R_URI}}}id": "rId_missing"})
+        _hl_bad.append(docx_xml_utils.make_run("bad_link"))
+        docx_xml_utils.sanitize_document_ooxml(_test_doc, _test_cmts, valid_hyperlink_rids=set(), declared_ns_prefixes={"w", "r"})
+        if _test_doc.find(f".//{docx_xml_utils.W}hyperlink") is not None:
+            raise RuntimeError("sanitize_document_ooxml did not unwrap broken hyperlink")
+        import fellowship_processor as _fp_test
+        if not callable(getattr(_fp_test, "verify_and_retain_fellowship_comments", None)):
+            raise RuntimeError("fellowship_processor.verify_and_retain_fellowship_comments missing in self-test")
 
         for req_fn in ("parse_titles_text_or_file", "parse_titles_multiline", "resolve_full_articles", "run_full_article_pipeline"):
             if not callable(getattr(_fap_test, req_fn, None)):
@@ -6591,7 +6695,7 @@ def _run_frozen_self_test() -> int:
             raise RuntimeError("dedup_checker.check_and_export_duplicates missing in self-test")
 
         upd_ver = str(getattr(_upd_test, "APP_VERSION", "")).lstrip("vV")
-        expected_vers = ("1.9.3",) if require_v18_siblings else ("1.7.0", "1.8.0", "1.8.1", "1.9.0", "1.9.1", "1.9.2", "1.9.3")
+        expected_vers = ("1.9.4",) if require_v18_siblings else ("1.7.0", "1.8.0", "1.8.1", "1.9.0", "1.9.1", "1.9.2", "1.9.3", "1.9.4")
         if upd_ver not in expected_vers:
             raise RuntimeError(f"updater.APP_VERSION mismatch: {getattr(_upd_test, 'APP_VERSION', None)!r}")
         if not callable(getattr(_upd_test, "check_for_updates", None)) or not callable(

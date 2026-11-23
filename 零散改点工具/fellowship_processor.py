@@ -515,8 +515,34 @@ def unwrap_all_sdts(root: ET.Element) -> int:
     return unwrapped
 
 
-def accept_revisions_and_strip_comments(root: ET.Element) -> Tuple[int, int]:
-    """Accept all <w:ins>/<w:del>/*Change revisions and strip all comment markers & highlights."""
+def strip_comment_markers_from_root(root: ET.Element) -> int:
+    """Remove all commentRangeStart/End, commentReference, and empty CommentReference runs from `root`."""
+    COMMENT_TAGS = {"commentRangeStart", "commentRangeEnd", "commentReference"}
+    cmt_count = 0
+    changed = True
+    while changed:
+        changed = False
+        for parent in list(root.iter()):
+            for child in list(parent):
+                if _local_tag(child) in COMMENT_TAGS:
+                    parent.remove(child)
+                    cmt_count += 1
+                    changed = True
+
+    for p in root.findall(f".//{W}p"):
+        for r in list(p.findall(f"{W}r")):
+            rpr = r.find(f"{W}rPr")
+            if rpr is not None:
+                rstyle = rpr.find(f"{W}rStyle")
+                if rstyle is not None and "CommentReference" in rstyle.attrib.get(f"{W}val", ""):
+                    has_content = any(_local_tag(c) not in ("rPr",) for c in r)
+                    if not has_content:
+                        p.remove(r)
+    return cmt_count
+
+
+def accept_revisions_and_strip_comments(root: ET.Element, strip_comments: bool = True) -> Tuple[int, int]:
+    """Accept all <w:ins>/<w:del>/*Change revisions and strip highlights (and optionally comment markers)."""
     rev_count = 0
     cmt_count = 0
 
@@ -539,7 +565,7 @@ def accept_revisions_and_strip_comments(root: ET.Element) -> Tuple[int, int]:
         "permEnd",
     }
     UNWRAP_TAGS = {"ins", "moveTo", "customXml"}
-    COMMENT_TAGS = {"commentRangeStart", "commentRangeEnd", "commentReference"}
+    COMMENT_TAGS = {"commentRangeStart", "commentRangeEnd", "commentReference"} if strip_comments else set()
 
     changed = True
     while changed:
@@ -583,12 +609,13 @@ def accept_revisions_and_strip_comments(root: ET.Element) -> Tuple[int, int]:
                 r_shd = rpr.find(f"{W}shd")
                 if r_shd is not None:
                     rpr.remove(r_shd)
-                rstyle = rpr.find(f"{W}rStyle")
-                if rstyle is not None and "CommentReference" in rstyle.attrib.get(f"{W}val", ""):
-                    has_content = any(_local_tag(c) not in ("rPr",) for c in r)
-                    if not has_content:
-                        p.remove(r)
-                        continue
+                if strip_comments:
+                    rstyle = rpr.find(f"{W}rStyle")
+                    if rstyle is not None and "CommentReference" in rstyle.attrib.get(f"{W}val", ""):
+                        has_content = any(_local_tag(c) not in ("rPr",) for c in r)
+                        if not has_content:
+                            p.remove(r)
+                            continue
 
     for tcPr in root.findall(f".//{W}tcPr"):
         for shd in list(tcPr.findall(f"{W}shd")):
@@ -2229,6 +2256,23 @@ def _apply_fl_pre_quote_introducer(
         out_bolds[k] = bool(intro_bd and not fl_txt[k].isspace() and k < b_end)
 
 
+def _find_all_post_quote_citations_inclusive(text: str, quotes: List[Tuple[int, int, int, int]]) -> List[Tuple[int, int]]:
+    """Union `find_post_quote_citation_spans` with any balanced `(...)`/`（...）`/`[...]` immediately after a closing quote."""
+    spans = list(find_post_quote_citation_spans(text))
+    n = len(text)
+    for _, _, _, fqc in quotes:
+        j = fqc
+        while j < n and text[j] in " \t\u00a0\u3000.。":
+            j += 1
+        if j < n and 0 <= j - fqc <= 4 and text[j] in BRACKET_PAIRS:
+            k = _find_balanced_bracket_end(text, j)
+            if k != -1:
+                inner = text[j + 1 : k - 1].strip()
+                if len(inner) >= 4 and not _SHORT_RESPONSE_EXCLUSION_RE.match(inner):
+                    spans.append((fqc, k))
+    return spans
+
+
 def _col3_existing_violates_quote_bounds(
     en_txt: str,
     en_cols: List[str],
@@ -2245,8 +2289,8 @@ def _col3_existing_violates_quote_bounds(
     if not en_qs or not fl_qs:
         return False
 
-    en_cits = find_post_quote_citation_spans(en_txt)
-    fl_cits = find_post_quote_citation_spans(fl_txt)
+    en_cits = _find_all_post_quote_citations_inclusive(en_txt, en_qs)
+    fl_cits = _find_all_post_quote_citations_inclusive(fl_txt, fl_qs)
 
     def _is_word_ch(ch: str) -> bool:
         return ch.isalnum() or unicodedata.category(ch).startswith("L")
@@ -2307,8 +2351,8 @@ def _enforce_quote_boundary_consistency(
     if not en_qs or not fl_qs:
         return
 
-    en_cits = find_post_quote_citation_spans(en_txt)
-    fl_cits = find_post_quote_citation_spans(fl_txt)
+    en_cits = _find_all_post_quote_citations_inclusive(en_txt, en_qs)
+    fl_cits = _find_all_post_quote_citations_inclusive(fl_txt, fl_qs)
 
     def _is_word_ch(ch: str) -> bool:
         return ch.isalnum() or unicodedata.category(ch).startswith("L")
@@ -2404,8 +2448,8 @@ def _try_quote_pair_blue_bold_alignment(
     if not en_quotes or len(en_quotes) != len(fl_quotes):
         return False
 
-    en_cits = find_post_quote_citation_spans(en_txt)
-    fl_cits = find_post_quote_citation_spans(fl_txt)
+    en_cits = _find_all_post_quote_citations_inclusive(en_txt, en_quotes)
+    fl_cits = _find_all_post_quote_citations_inclusive(fl_txt, fl_quotes)
 
     def _is_in_spans(idx: int, sp_list: List[Tuple[int, int]]) -> bool:
         return any(s0 <= idx < s1 for s0, s1 in sp_list)
@@ -2567,6 +2611,25 @@ def _trim_outer_quotes_from_bold_span(full_text: str, s0: int, s1: int) -> Tuple
     return s0, s1
 
 
+def _fold_diacritics_char(c: str) -> str:
+    """Map accented/diacritic character to a single base char (preserving 1:1 string length when possible)."""
+    if c in ('"', "“", "”", "„", "«", "»"):
+        return '"'
+    if c in ("'", "‘", "’", "‚"):
+        return "'"
+    if c in ("\u00a0", "\u3000", "\t"):
+        return " "
+    if c in ("–", "—", "−"):
+        return "-"
+    # Special single-codepoint stroke letters not decomposed by NFKD (e.g. Polish ł/Ł, Danish ø/Ø, German ß)
+    stroke_map = {"ł": "l", "Ł": "L", "ø": "o", "Ø": "O", "đ": "d", "Đ": "D"}
+    if c in stroke_map:
+        return stroke_map[c]
+    decomp = unicodedata.normalize("NFKD", c)
+    base = "".join(ch for ch in decomp if not unicodedata.combining(ch))
+    return base if len(base) == 1 else c
+
+
 def _locate_substring_fuzzy(
     haystack: str,
     needle: str,
@@ -2575,7 +2638,7 @@ def _locate_substring_fuzzy(
 ) -> Optional[Tuple[int, int]]:
     if not needle:
         return None
-    cur = search_from if search_from is not None else start_cursor
+    cur = max(0, search_from if search_from is not None else start_cursor)
     idx = haystack.find(needle, cur)
     if idx != -1:
         return idx, idx + len(needle)
@@ -2583,25 +2646,36 @@ def _locate_substring_fuzzy(
     if idx_any != -1 and search_from is None:
         return idx_any, idx_any + len(needle)
 
-    def _norm_char(c: str) -> str:
-        if c in ('"', "“", "”", "„", "«", "»"):
-            return '"'
-        if c in ("'", "‘", "’", "‚"):
-            return "'"
-        if c in ("\u00a0", "\u3000", "\t"):
-            return " "
-        return c
-
-    h_norm = "".join(_norm_char(c) for c in haystack)
-    n_norm = "".join(_norm_char(c) for c in needle)
-    if len(h_norm) == len(haystack) and len(n_norm) == len(needle):
-        idx2 = h_norm.find(n_norm, cur)
+    # 1:1 quote, dash, whitespace, case, and diacritic-folded lookup (handles Polish ą/ę/ł/ś, French, etc.)
+    h_fold = "".join(_fold_diacritics_char(c) for c in haystack).lower()
+    n_fold = "".join(_fold_diacritics_char(c) for c in needle).lower()
+    if len(h_fold) == len(haystack) and len(n_fold) == len(needle):
+        idx2 = h_fold.find(n_fold, cur)
         if idx2 != -1:
-            return idx2, idx2 + len(n_norm)
+            return idx2, idx2 + len(n_fold)
         if search_from is None:
-            idx3 = h_norm.find(n_norm)
+            idx3 = h_fold.find(n_fold)
             if idx3 != -1:
-                return idx3, idx3 + len(n_norm)
+                return idx3, idx3 + len(n_fold)
+
+    # Whitespace/punctuation-tolerant regex span lookup via docx_xml_utils
+    fz = docx_xml_utils.find_fuzzy_substring_span(haystack, needle, search_from=cur)
+    if fz is not None and fz[0] >= cur:
+        return fz
+    if search_from is None and fz is not None:
+        return fz
+
+    # Diacritic-folded + collapsed-whitespace regex lookup for multi-space / soft-hyphen variance
+    tokens = [re.escape(tok) for tok in n_fold.split() if tok]
+    if tokens:
+        pat = re.compile(r"\s+".join(tokens))
+        m = pat.search(h_fold, cur)
+        if m is not None:
+            return m.start(), m.end()
+        if search_from is None:
+            m2 = pat.search(h_fold)
+            if m2 is not None:
+                return m2.start(), m2.end()
     return None
 
 
@@ -2695,6 +2769,89 @@ def _apply_span_dicts_onto_arrays(
                 char_bolds[idx] = False
 
     return matched_cnt
+
+
+def _fill_missing_red_spans_locally(
+    en_txt: str,
+    en_colors: List[str],
+    en_bolds: List[bool],
+    en_start: int,
+    fl_txt: str,
+    fl_start: int,
+    char_colors: List[str],
+    char_bolds: List[bool],
+    en_allows_bold: bool,
+) -> int:
+    """
+    Ensure every distinct red (`<RD>` / `<RB>`) span in `en_txt[en_start:]` has a corresponding red span
+    in `fl_txt[fl_start:]`. If some red spans were already matched (e.g. span 1 of 2), only fills the
+    unmatched red span(s) in the non-overlapping window without clobbering already-matched spans!
+    """
+    en_sub_full = en_txt[en_start:]
+    fl_sub_full = fl_txt[fl_start:]
+    if not en_sub_full.strip() or not fl_sub_full.strip():
+        return 0
+
+    raw_segs = _compress_style_segments(en_txt, en_colors, en_bolds, start=en_start)
+    red_reqs: List[Dict] = []
+    meta_list: List[Tuple[bool, str, int, int]] = []
+    rel_pos = 0
+    for seg_txt, ck, bd in raw_segs:
+        seg_len = len(seg_txt)
+        s0, s1 = rel_pos, rel_pos + seg_len
+        rel_pos = s1
+        if ck == "red" and seg_txt.strip():
+            sid = f"rd_{len(red_reqs)}"
+            red_reqs.append(
+                {
+                    "span_id": sid,
+                    "type": "up",
+                    "old_en_in_col3": seg_txt,
+                    "old_en_char_start": s0,
+                    "old_en_char_end": s1,
+                    "left_old_context": en_sub_full[max(0, s0 - 30) : s0],
+                    "right_old_context": en_sub_full[s1 : min(len(en_sub_full), s1 + 30)],
+                }
+            )
+            meta_list.append((bd and en_allows_bold, seg_txt, s0, s1))
+
+    if not red_reqs:
+        return 0
+
+    got_red_runs = _count_distinct_true_runs([c == "red" for c in char_colors], fl_txt, start=fl_start)
+    if got_red_runs >= len(red_reqs):
+        return 0
+
+    aligned_map = local_align_col3_spans(fl_sub_full, en_sub_full, red_reqs, _locate_substring_fuzzy)
+    if not aligned_map:
+        return 0
+
+    added = 0
+    search_cur = fl_start
+    for idx_r, req in enumerate(red_reqs):
+        want_bd, _, _, _ = meta_list[idx_r]
+        val = aligned_map.get(req["span_id"], "")
+        sub = val.get("col3_substring", "") if isinstance(val, dict) else str(val or "")
+        if not sub.strip():
+            continue
+        loc = _locate_substring_fuzzy(fl_txt, sub, start_cursor=search_cur, search_from=search_cur)
+        if loc is None:
+            loc = _locate_substring_fuzzy(fl_txt, sub.strip(), start_cursor=search_cur)
+        if loc is None or loc[0] < fl_start:
+            continue
+        ms, me = loc
+        search_cur = me
+        # Only paint if this target window doesn't already have red coverage
+        existing_red_chars = sum(1 for k in range(ms, me) if not fl_txt[k].isspace() and char_colors[k] == "red")
+        non_ws_len = max(1, sum(1 for k in range(ms, me) if not fl_txt[k].isspace()))
+        if existing_red_chars / non_ws_len >= 0.45:
+            continue
+        for k in range(ms, me):
+            char_colors[k] = "red"
+            if want_bd and not fl_txt[k].isspace() and fl_txt[k] not in ALL_OUTER_QUOTE_CHARS:
+                char_bolds[k] = True
+        added += 1
+    return added
 
 
 def _align_spans_locally_onto_arrays(
@@ -2876,19 +3033,28 @@ _FELLOWSHIP_ALIGN_SCHEMA = {
 }
 
 
-def _count_distinct_true_runs(flags: List[bool], text: str, start: int = 0) -> int:
-    cnt = 0
-    in_run = False
+def _get_distinct_true_run_spans(flags: List[bool], text: str, start: int = 0) -> List[Tuple[int, int]]:
+    spans: List[Tuple[int, int]] = []
+    cur_s: Optional[int] = None
+    last_t = start
     for i in range(start, len(flags)):
         if text[i].isspace():
             continue
         if flags[i]:
-            if not in_run:
-                cnt += 1
-                in_run = True
+            if cur_s is None:
+                cur_s = i
+            last_t = i + 1
         else:
-            in_run = False
-    return cnt
+            if cur_s is not None:
+                spans.append((cur_s, last_t))
+                cur_s = None
+    if cur_s is not None:
+        spans.append((cur_s, last_t))
+    return spans
+
+
+def _count_distinct_true_runs(flags: List[bool], text: str, start: int = 0) -> int:
+    return len(_get_distinct_true_run_spans(flags, text, start=start))
 
 
 def sync_table_col3_blue_and_bold(
@@ -2897,7 +3063,7 @@ def sync_table_col3_blue_and_bold(
     model: str,
     api_mode: str,
     enable_ai_col3: bool = True,
-    sync_red: bool = False,
+    sync_red: bool = True,
     log_fn: Optional[Callable[[str], None]] = None,
 ) -> Dict:
     """Synchronize Col 3 blue (#0000FF), optional red (#FF0000 when `sync_red=True`), and bold (<w:b/>)
@@ -3032,9 +3198,11 @@ def sync_table_col3_blue_and_bold(
                         if not any(fqi_s <= k < fqi_e for _, fqi_s, fqi_e, _ in fl_qs_chk):
                             work_bds[k] = False
 
-            # Check Red channel status
-            fl_rem_has_red = any(fl_orig_cols[k] == "red" for k in range(fl_rem_start, n_fl) if not fl_txt[k].isspace())
-            need_align_red = en_rem_has_red and not fl_rem_has_red
+            # Check Red channel status (count distinct red spans so partial Col 3 red still completes missing spans!)
+            en_red_runs = _count_distinct_true_runs([c == "red" for c in en_cols], en_txt, start=en_rem_start) if sync_red else 0
+            fl_red_runs = _count_distinct_true_runs([c == "red" for c in fl_orig_cols], fl_txt, start=fl_rem_start)
+            fl_rem_has_red = fl_red_runs > 0
+            need_align_red = en_rem_has_red and (fl_red_runs < en_red_runs)
 
             # 4. Try exact deterministic Quote-Pair Blue/Bold mapping
             need_align_bb = en_rem_has_blue or en_rem_has_bold
@@ -3056,6 +3224,46 @@ def sync_table_col3_blue_and_bold(
             # 5. If Quote-Pair didn't resolve Blue/Bold, check if Col 3's existing Blue/Bold already matches Col 2
             if need_align_bb:
                 fl_rem_has_blue = any(work_cols[k] == "blue" for k in range(fl_rem_start, n_fl) if not fl_txt[k].isspace())
+                # If Col 3 already has the exact same number of valid blue runs as Col 2 and all Col 2 bold sits inside Col 2 blue runs,
+                # deterministically mirror bold/unbold per blue run (e.g. unbolding Bible verses like Job 1:21 while keeping God's Word bold)!
+                if en_rem_has_blue and fl_rem_has_blue:
+                    en_bl_spans = _get_distinct_true_run_spans([c == "blue" for c in en_cols], en_txt, start=en_rem_start)
+                    fl_bl_spans = _get_distinct_true_run_spans([c == "blue" for c in work_cols], fl_txt, start=fl_rem_start)
+                    en_bold_only_in_blue = all(en_cols[i] == "blue" for i in en_rem_non_ws if en_bds[i])
+                    if (
+                        len(en_bl_spans) == len(fl_bl_spans) > 0
+                        and en_bold_only_in_blue
+                        and not _col3_existing_violates_quote_bounds(
+                            en_txt,
+                            en_cols,
+                            [False] * len(en_bds),
+                            en_rem_start,
+                            fl_txt,
+                            fl_rem_start,
+                            work_cols,
+                            [False] * len(work_bds),
+                        )
+                    ):
+                        fl_qs_local = find_top_level_quotes(fl_txt, start=fl_rem_start)
+                        fl_cits_local = _find_all_post_quote_citations_inclusive(fl_txt, fl_qs_local)
+                        for k in range(fl_rem_start, n_fl):
+                            if not (fl_rem_has_red and work_cols[k] == "red"):
+                                work_bds[k] = False
+                        for (es, ee), (fs, fe) in zip(en_bl_spans, fl_bl_spans):
+                            want_bd = any(en_bds[i] for i in range(es, ee) if not en_txt[i].isspace())
+                            if want_bd:
+                                for k in range(fs, fe):
+                                    if (
+                                        fl_txt[k].isspace()
+                                        or fl_txt[k] in ALL_OUTER_QUOTE_CHARS
+                                        or any(cs <= k < ce for cs, ce in fl_cits_local)
+                                    ):
+                                        continue
+                                    # Keep trailing sentence punctuation right after citation unbolded
+                                    if any(k == ce and fl_txt[k] in ".。։।" for _, ce in fl_cits_local):
+                                        continue
+                                    work_bds[k] = True
+
                 fl_rem_has_bold = any(work_bds[k] for k in range(fl_rem_start, n_fl) if not fl_txt[k].isspace())
                 en_bd_runs = _count_distinct_true_runs(en_bds, en_txt, start=en_rem_start)
                 fl_bd_runs = _count_distinct_true_runs(work_bds, fl_txt, start=fl_rem_start)
@@ -3068,10 +3276,11 @@ def sync_table_col3_blue_and_bold(
                     )
                 ):
                     # Normalize outer quotes & post-quote citations locally
+                    fl_qs_norm = find_top_level_quotes(fl_txt, start=fl_rem_start)
                     for k in range(fl_rem_start, n_fl):
                         if fl_txt[k] in ALL_OUTER_QUOTE_CHARS:
                             work_bds[k] = False
-                    for c0, c1 in find_post_quote_citation_spans(fl_txt):
+                    for c0, c1 in _find_all_post_quote_citations_inclusive(fl_txt, fl_qs_norm):
                         if c0 >= fl_rem_start:
                             for k in range(c0, c1):
                                 work_bds[k] = False
@@ -3089,7 +3298,9 @@ def sync_table_col3_blue_and_bold(
                         work_cols[k] = "none"
                     if not (fl_rem_has_red and work_cols[k] == "red"):
                         work_bds[k] = False
-                if need_align_red and work_cols[k] == "red":
+                # Preserve already-marked red runs when Col 3 has partial red (`0 < fl_red_runs < en_red_runs`),
+                # only clearing red when Col 3 had 0 red runs
+                if need_align_red and not fl_rem_has_red and work_cols[k] == "red":
                     work_cols[k] = "none"
 
             ai_tasks.append(
@@ -3101,6 +3312,7 @@ def sync_table_col3_blue_and_bold(
                     "en_bds": en_bds,
                     "en_rem_start": en_rem_start,
                     "en_rem_has_bold": en_rem_has_bold,
+                    "en_red_runs": en_red_runs,
                     "fl_txt": fl_txt,
                     "fl_rem_start": fl_rem_start,
                     "work_cols": work_cols,
@@ -3237,6 +3449,39 @@ def sync_table_col3_blue_and_bold(
                                 align_blue_bold=task["need_align_bb"],
                                 align_red=task["need_align_red"],
                             )
+                        else:
+                            # Per-channel & per-span completion: if AI matched Blue/Bold but missed Red (or matched 1 of 2 Red spans), fill missing spans!
+                            if task["need_align_bb"]:
+                                has_any_bb_now = any(
+                                    task["work_cols"][k] == "blue" or task["work_bds"][k]
+                                    for k in range(task["fl_rem_start"], len(task["fl_txt"]))
+                                    if not task["fl_txt"][k].isspace()
+                                )
+                                if not has_any_bb_now:
+                                    applied_n += _align_spans_locally_onto_arrays(
+                                        task["en_txt"],
+                                        task["en_cols"],
+                                        task["en_bds"],
+                                        task["en_rem_start"],
+                                        task["fl_txt"],
+                                        task["fl_rem_start"],
+                                        task["work_cols"],
+                                        task["work_bds"],
+                                        align_blue_bold=True,
+                                        align_red=False,
+                                    )
+                            if task["need_align_red"]:
+                                applied_n += _fill_missing_red_spans_locally(
+                                    task["en_txt"],
+                                    task["en_cols"],
+                                    task["en_bds"],
+                                    task["en_rem_start"],
+                                    task["fl_txt"],
+                                    task["fl_rem_start"],
+                                    task["work_cols"],
+                                    task["work_bds"],
+                                    en_allows_bold=task["en_rem_has_bold"],
+                                )
                         _enforce_quote_boundary_consistency(
                             task["en_txt"],
                             task["en_cols"],
@@ -3809,12 +4054,659 @@ def balance_three_column_widths(
     return widths_tuple
 
 
+# ---------------- Step 7.5: 3-Type Fellowship Comment Verification & Selective Retention ----------------
+
+_EXCERPT_COMMENT_HEADER_RE = re.compile(
+    r"^\s*(?:please\s+)?(?:extract|take|select|use|trim|keep)\b[^\n.!?]*\b(?:excerpt|corresponding\s+translation|english)\b[^\n.!?]*[.!?:]?\s*",
+    re.IGNORECASE,
+)
+_ABOVE_CONSISTENCY_COMMENT_RE = re.compile(
+    r"\b(?:consistent\s+with|quote\b.*\babove|extract\b.*\babove|same\s+as\b.*\babove|translation\b.*\babove|text\s+above|verse\s+above|from\s+above|in\s+the\s+above|as\s+translated\s+above)\b",
+    re.IGNORECASE,
+)
+_ALL_QUOTE_GLYPHS_RE = re.compile(r'[„“”«»"‟‹›‚‘’\']')
+_NORM_WS_RE = re.compile(r"[\s\u00a0\u3000]+")
+
+
+def _norm_quote_neutral_str(s: str) -> str:
+    """Normalize quote glyphs, dashes, and whitespace while keeping every word and internal punctuation intact."""
+    if not s:
+        return ""
+    t = s.replace("–", "-").replace("—", "-").replace("−", "-")
+    t = re.sub(r'[„“”«»"‟]', '"', t)
+    t = re.sub(r"[‚‘’]", "'", t)
+    t = _NORM_WS_RE.sub(" ", t).strip()
+    return t
+
+
+def _norm_inner_quote_cmp(s: str) -> str:
+    """Normalize inner quote text (stripping outer quotes and outer sentence-final period/whitespace) for exact word matching."""
+    t = _norm_quote_neutral_str(s)
+    t = t.strip(' "\'').strip()
+    t = t.rstrip(".。").strip()
+    return t
+
+
+def _norm_en_phrase_key(s: str) -> str:
+    t = _ALL_QUOTE_GLYPHS_RE.sub("", s or "")
+    t = re.sub(r"[.,?!;:—–\-()\[\]]+", " ", t.lower())
+    return _NORM_WS_RE.sub(" ", t).strip()
+
+
+def load_fellowship_comments_dict(zf: zipfile.ZipFile) -> Dict[str, Dict]:
+    """Load `{cid: {'id', 'author', 'date', 'initials', 'text', 'xml_el'}}` from `word/comments.xml` if present."""
+    if "word/comments.xml" not in zf.namelist():
+        return {}
+    try:
+        c_root = _parse_safe_xml_bytes(_read_zip_member_bounded(zf, "word/comments.xml"))
+    except Exception:
+        return {}
+    out: Dict[str, Dict] = {}
+    for c_el in c_root.findall(f"{W}comment"):
+        cid = c_el.attrib.get(f"{W}id", "").strip()
+        if not cid:
+            continue
+        paras = ["".join(p.itertext()).strip() for p in c_el.findall(f"{W}p")]
+        txt = "\n".join(p for p in paras if p).strip()
+        if not txt:
+            continue
+        out[cid] = {
+            "id": cid,
+            "author": c_el.attrib.get(f"{W}author", "Reviewer"),
+            "date": c_el.attrib.get(f"{W}date", ""),
+            "initials": c_el.attrib.get(f"{W}initials", ""),
+            "text": txt,
+            "xml_el": copy.deepcopy(c_el),
+        }
+    return out
+
+
+def extract_table_comment_records(tbl: Optional[ET.Element], comments_dict: Dict[str, Dict]) -> List[Dict]:
+    """
+    Extract structured comment anchors from `tbl` (after internal Part table merging & revision acceptance,
+    before stripping comment markers) so each comment can be verified against final Col 2 & Col 3!
+    """
+    if tbl is None or not comments_dict:
+        return []
+    records: List[Dict] = []
+    seen_cids: Set[str] = set()
+    trs = tbl.findall(f"{W}tr")
+    for r_idx, tr in enumerate(trs):
+        tcs = tr.findall(f"{W}tc")
+        if len(tcs) < 3:
+            continue
+        for c_idx in range(min(3, len(tcs))):
+            ps = tcs[c_idx].findall(f"{W}p")
+            for p_idx, p_el in enumerate(ps):
+                char_pos = 0
+                open_starts: Dict[str, int] = {}
+                done_ranges: List[Tuple[str, int, int]] = []
+                for sub in p_el.iter():
+                    lt = _local_tag(sub)
+                    if lt == "commentRangeStart":
+                        cid = sub.attrib.get(f"{W}id", "").strip()
+                        if cid in comments_dict and cid not in open_starts:
+                            open_starts[cid] = char_pos
+                    elif lt == "commentRangeEnd":
+                        cid = sub.attrib.get(f"{W}id", "").strip()
+                        if cid in open_starts:
+                            done_ranges.append((cid, open_starts.pop(cid), char_pos))
+                    elif lt == "commentReference":
+                        cid = sub.attrib.get(f"{W}id", "").strip()
+                        if cid in comments_dict and cid not in seen_cids and not any(x[0] == cid for x in done_ranges):
+                            s0 = open_starts.pop(cid, char_pos)
+                            done_ranges.append((cid, s0, char_pos))
+                    elif lt == "t" and sub.text:
+                        char_pos += len(sub.text)
+                for cid, s0 in open_starts.items():
+                    done_ranges.append((cid, s0, char_pos))
+
+                p_plain = _get_p_text(p_el)
+                for cid, a_s, a_e in done_ranges:
+                    if cid in seen_cids or cid not in comments_dict:
+                        continue
+                    seen_cids.add(cid)
+                    cmeta = comments_dict[cid]
+                    records.append(
+                        {
+                            "cid": cid,
+                            "row_idx": r_idx,
+                            "col_idx": c_idx,
+                            "p_idx": p_idx,
+                            "anchor_start": a_s,
+                            "anchor_end": a_e,
+                            "anchor_text": p_plain[a_s:a_e],
+                            "comment_text": cmeta["text"],
+                            "author": cmeta["author"],
+                            "date": cmeta["date"],
+                            "initials": cmeta["initials"],
+                            "xml_el": cmeta["xml_el"],
+                        }
+                    )
+    return records
+
+
+def _expand_col2_anchor_context(
+    en_txt: str,
+    en_cols: List[str],
+    a_start: int,
+    a_end: int,
+) -> Dict:
+    """
+    Expand a (possibly 1-word or quote-mark-only, e.g. `<<The>>`, `<<we>>`, `<<“>>`) Col 2 comment anchor
+    to its enclosing top-level quotation `(q_open, q_in_s, q_in_e, q_close)` (+ post-quote citation if any),
+    and compute the expected semantic color (`'blue'` | `'red'` | `'none'`).
+    """
+    n = len(en_txt)
+    a0 = max(0, min(n, a_start))
+    a1 = max(a0, min(n, a_end))
+    en_qs = find_top_level_quotes(en_txt)
+    en_cits = find_post_quote_citation_spans(en_txt)
+
+    for q_ord, (qo, qis, qie, qc) in enumerate(en_qs):
+        # Anchor overlaps or touches opening quote of this quote
+        if (qo <= a0 <= qc) or (a0 < qc and a1 > qo) or (0 <= qo - a1 <= 2 and en_txt[a0:qc].strip()):
+            post_cit = next(((cs, ce) for cs, ce in en_cits if 0 <= cs - qc <= 4), None)
+            full_e = post_cit[1] if post_cit else qc
+            word_cols = [en_cols[k] for k in range(qis, qie) if not en_txt[k].isspace() and en_cols[k] in ("blue", "red")]
+            exp_col = "none"
+            if word_cols:
+                exp_col = "red" if word_cols.count("red") >= word_cols.count("blue") else "blue"
+            return {
+                "is_quote": True,
+                "quote_ord": q_ord,
+                "total_en_quotes": len(en_qs),
+                "span_start": qo,
+                "span_end": full_e,
+                "quote_inner": en_txt[qis:qie],
+                "quote_outer": en_txt[qo:qc],
+                "citation": en_txt[post_cit[0] : post_cit[1]] if post_cit else "",
+                "expected_color": exp_col,
+            }
+
+    # Unquoted anchor span: expand to word boundaries
+    s0, s1 = a0, max(a1, min(n, a0 + 1))
+    while s0 > 0 and en_txt[s0 - 1].isalnum():
+        s0 -= 1
+    while s1 < n and en_txt[s1].isalnum():
+        s1 += 1
+    word_cols = [en_cols[k] for k in range(s0, s1) if not en_txt[k].isspace() and en_cols[k] in ("blue", "red")]
+    exp_col = "none"
+    if word_cols:
+        exp_col = "red" if word_cols.count("red") >= word_cols.count("blue") else "blue"
+    return {
+        "is_quote": False,
+        "quote_ord": -1,
+        "total_en_quotes": len(en_qs),
+        "span_start": s0,
+        "span_end": s1,
+        "quote_inner": en_txt[s0:s1].strip(),
+        "quote_outer": en_txt[s0:s1].strip(),
+        "citation": "",
+        "expected_color": exp_col,
+    }
+
+
+def _check_fl_span_matches_expected_color(
+    fl_txt: str,
+    fl_cols: List[str],
+    s0: int,
+    s1: int,
+    expected_color: str,
+) -> bool:
+    """Verify that the matched foreign text (focusing on inner quote words if quoted) has `expected_color` ('blue'|'red')."""
+    if expected_color not in ("blue", "red"):
+        return True
+    sub_qs = find_top_level_quotes(fl_txt[s0:s1])
+    if sub_qs:
+        check_indices = [
+            s0 + k
+            for _, qis, qie, _ in sub_qs
+            for k in range(qis, qie)
+            if (fl_txt[s0 + k].isalnum() or unicodedata.category(fl_txt[s0 + k]).startswith("L"))
+        ]
+    else:
+        check_indices = [
+            k
+            for k in range(s0, s1)
+            if (fl_txt[k].isalnum() or unicodedata.category(fl_txt[k]).startswith("L"))
+        ]
+    if not check_indices:
+        return True
+    matched = sum(1 for k in check_indices if fl_cols[k] == expected_color)
+    return (matched / len(check_indices)) >= 0.80
+
+
+def _find_quote_neutral_span(haystack: str, needle: str, start_pos: int = 0) -> Optional[Tuple[int, int]]:
+    """Find `needle` inside `haystack` normalizing quote styles (`„“` / `“”` / `«»` / `""`) and dashes, but requiring exact words!"""
+    if not needle or not needle.strip():
+        return None
+    n_clean = _norm_quote_neutral_str(needle).rstrip(".。").strip()
+    if not n_clean:
+        return None
+
+    # Build regex from `n_clean` where quote chars match any quote glyph, dashes match any dash, spaces match \s+
+    pat_parts: List[str] = []
+    for ch in n_clean:
+        if ch == '"':
+            pat_parts.append(r'[„“”«»"‟]')
+        elif ch == "'":
+            pat_parts.append(r"[‚‘’']")
+        elif ch == "-":
+            pat_parts.append(r"[-–—−]")
+        elif ch == " ":
+            pat_parts.append(r"[\s\u00a0\u3000]+")
+        else:
+            pat_parts.append(re.escape(ch))
+    rx = re.compile("".join(pat_parts))
+    m = rx.search(haystack, max(0, start_pos))
+    if m is not None:
+        return m.start(), m.end()
+    if start_pos > 0:
+        m2 = rx.search(haystack)
+        if m2 is not None:
+            return m2.start(), m2.end()
+    return None
+
+
+def _find_above_reference_translation(
+    target_en_inner: str,
+    prior_para_pairs: List[Tuple[str, str]],
+    cur_en_prefix: str,
+    cur_fl_txt: str,
+    cur_fl_quote_limit_idx: int,
+) -> Optional[Tuple[str, str]]:
+    """
+    Search earlier text (current paragraph prefix first, then preceding rows & Parts in reverse order)
+    for `target_en_inner`. Returns `('exact_quote', fl_quote_inner)` or `('super_quote', fl_long_quote_inner)`.
+    """
+    target_key = _norm_en_phrase_key(target_en_inner)
+    if len(target_key) < 4:
+        return None
+
+    # Build candidate `(en_block, fl_block, max_fl_quotes)` list from closest above to farthest above
+    search_blocks: List[Tuple[str, str, Optional[int]]] = []
+    if cur_en_prefix.strip():
+        search_blocks.append((cur_en_prefix, cur_fl_txt, cur_fl_quote_limit_idx))
+    for p_en, p_fl in reversed(prior_para_pairs):
+        if p_en.strip() and p_fl.strip():
+            search_blocks.append((p_en, p_fl, None))
+
+    for blk_en, blk_fl, fl_q_limit in search_blocks:
+        en_qs = find_top_level_quotes(blk_en)
+        fl_qs = find_top_level_quotes(blk_fl)
+        if fl_q_limit is not None:
+            fl_qs = fl_qs[: max(0, fl_q_limit)]
+        if not en_qs or not fl_qs:
+            continue
+
+        # Pass A: Exact quote match in earlier Col 2
+        for qi in range(len(en_qs) - 1, -1, -1):
+            _, qis, qie, _ = en_qs[qi]
+            cand_en = blk_en[qis:qie]
+            if _norm_en_phrase_key(cand_en) == target_key:
+                # Map to corresponding fl_qs index (exact index if quote counts match, else proportional)
+                f_qi = qi if qi < len(fl_qs) else min(len(fl_qs) - 1, round(qi * len(fl_qs) / max(1, len(en_qs))))
+                _, fqis, fqie, _ = fl_qs[f_qi]
+                return ("exact_quote", blk_fl[fqis:fqie])
+
+        # Pass B: `target_en_inner` is a clause/sentence inside a longer earlier quote/Bible verse!
+        for qi in range(len(en_qs) - 1, -1, -1):
+            _, qis, qie, _ = en_qs[qi]
+            cand_en = blk_en[qis:qie]
+            cand_key = _norm_en_phrase_key(cand_en)
+            if len(cand_key) > len(target_key) and target_key in cand_key:
+                f_qi = qi if qi < len(fl_qs) else min(len(fl_qs) - 1, round(qi * len(fl_qs) / max(1, len(en_qs))))
+                _, fqis, fqie, _ = fl_qs[f_qi]
+                return ("super_quote", blk_fl[fqis:fqie])
+
+    return None
+
+
+def verify_single_fellowship_comment(
+    rec: Dict,
+    en_txt: str,
+    en_cols: List[str],
+    fl_txt: str,
+    fl_cols: List[str],
+    prior_para_pairs: List[Tuple[str, str]],
+) -> Tuple[bool, str]:
+    """
+    Verify one fellowship comment against final Col 2 & Col 3 text and colors:
+      - Returns `(True, reason)` when verified 100% consistent (-> safe to delete comment).
+      - Returns `(False, reason)` when mismatched or uncertain (-> MUST retain comment for human review).
+    """
+    cmt_raw = (rec.get("comment_text") or "").strip()
+    if not cmt_raw:
+        return True, "empty"
+
+    ctx = _expand_col2_anchor_context(en_txt, en_cols, rec["anchor_start"], rec["anchor_end"])
+    exp_col = ctx["expected_color"]
+    en_q_inner = ctx["quote_inner"]
+    fl_qs = find_top_level_quotes(fl_txt)
+
+    # ------------------------------------------------------------------
+    # Type ②: Excerpt extraction comment (`Please extract the corresponding translation based on the English excerpt...`)
+    # ------------------------------------------------------------------
+    if _EXCERPT_COMMENT_HEADER_RE.search(cmt_raw):
+        body_after_hdr = _EXCERPT_COMMENT_HEADER_RE.sub("", cmt_raw, count=1).strip()
+        if not body_after_hdr or not en_q_inner:
+            return False, "excerpt_comment_unparseable"
+
+        # Locate full English sentence vs full Foreign reference inside `body_after_hdr`
+        en_probe = _norm_quote_neutral_str(en_q_inner).strip(' "\'').rstrip(".!?")
+        probe_loc = _locate_substring_fuzzy(body_after_hdr, en_probe[: min(40, len(en_probe))])
+        cmt_full_en = ""
+        cmt_full_fl = body_after_hdr
+        if probe_loc is not None:
+            # Find where the foreign translation begins (first foreign opening quote `„`/`«`/`“` or non-ASCII letter after probe_loc)
+            split_pos = -1
+            for k in range(probe_loc[1], len(body_after_hdr)):
+                ch = body_after_hdr[k]
+                if ch in ("„", "«", "「") or (ord(ch) > 127 and unicodedata.category(ch).startswith("L")):
+                    split_pos = k
+                    # Step back 1 char if preceded immediately by opening quote `“` or `"`
+                    if split_pos > probe_loc[1] and body_after_hdr[split_pos - 1] in ('"', "“"):
+                        split_pos -= 1
+                    break
+                if ch == "\n":
+                    split_pos = k
+                    break
+            if split_pos != -1:
+                cmt_full_en = body_after_hdr[probe_loc[0] : split_pos].strip()
+                cmt_full_fl = body_after_hdr[split_pos:].strip()
+
+        cmt_fl_qs = find_top_level_quotes(cmt_full_fl)
+        if cmt_fl_qs:
+            _, cf_is, cf_ie, cf_qc = cmt_fl_qs[0]
+            cmt_fl_inner = cmt_full_fl[cf_is:cf_ie]
+            cmt_cits = find_post_quote_citation_spans(cmt_full_fl)
+            cmt_fl_cit = cmt_full_fl[cmt_cits[0][0] : cmt_cits[0][1]] if cmt_cits else ""
+        else:
+            cmt_fl_inner = cmt_full_fl
+            cmt_fl_cit = ""
+
+        norm_cmt_fl_inner = _norm_inner_quote_cmp(cmt_fl_inner)
+        if not norm_cmt_fl_inner or not fl_qs:
+            return False, "excerpt_missing_fl_quote"
+
+        # Identify candidate quote(s) in Col 3 (preferring matching quote ordinal if quote counts match)
+        cand_q_indices = list(range(len(fl_qs)))
+        if ctx["is_quote"] and 0 <= ctx["quote_ord"] < len(fl_qs) and ctx["total_en_quotes"] == len(fl_qs):
+            cand_q_indices = [ctx["quote_ord"]] + [i for i in range(len(fl_qs)) if i != ctx["quote_ord"]]
+
+        en_was_trimmed = bool(cmt_full_en) and (
+            len(_norm_en_phrase_key(en_q_inner).split()) + 1 < len(_norm_en_phrase_key(cmt_full_en).split())
+        )
+        fl_cits_all = find_post_quote_citation_spans(fl_txt)
+
+        for fqi in cand_q_indices:
+            fqo, fqis, fqie, fqc = fl_qs[fqi]
+            cand_fl_inner = _norm_inner_quote_cmp(fl_txt[fqis:fqie])
+            if not cand_fl_inner or len(cand_fl_inner) < 4:
+                continue
+            if cand_fl_inner not in norm_cmt_fl_inner:
+                continue
+            # If English quote was trimmed shorter than full English, Col 3 quote MUST also be trimmed shorter!
+            if en_was_trimmed and len(cand_fl_inner) >= len(norm_cmt_fl_inner):
+                return False, "excerpt_not_trimmed_in_col3"
+            # Check post-quote citation if both Col 2 and comment carry a citation
+            if ctx["citation"] and cmt_fl_cit:
+                adj_cit = next(((cs, ce) for cs, ce in fl_cits_all if 0 <= cs - fqc <= 4), None)
+                if adj_cit is None:
+                    return False, "excerpt_citation_missing"
+                if _norm_inner_quote_cmp(fl_txt[adj_cit[0] : adj_cit[1]]) != _norm_inner_quote_cmp(cmt_fl_cit):
+                    return False, "excerpt_citation_mismatch"
+            if not _check_fl_span_matches_expected_color(fl_txt, fl_cols, fqo, fqc, exp_col):
+                return False, "excerpt_color_mismatch"
+            return True, "excerpt_verified"
+
+        return False, "excerpt_mismatch"
+
+    # ------------------------------------------------------------------
+    # Type ③: English editorial instruction (`Needs to be consistent with...above` / `Please quote...above`)
+    # ------------------------------------------------------------------
+    has_non_ascii_letters = any(ord(c) > 127 and unicodedata.category(c).startswith("L") for c in cmt_raw)
+    if _ABOVE_CONSISTENCY_COMMENT_RE.search(cmt_raw):
+        if not en_q_inner:
+            return False, "above_anchor_empty"
+        cur_q_ord = ctx["quote_ord"] if ctx["is_quote"] else len(fl_qs)
+        mapped_fl_q_limit = (
+            cur_q_ord
+            if (ctx["is_quote"] and ctx["total_en_quotes"] == len(fl_qs))
+            else len(fl_qs)
+        )
+        above_ref = _find_above_reference_translation(
+            target_en_inner=en_q_inner,
+            prior_para_pairs=prior_para_pairs,
+            cur_en_prefix=en_txt[: ctx["span_start"]],
+            cur_fl_txt=fl_txt,
+            cur_fl_quote_limit_idx=mapped_fl_q_limit,
+        )
+        if above_ref is None:
+            return False, "above_ref_not_found"
+
+        ref_kind, ref_fl_text = above_ref
+        norm_ref_fl = _norm_inner_quote_cmp(ref_fl_text)
+        if not norm_ref_fl:
+            return False, "above_ref_empty"
+
+        # Determine search start in current `fl_txt` (after earlier quotes in the same paragraph if applicable)
+        fl_search_from = 0
+        if ctx["is_quote"] and 0 < cur_q_ord <= len(fl_qs) and ctx["total_en_quotes"] == len(fl_qs):
+            fl_search_from = fl_qs[cur_q_ord - 1][3]
+
+        if ref_kind == "exact_quote":
+            span = _find_quote_neutral_span(fl_txt, norm_ref_fl, start_pos=fl_search_from)
+            if span is None:
+                return False, "above_exact_quote_mismatch"
+            if not _check_fl_span_matches_expected_color(fl_txt, fl_cols, span[0], span[1], exp_col):
+                return False, "above_color_mismatch"
+            return True, "above_exact_verified"
+
+        # `super_quote`: current Col 3 quote must be a verbatim contiguous substring of `norm_ref_fl`
+        cand_indices = (
+            [cur_q_ord]
+            if (ctx["is_quote"] and 0 <= cur_q_ord < len(fl_qs) and ctx["total_en_quotes"] == len(fl_qs))
+            else [i for i in range(len(fl_qs)) if fl_qs[i][0] >= fl_search_from] or list(range(len(fl_qs)))
+        )
+        for fqi in cand_indices:
+            fqo, fqis, fqie, fqc = fl_qs[fqi]
+            cur_fl_q = _norm_inner_quote_cmp(fl_txt[fqis:fqie])
+            if len(cur_fl_q) >= 5 and cur_fl_q in norm_ref_fl:
+                if not _check_fl_span_matches_expected_color(fl_txt, fl_cols, fqo, fqc, exp_col):
+                    return False, "above_subquote_color_mismatch"
+                return True, "above_subquote_verified"
+        return False, "above_subquote_mismatch"
+
+    # Any other pure-ASCII English editorial instruction that is NOT a foreign-language reference -> retain safely!
+    if not has_non_ascii_letters and re.search(
+        r"\b(?:please|need|needs|check|verify|revise|modify|correct|note|should|must|translate|retranslate)\b",
+        cmt_raw,
+        re.I,
+    ):
+        return False, "custom_english_instruction_retained"
+
+    # ------------------------------------------------------------------
+    # Type ①: Direct Foreign Reference Text in Comment
+    # ------------------------------------------------------------------
+    span = _find_quote_neutral_span(fl_txt, cmt_raw, start_pos=0)
+    if span is None:
+        return False, "foreign_text_mismatch"
+    if not _check_fl_span_matches_expected_color(fl_txt, fl_cols, span[0], span[1], exp_col):
+        return False, "foreign_color_mismatch"
+    return True, "foreign_exact_verified"
+
+
+def _anchor_retained_comment_on_paragraph(p_el: ET.Element, span_start: int, span_end: int, new_cid: str) -> None:
+    """Insert `<w:commentRangeStart/> ... <w:commentRangeEnd/> <w:commentReference/>` cleanly onto `p_el`."""
+    full_t = _get_p_text(p_el)
+    n = len(full_t)
+    s0 = max(0, min(n, span_start))
+    s1 = max(s0, min(n, span_end if span_end > span_start else min(n, s0 + 1)))
+
+    if n == 0:
+        ppr = p_el.find(f"{W}pPr")
+        ins_i = 1 if (ppr is not None and len(p_el) > 0 and p_el[0] is ppr) else 0
+        p_el.insert(ins_i, ET.Element(f"{W}commentRangeStart", {f"{W}id": new_cid}))
+        p_el.append(ET.Element(f"{W}commentRangeEnd", {f"{W}id": new_cid}))
+        ref_r = ET.Element(f"{W}r")
+        ref_rpr = ET.SubElement(ref_r, f"{W}rPr")
+        ET.SubElement(ref_rpr, f"{W}rStyle", {f"{W}val": "CommentReference"})
+        ET.SubElement(ref_r, f"{W}commentReference", {f"{W}id": new_cid})
+        p_el.append(ref_r)
+        return
+
+    cuts = {c for c in (s0, s1) if 0 < c < n}
+    if cuts:
+        split_paragraph_runs_at_offsets(p_el, cuts)
+
+    # Locate child indices for s0 and s1
+    cur_off = 0
+    start_child_el = None
+    end_after_el = None
+    for ch in list(p_el):
+        if _local_tag(ch) != "r":
+            continue
+        r_txt = "".join(t.text or "" for t in ch.findall(f"{W}t"))
+        r_len = len(r_txt)
+        if start_child_el is None and cur_off + r_len > s0:
+            start_child_el = ch
+        if cur_off + r_len >= s1 and end_after_el is None:
+            end_after_el = ch
+        cur_off += r_len
+
+    children_now = list(p_el)
+    if start_child_el is not None and start_child_el in children_now:
+        idx_s = children_now.index(start_child_el)
+    else:
+        ppr = p_el.find(f"{W}pPr")
+        idx_s = 1 if (ppr is not None and len(children_now) > 0 and children_now[0] is ppr) else 0
+    p_el.insert(idx_s, ET.Element(f"{W}commentRangeStart", {f"{W}id": new_cid}))
+
+    children_now = list(p_el)
+    if end_after_el is not None and end_after_el in children_now:
+        idx_e = children_now.index(end_after_el) + 1
+    else:
+        idx_e = len(children_now)
+    p_el.insert(idx_e, ET.Element(f"{W}commentRangeEnd", {f"{W}id": new_cid}))
+    ref_r = ET.Element(f"{W}r")
+    ref_rpr = ET.SubElement(ref_r, f"{W}rPr")
+    ET.SubElement(ref_rpr, f"{W}rStyle", {f"{W}val": "CommentReference"})
+    ET.SubElement(ref_r, f"{W}commentReference", {f"{W}id": new_cid})
+    p_el.insert(idx_e + 1, ref_r)
+
+
+def verify_and_retain_fellowship_comments(
+    tbl: Optional[ET.Element],
+    comment_records: List[Dict],
+    prior_doc_para_pairs: List[Tuple[str, str]],
+    next_cid_start: int = 1,
+) -> Tuple[Optional[ET.Element], int, int, List[int], List[Tuple[str, str]], int]:
+    """
+    Verify all extracted comments in `tbl` after Col 3 styling/typography completes.
+    Deletes verified comments; re-anchors ONLY mismatched/uncertain comments onto `tbl` and builds `comments_root`.
+    Returns `(comments_root_or_None, verified_deleted_cnt, retained_cnt, retained_row_1based_list, updated_para_pairs, next_cid)`.
+    """
+    para_history = list(prior_doc_para_pairs)
+    if tbl is None:
+        return None, 0, 0, [], para_history, next_cid_start
+
+    trs = tbl.findall(f"{W}tr")
+    by_row: Dict[int, List[Dict]] = {}
+    for rec in comment_records:
+        by_row.setdefault(rec["row_idx"], []).append(rec)
+
+    verified_cnt = 0
+    retained_cnt = 0
+    retained_rows: List[int] = []
+    comments_root = docx_xml_utils.new_comments_root()
+    cur_cid = max(1, next_cid_start)
+
+    for r_idx, tr in enumerate(trs):
+        tcs = tr.findall(f"{W}tc")
+        if len(tcs) < 3:
+            continue
+        ps_en = tcs[1].findall(f"{W}p")
+        ps_fl = tcs[2].findall(f"{W}p")
+        row_recs = by_row.get(r_idx, [])
+
+        max_p = max(len(ps_en), len(ps_fl))
+        for p_i in range(max_p):
+            p_en = ps_en[p_i] if p_i < len(ps_en) else None
+            p_fl = ps_fl[p_i] if p_i < len(ps_fl) else (ps_fl[-1] if ps_fl else None)
+            en_txt, en_cols, _ = _extract_char_styles(p_en, include_red=True) if p_en is not None else ("", [], [])
+            fl_txt, fl_cols, _ = _extract_char_styles(p_fl, include_red=True) if p_fl is not None else ("", [], [])
+
+            p_recs = [rc for rc in row_recs if rc["p_idx"] == p_i]
+            for rc in p_recs:
+                ok, _reason = verify_single_fellowship_comment(
+                    rec=rc,
+                    en_txt=en_txt,
+                    en_cols=en_cols,
+                    fl_txt=fl_txt,
+                    fl_cols=fl_cols,
+                    prior_para_pairs=para_history,
+                )
+                if ok:
+                    verified_cnt += 1
+                else:
+                    retained_cnt += 1
+                    retained_rows.append(r_idx + 1)
+                    new_cid_str = str(cur_cid)
+                    cur_cid += 1
+                    target_tc = tcs[rc["col_idx"]] if 0 <= rc["col_idx"] < len(tcs) else tcs[1]
+                    target_ps = target_tc.findall(f"{W}p")
+                    target_p = target_ps[p_i] if p_i < len(target_ps) else (target_ps[-1] if target_ps else None)
+                    if target_p is not None:
+                        if rc["col_idx"] == 1:
+                            ctx_a = _expand_col2_anchor_context(en_txt, en_cols, rc["anchor_start"], rc["anchor_end"])
+                            a0, a1 = ctx_a["span_start"], ctx_a["span_end"]
+                        else:
+                            a0, a1 = rc["anchor_start"], rc["anchor_end"]
+                        _anchor_retained_comment_on_paragraph(target_p, a0, a1, new_cid_str)
+                        c_copy = docx_xml_utils.sanitize_comment_element(copy.deepcopy(rc["xml_el"]), int(new_cid_str))
+                        comments_root.append(c_copy)
+
+            if en_txt.strip() or fl_txt.strip():
+                para_history.append((en_txt, fl_txt))
+
+        # Handle any comment whose original p_idx exceeded len(ps_en)/len(ps_fl) safely by retaining on last paragraph
+        for rc in row_recs:
+            if rc["p_idx"] >= max_p and ps_en:
+                en_cell_txt = "\n".join(_get_p_text(p) for p in ps_en)
+                fl_cell_txt = "\n".join(_get_p_text(p) for p in ps_fl)
+                ok, _ = verify_single_fellowship_comment(
+                    rec=rc,
+                    en_txt=en_cell_txt,
+                    en_cols=["none"] * len(en_cell_txt),
+                    fl_txt=fl_cell_txt,
+                    fl_cols=["none"] * len(fl_cell_txt),
+                    prior_para_pairs=para_history,
+                )
+                if ok:
+                    verified_cnt += 1
+                else:
+                    retained_cnt += 1
+                    retained_rows.append(r_idx + 1)
+                    new_cid_str = str(cur_cid)
+                    cur_cid += 1
+                    _anchor_retained_comment_on_paragraph(ps_en[-1], 0, min(10, len(_get_p_text(ps_en[-1]))), new_cid_str)
+                    c_copy = docx_xml_utils.sanitize_comment_element(copy.deepcopy(rc["xml_el"]), int(new_cid_str))
+                    comments_root.append(c_copy)
+
+    if retained_cnt == 0:
+        return None, verified_cnt, 0, [], para_history, cur_cid
+    return comments_root, verified_cnt, retained_cnt, sorted(set(retained_rows)), para_history, cur_cid
+
+
 # ---------------- Step 8: Package I/O, Preview Inspection & Full Pipeline ----------------
 
 def write_cleaned_docx(
     src_docx: Path,
     dst_docx: Path,
     doc_root: ET.Element,
+    comments_root: Optional[ET.Element] = None,
 ):
     dst_docx.parent.mkdir(parents=True, exist_ok=True)
 
@@ -3823,6 +4715,7 @@ def write_cleaned_docx(
     tmp_path = Path(tmp_name)
     try:
         with zipfile.ZipFile(src_docx, "r") as zin, zipfile.ZipFile(tmp_path, "w", zipfile.ZIP_DEFLATED) as zout:
+            raw_rels: Optional[bytes] = None
             cleaned_rels_bytes: Optional[bytes] = None
             valid_rel_ids: Optional[Set[str]] = None
             if "word/_rels/document.xml.rels" in zin.namelist():
@@ -3830,6 +4723,20 @@ def write_cleaned_docx(
                 cleaned_rels_bytes, valid_rel_ids = strip_comment_and_people_rels_bytes(raw_rels)
 
             sanitize_fellowship_ooxml(doc_root, valid_rel_ids=valid_rel_ids)
+            eff_comments = docx_xml_utils.sanitize_document_ooxml(
+                doc_root,
+                comments_root,
+                valid_hyperlink_rids=docx_xml_utils._extract_valid_hyperlink_rids_from_rels_bytes(cleaned_rels_bytes or b""),
+                declared_ns_prefixes=set(COMMON_NAMESPACES.keys()),
+            )
+            has_active_comments = eff_comments is not None and len(eff_comments.findall(f"{W}comment")) > 0
+            comments_bytes = docx_xml_utils._serialize_comments_xml(eff_comments) if has_active_comments else None
+
+            if has_active_comments and raw_rels is not None:
+                cleaned_rels_bytes = docx_xml_utils._patch_document_rels_xml(
+                    raw_rels, ensure_comments_rel=True, keep_people=False
+                )
+
             for _pfx, _uri in COMMON_NAMESPACES.items():
                 ET.register_namespace(_pfx, _uri)
             doc_xml_body = ET.tostring(doc_root, encoding="unicode")
@@ -3844,11 +4751,11 @@ def write_cleaned_docx(
             ]
             has_emf = any(n.endswith(".emf") for n in kept_names_low)
             has_wmf = any(n.endswith(".wmf") for n in kept_names_low)
+            wrote_rels = False
 
             for item in zin.infolist():
                 fn = item.filename
                 fn_low = fn.replace("\\", "/").lower()
-                # Drop all comment XML parts, people.xml, embedded fonts, and thumbnail bloat
                 if (
                     fn_low.startswith("word/comments")
                     or fn_low == "word/people.xml"
@@ -3882,10 +4789,11 @@ def write_cleaned_docx(
                     )
                 elif fn_low == "word/_rels/document.xml.rels" and cleaned_rels_bytes is not None:
                     zout.writestr(zi, cleaned_rels_bytes, compress_type=zipfile.ZIP_DEFLATED)
+                    wrote_rels = True
                 elif fn_low == "[content_types].xml":
                     ct_slim = docx_xml_utils._patch_content_types_xml(
                         raw,
-                        ensure_comments_ct=False,
+                        ensure_comments_ct=has_active_comments,
                         keep_people=False,
                         has_emf_media=has_emf,
                         has_wmf_media=has_wmf,
@@ -3893,6 +4801,19 @@ def write_cleaned_docx(
                     zout.writestr(zi, ct_slim, compress_type=zipfile.ZIP_DEFLATED)
                 else:
                     zout.writestr(zi, raw, compress_type=zipfile.ZIP_DEFLATED)
+
+            if has_active_comments and comments_bytes is not None:
+                zout.writestr("word/comments.xml", comments_bytes, compress_type=zipfile.ZIP_DEFLATED)
+                if not wrote_rels:
+                    empty_rels = (
+                        f'<?xml version="1.0" encoding="UTF-8" standalone="yes"?>\r\n'
+                        f'<Relationships xmlns="{REL_PKG_NS}"/>'
+                    ).encode("utf-8")
+                    zout.writestr(
+                        "word/_rels/document.xml.rels",
+                        docx_xml_utils._patch_document_rels_xml(empty_rels, ensure_comments_rel=True, keep_people=False),
+                        compress_type=zipfile.ZIP_DEFLATED,
+                    )
         os.replace(str(tmp_path), str(dst_docx))
     except Exception:
         try:
@@ -3970,7 +4891,7 @@ def run_fellowship_pipeline(
     quote_mode: str = "auto",  # "auto", "curly", "skip"
     date_yyyymmdd: str = "",
     enable_ai_col3: bool = True,
-    sync_red: bool = False,
+    sync_red: bool = True,
     api_key=None,
     model: str = "gemini-3.5-flash-lite",
     api_mode: str = "auto",
@@ -4059,6 +4980,9 @@ def run_fellowship_pipeline(
 
     processed_docs: List[Dict] = []
     ai_failed_items: List[str] = []
+    retained_comment_summary: List[str] = []
+    prior_para_pairs: List[Tuple[str, str]] = []
+    global_next_cid = 1
     total_files = len(sorted_paths)
 
     for idx, src_p in enumerate(sorted_paths):
@@ -4069,11 +4993,12 @@ def run_fellowship_pipeline(
         validate_docx_archive(src_p)
         with zipfile.ZipFile(src_p, "r") as zf:
             doc_root = _parse_safe_xml_bytes(_read_zip_member_bounded(zf, "word/document.xml"))
+            raw_comments_dict = load_fellowship_comments_dict(zf)
 
         # 1. Unwrap <w:sdt> content controls
         sdt_n = unwrap_all_sdts(doc_root)
-        # 2. Accept track changes & strip comments + highlights
-        rev_n, cmt_n = accept_revisions_and_strip_comments(doc_root)
+        # 2. Accept track changes & strip highlights while keeping comment anchors temporarily for row-accurate extraction
+        rev_n, _ = accept_revisions_and_strip_comments(doc_root, strip_comments=False)
         # 3. Single-doc multi-part detection & internal table merge (Feedback #3)
         was_internally_merged, merged_extra_tbls = merge_internal_part_tables_in_body(
             doc_root, output_mode=output_mode
@@ -4096,6 +5021,10 @@ def run_fellowship_pipeline(
 
         # 6. Strip trailing spaces & trailing empty paragraphs at bottom of non-empty cells (Feedback #6)
         clean_table_trailing_spaces_and_empty_paragraphs(tbl)
+
+        # 6.5 Extract structured comment records on merged/cleaned `tbl`, then strip raw comment markers before run styling
+        extracted_cmts = extract_table_comment_records(tbl, raw_comments_dict)
+        cmt_n = strip_comment_markers_from_root(doc_root)
 
         # 7. Pre-capture Col 1 & Col 2 source citation hints (including original sz=21) BEFORE size overwrite
         cit_hints_map = capture_table_citation_hints(tbl)
@@ -4139,21 +5068,47 @@ def run_fellowship_pipeline(
             citation_hints_map=cit_hints_map,
         )
 
+        # 10.5 Verify comments against final Col 2 & Col 3 text + colors: delete consistent, retain mismatched!
+        (
+            retained_cmts_root,
+            verified_del_cnt,
+            retained_cmt_cnt,
+            retained_rows_1b,
+            prior_para_pairs,
+            global_next_cid,
+        ) = verify_and_retain_fellowship_comments(
+            tbl=tbl,
+            comment_records=extracted_cmts,
+            prior_doc_para_pairs=prior_para_pairs,
+            next_cid_start=global_next_cid,
+        )
+
         # 11. Strip staggered gridSpan props & balance 3-column widths
         w_tuple = balance_three_column_widths(doc_root, tbl, lang_typo=lang_typo)
 
         merge_note = f" | 文档内合并 {merged_extra_tbls + 1} 个part表" if was_internally_merged else ""
         font_note = f" | 外文字体 {lang_typo['font']}" if lang_typo.get("font") else ""
+        cmt_note = (
+            f"核对删批注 {verified_del_cnt} 条, 保留不一致批注 {retained_cmt_cnt} 条"
+            if extracted_cmts
+            else f"清修订 {rev_n} 处"
+        )
         log(
-            f"   ✓ 拆控件 {sdt_n} 处 | 清批注/修订 {cmt_n + rev_n} 处{merge_note} | "
+            f"   ✓ 拆控件 {sdt_n} 处 | {cmt_note}{merge_note} | "
             f"第3列样式同步(确定性 {sync_stats['tier1_synced']} 处, AI/本地 {sync_stats['ai_synced'] + sync_stats.get('local_fallback_synced', 0)} 段) | "
             f"摘自字号 {cit_cnt} 处{font_note} | 列宽 {w_tuple}"
         )
+        if retained_cmt_cnt > 0:
+            row_str = "、".join(str(r) for r in retained_rows_1b)
+            warn_line = f"{src_p.name}：第 {row_str} 行共保留 {retained_cmt_cnt} 条不一致批注待人工复核"
+            retained_comment_summary.append(warn_line)
+            log(f"   ⚠️ 批注待复核：{warn_line}")
 
         processed_docs.append(
             {
                 "src_path": src_p,
                 "root": doc_root,
+                "comments_root": retained_cmts_root,
                 "base_title": base_title,
                 "part_num": part_num,
                 "title_p": title_p,
@@ -4168,8 +5123,6 @@ def run_fellowship_pipeline(
     if output_mode in ("single_only", "both"):
         prog(84.0, "正在导出单篇整理定稿（修订模式：关闭）...")
         for item in processed_docs:
-            # When output_mode == 'both' and there is only 1 already-internally-merged file (part_num=None),
-            # defer to the merged output block so we don't write the identical filename twice.
             if output_mode == "both" and total_files == 1 and item["part_num"] is None:
                 continue
             out_name = build_fellowship_output_name(
@@ -4183,7 +5136,7 @@ def run_fellowship_pipeline(
                 set_clean_top_title_paragraph(item["title_p"], f"{item['base_title']}-{item['part_num']:02d}")
             else:
                 set_clean_top_title_paragraph(item["title_p"], item["base_title"])
-            write_cleaned_docx(item["src_path"], dst_p, item["root"])
+            write_cleaned_docx(item["src_path"], dst_p, item["root"], comments_root=item["comments_root"])
             saved_files.append(str(dst_p))
             saved_paths_seen.add(str(dst_p))
             log(f"✅ 已输出单篇：{dst_p.name}")
@@ -4192,6 +5145,10 @@ def run_fellowship_pipeline(
         prog(92.0, "正在按顺序合并总文档并全局均衡三列宽度...")
         first = processed_docs[0]
         merged_root = copy.deepcopy(first["root"])
+        merged_comments_root = docx_xml_utils.new_comments_root()
+        if first["comments_root"] is not None:
+            for c_el in first["comments_root"].findall(f"{W}comment"):
+                merged_comments_root.append(copy.deepcopy(c_el))
         enforce_landscape_page_setup(merged_root)
         merged_body = merged_root.find(f"{W}body")
         merged_title_p = merged_body.find(f"{W}p")
@@ -4205,6 +5162,12 @@ def run_fellowship_pipeline(
 
         for extra in processed_docs[1:]:
             _append_part_rows_into_table(merged_tbl, extra["tbl"], p1_headers, deep_copy=True)
+            if extra["comments_root"] is not None:
+                for c_el in extra["comments_root"].findall(f"{W}comment"):
+                    merged_comments_root.append(copy.deepcopy(c_el))
+
+        if len(merged_comments_root.findall(f"{W}comment")) == 0:
+            merged_comments_root = None
 
         merged_widths = balance_three_column_widths(merged_root, merged_tbl, lang_typo=lang_typo)
         total_merged_rows = len(merged_tbl.findall(f"{W}tr"))
@@ -4216,7 +5179,7 @@ def run_fellowship_pipeline(
             part_num=None,
         )
         merged_dst = out_dir_p / merged_name
-        write_cleaned_docx(first["src_path"], merged_dst, merged_root)
+        write_cleaned_docx(first["src_path"], merged_dst, merged_root, comments_root=merged_comments_root)
         if str(merged_dst) not in saved_paths_seen:
             saved_files.append(str(merged_dst))
             saved_paths_seen.add(str(merged_dst))
@@ -4229,4 +5192,5 @@ def run_fellowship_pipeline(
         "lang_code": resolved_code,
         "font": lang_typo.get("font", ""),
         "ai_failed_items": ai_failed_items,
+        "retained_comments": retained_comment_summary,
     }

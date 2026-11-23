@@ -83,6 +83,14 @@ TCPR_ORDER = [
 ]
 TCPR_RANK = {name: idx for idx, name in enumerate(TCPR_ORDER)}
 
+# Strict ECMA-376 CT_TrPr child tag order
+TRPR_ORDER = [
+    "cnfStyle", "divId", "gridBefore", "gridAfter", "wBefore", "wAfter",
+    "cantSplit", "trHeight", "tblHeader", "tblCellSpacing", "jc", "hidden",
+    "ins", "del", "trPrChange",
+]
+TRPR_RANK = {name: idx for idx, name in enumerate(TRPR_ORDER)}
+
 # Strict ECMA-376 CT_TblPr child tag order
 TBLPR_ORDER = [
     "tblStyle", "tblpPr", "tblOverlap", "bidiVisual", "tblStyleRowBandSize",
@@ -451,6 +459,10 @@ class MarkupIdAllocator:
             nid = self._next
             self._next += 1
             return nid
+
+    def allocate(self) -> int:
+        """Backward-compatible alias for `next_id()`."""
+        return self.next_id()
 
 
 # Backward-compatible alias
@@ -1515,10 +1527,185 @@ _STANDALONE_TRACK_CHANGE_TAGS = frozenset({
 })
 
 
-def sanitize_document_ooxml(root: ET.Element, comments_root: ET.Element = None):
+_WORD_EXT_NS_PREFIXES = (
+    "{http://schemas.microsoft.com/office/word/2010/",
+    "{http://schemas.microsoft.com/office/word/2012/",
+    "{http://schemas.microsoft.com/office/word/2015/",
+    "{http://schemas.microsoft.com/office/word/2016/",
+    "{http://schemas.microsoft.com/office/word/2018/",
+    "{http://schemas.microsoft.com/office/word/2020/",
+    "{http://schemas.microsoft.com/office/word/2023/",
+    "{http://schemas.microsoft.com/office/word/2024/",
+)
+_MC_URI = "http://schemas.openxmlformats.org/markup-compatibility/2006"
+_MC_IGNORABLE_ATTR = f"{{{_MC_URI}}}Ignorable"
+
+_PROP_CONTAINER_RANKS = {
+    "rPr": (RPR_RANK, True),
+    "pPr": (PPR_RANK, True),
+    "tcPr": (TCPR_RANK, True),
+    "trPr": (TRPR_RANK, True),
+    "tblPr": (TBLPR_RANK, True),
+    "sectPr": (SECTPR_RANK, False),
+}
+
+
+def _extract_valid_hyperlink_rids_from_rels_bytes(rels_bytes: bytes) -> set:
+    """Return set of Relationship Ids in `document.xml.rels` whose Type ends with `/hyperlink`."""
+    valid = set()
+    if not rels_bytes:
+        return valid
+    try:
+        _assert_safe_openxml_bytes(rels_bytes)
+        r_root = ET.fromstring(rels_bytes)
+        for rel in r_root:
+            if _local_name(rel.tag) == "Relationship":
+                rid = rel.attrib.get("Id", "").strip()
+                rtype = rel.attrib.get("Type", "").strip().lower()
+                if rid and rtype.endswith("/hyperlink"):
+                    valid.add(rid)
+    except Exception:
+        pass
+    return valid
+
+
+def _enforce_canonical_ooxml_structure(tree: ET.Element, valid_hyperlink_rids: set = None, is_comments_part: bool = False):
+    """
+    Eliminate structural causes of Word's 'unreadable content' dialog on `tree`:
+      - Strip Word 2010..2024 extension attributes (`w14:paraId`, `w15:*`, `w16cid:*`, etc.);
+      - Drop `<w:proofErr>`, `<w:permStart>`, `<w:permEnd>` and unwrap `<w:smartTag>` / `<w:customXml>`;
+      - Unwrap `<w:hyperlink>` elements whose `r:id` is missing/invalid (hoisting inner runs intact);
+      - Sort & deduplicate `<w:rPr>`, `<w:pPr>`, `<w:tcPr>`, `<w:trPr>`, `<w:tblPr>`, `<w:sectPr>` strictly by ECMA-376 rank;
+      - Ensure `<w:pPr>` is child 0 of `<w:p>`, `<w:tcPr>` is child 0 of `<w:tc>`, `<w:tc>` ends with `<w:p>`,
+        `<w:trPr>` is child 0 of `<w:tr>`, and `<w:tblPr>` / `<w:tblGrid>` lead `<w:tbl>`.
+    """
+    if tree is None:
+        return
+
+    for el in tree.iter():
+        for ak in list(el.attrib.keys()):
+            if ak.startswith(_WORD_EXT_NS_PREFIXES):
+                del el.attrib[ak]
+
+    if is_comments_part:
+        tree.attrib.pop(_MC_IGNORABLE_ATTR, None)
+
+    drop_tags = {"proofErr", "permStart", "permEnd"}
+    if is_comments_part:
+        drop_tags = drop_tags | {"drawing", "pict", "object"}
+    unwrap_tags = {"smartTag", "customXml"}
+    r_id_attr = f"{{{R_URI}}}id"
+    w_anchor_attr = f"{W}anchor"
+
+    changed = True
+    while changed:
+        changed = False
+        for parent in list(tree.iter()):
+            children = list(parent)
+            for idx, child in enumerate(children):
+                loc = _local_name(child.tag)
+                if loc in drop_tags:
+                    parent.remove(child)
+                    changed = True
+                    break
+                if loc in unwrap_tags:
+                    hoist = list(child)
+                    parent.remove(child)
+                    for off, sub in enumerate(hoist):
+                        parent.insert(idx + off, sub)
+                    changed = True
+                    break
+                if loc == "hyperlink":
+                    rid = child.attrib.get(r_id_attr, "").strip()
+                    anc = child.attrib.get(w_anchor_attr, "").strip()
+                    bad_hl = False
+                    if is_comments_part:
+                        if rid or not anc:
+                            bad_hl = True
+                    elif valid_hyperlink_rids is not None:
+                        if rid and rid not in valid_hyperlink_rids:
+                            bad_hl = True
+                        elif not rid and not anc:
+                            bad_hl = True
+                    else:
+                        if not rid and not anc:
+                            bad_hl = True
+                    if bad_hl:
+                        hoist = list(child)
+                        parent.remove(child)
+                        for off, sub in enumerate(hoist):
+                            parent.insert(idx + off, sub)
+                        changed = True
+                        break
+
+    # Sort property containers & enforce block/container ordering
+    for el in list(tree.iter()):
+        loc = _local_name(el.tag)
+        if loc in _PROP_CONTAINER_RANKS:
+            rank_map, dedup_singletons = _PROP_CONTAINER_RANKS[loc]
+            ch_list = list(el)
+            if len(ch_list) > 1:
+                if dedup_singletons:
+                    seen_locals = set()
+                    deduped_rev = []
+                    for ch in reversed(ch_list):
+                        cloc = _local_name(ch.tag)
+                        if cloc in rank_map:
+                            if cloc in seen_locals:
+                                continue
+                            seen_locals.add(cloc)
+                        deduped_rev.append(ch)
+                    ch_list = list(reversed(deduped_rev))
+                ordered = sorted(
+                    enumerate(ch_list),
+                    key=lambda pair: (rank_map.get(_local_name(pair[1].tag), 900), pair[0]),
+                )
+                new_seq = [c for _, c in ordered]
+                if new_seq != list(el):
+                    for old_c in list(el):
+                        el.remove(old_c)
+                    for new_c in new_seq:
+                        el.append(new_c)
+        elif loc == "p":
+            ppr = el.find(f"{W}pPr")
+            if ppr is not None and len(el) > 0 and el[0] is not ppr:
+                el.remove(ppr)
+                el.insert(0, ppr)
+        elif loc == "tr":
+            trpr = el.find(f"{W}trPr")
+            if trpr is not None and len(el) > 0 and el[0] is not trpr:
+                el.remove(trpr)
+                el.insert(0, trpr)
+        elif loc == "tc":
+            tcpr = el.find(f"{W}tcPr")
+            if tcpr is not None and len(el) > 0 and el[0] is not tcpr:
+                el.remove(tcpr)
+                el.insert(0, tcpr)
+            if len(el) == 0 or _local_name(el[-1].tag) != "p":
+                el.append(ET.Element(f"{W}p"))
+        elif loc == "tbl":
+            tblpr = el.find(f"{W}tblPr")
+            if tblpr is not None and len(el) > 0 and el[0] is not tblpr:
+                el.remove(tblpr)
+                el.insert(0, tblpr)
+            tblgrid = el.find(f"{W}tblGrid")
+            if tblgrid is not None:
+                want_idx = 1 if (tblpr is not None and len(el) > 0 and el[0] is tblpr) else 0
+                if list(el).index(tblgrid) != want_idx:
+                    el.remove(tblgrid)
+                    el.insert(want_idx, tblgrid)
+
+
+def sanitize_document_ooxml(
+    root: ET.Element,
+    comments_root: ET.Element = None,
+    valid_hyperlink_rids: set = None,
+    declared_ns_prefixes: set = None,
+):
     """
     Whole-document OOXML integrity pass run before saving any .docx:
-      1. Strip invalid (>= 0x80000000 or <= 0) or duplicate w14:paraId / w14:textId attributes.
+      1. Strip Word extension attributes, unwrap invalid `<w:hyperlink r:id>`, and enforce canonical
+         ECMA-376 child ordering (`CT_RPr`, `CT_PPr`, `CT_TcPr`, `CT_TrPr`, `CT_TblPr`, `CT_SectPr`).
       2. Remove orphaned, half-open, reversed, duplicate, or hidden/internal (`_*` such as `_GoBack`,
          `_Hlk*`, `_Toc*`, `_3dy6vkm`) w:bookmarkStart / w:bookmarkEnd elements.
       3. Repair/clean w:commentRangeStart / w:commentRangeEnd / w:commentReference in `root` and prune
@@ -1527,32 +1714,19 @@ def sanitize_document_ooxml(root: ET.Element, comments_root: ET.Element = None):
          ins, del, *PrChange, moveFrom/To), re-numbering any colliding bookmarks or revisions!
     Returns sanitized `comments_root` (or None).
     """
-    # 1. Clean w14:paraId / w14:textId across root and comments_root
-    seen_para_ids = set()
-    trees = [root] + ([comments_root] if comments_root is not None else [])
-    for tree in trees:
-        for elem in tree.iter():
-            for attr_k in list(elem.attrib.keys()):
-                aloc = _local_name(attr_k)
-                if aloc == "paraId":
-                    val = elem.attrib[attr_k].strip()
-                    try:
-                        iv = int(val, 16)
-                    except ValueError:
-                        iv = -1
-                    norm_hex = val.upper()
-                    if len(val) != 8 or iv <= 0 or iv >= 0x80000000 or norm_hex in seen_para_ids:
-                        del elem.attrib[attr_k]
-                    else:
-                        seen_para_ids.add(norm_hex)
-                elif aloc == "textId":
-                    val = elem.attrib[attr_k].strip()
-                    try:
-                        iv = int(val, 16)
-                    except ValueError:
-                        iv = -1
-                    if len(val) != 8 or iv <= 0 or iv >= 0x80000000:
-                        del elem.attrib[attr_k]
+    _enforce_canonical_ooxml_structure(root, valid_hyperlink_rids=valid_hyperlink_rids, is_comments_part=False)
+    if comments_root is not None:
+        _enforce_canonical_ooxml_structure(comments_root, valid_hyperlink_rids=set(), is_comments_part=True)
+
+    if _MC_IGNORABLE_ATTR in root.attrib:
+        if declared_ns_prefixes is not None:
+            kept_pfxs = [p for p in root.attrib[_MC_IGNORABLE_ATTR].split() if p in declared_ns_prefixes]
+            if kept_pfxs:
+                root.attrib[_MC_IGNORABLE_ATTR] = " ".join(kept_pfxs)
+            else:
+                del root.attrib[_MC_IGNORABLE_ATTR]
+        else:
+            del root.attrib[_MC_IGNORABLE_ATTR]
 
     # Build parent map for root
     parent_map = {child: parent for parent in root.iter() for child in parent}
@@ -2129,7 +2303,23 @@ def save_docx_xml(
     if comments_root is None:
         comments_root = load_docx_comments_xml(src_docx_path)
 
-    comments_root = sanitize_document_ooxml(root, comments_root)
+    valid_hl_rids = set()
+    try:
+        with zipfile.ZipFile(src_docx_path, "r") as _zpre:
+            if "word/_rels/document.xml.rels" in _zpre.namelist():
+                valid_hl_rids = _extract_valid_hyperlink_rids_from_rels_bytes(
+                    _zpre.read("word/_rels/document.xml.rels")
+                )
+    except Exception:
+        valid_hl_rids = set()
+
+    decl_pfxs = {pfx for pfx, _ in (ns_pairs or ()) if pfx}
+    comments_root = sanitize_document_ooxml(
+        root,
+        comments_root,
+        valid_hyperlink_rids=valid_hl_rids,
+        declared_ns_prefixes=decl_pfxs,
+    )
     has_active_comments = comments_root is not None and len(comments_root.findall(f"{W}comment")) > 0
 
     with _ET_NS_LOCK:
