@@ -477,7 +477,7 @@ def run_proofread_ingestion_pipeline(
         for lib_file in target_lib_files:
             before_copy = docx_xml_utils.safe_join_output_file(before_dir, lib_file.name)
             after_copy = docx_xml_utils.safe_join_output_file(after_dir, lib_file.name)
-            shutil.copy2(lib_file, before_copy)
+            docx_xml_utils.slim_docx_file(lib_file, before_copy)
             if log_fn:
                 log_fn(f"  [步骤 1] 已提取改前文档：{lib_file.name}")
 

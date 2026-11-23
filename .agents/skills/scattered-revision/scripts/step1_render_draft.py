@@ -433,7 +433,20 @@ def main():
             else:
                 shd_hex = reg["fill_hex"]
                 sents = reg["sentences"]
-                actions = [decisions.get(s["sent_id"], s["suggested_action"]) for s in sents]
+                actions = []
+                for s in sents:
+                    act = decisions.get(s["sent_id"], s["suggested_action"])
+                    if s.get("has_edit"):
+                        s_ratio = float(s.get("change_ratio", 0.0))
+                        s_consec = int(s.get("max_consec_eq_words", 99))
+                        s_hunks = int(s.get("edit_hunks", 1))
+                        # Hard guard 1: heavily shattered/rewritten sentence MUST be 'cyan' (RV)
+                        if (s_ratio >= 0.62 and s_consec <= 5) or (s_ratio >= 0.55 and s_hunks >= 5 and s_consec <= 4):
+                            act = "cyan"
+                        # Hard guard 2: light local edits (< 35% changed with intact >= 6-word clause) MUST stay 'yellow' (UP)
+                        elif s_ratio < 0.35 and s_consec >= 6 and act == "cyan":
+                            act = "yellow"
+                    actions.append(act)
 
                 # Item 8.4: Promote heavily fragmented whole paragraph/region to clean 'cyan' (RV)
                 if use_hl and should_promote_region_to_cyan(sents, actions, max_gap_words=max_gap_words):

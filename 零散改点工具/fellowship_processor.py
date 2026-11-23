@@ -40,11 +40,29 @@ import json
 import os
 from pathlib import Path
 import re
+import sys
 import tempfile
 from typing import Callable, Dict, List, Optional, Set, Tuple
 import unicodedata
 import xml.etree.ElementTree as ET
 import zipfile
+
+
+def _ensure_skill_scripts_fp():
+    candidates = []
+    if getattr(sys, "frozen", False) and hasattr(sys, "_MEIPASS"):
+        candidates.append(Path(sys._MEIPASS) / "skill_scripts")
+        candidates.append(Path(sys._MEIPASS))
+    here = Path(__file__).resolve().parent
+    candidates.append(here.parent / ".agents" / "skills" / "scattered-revision" / "scripts")
+    candidates.append(here / "skill_scripts")
+    for p in candidates:
+        if p.exists() and str(p) not in sys.path:
+            sys.path.insert(0, str(p))
+
+
+_ensure_skill_scripts_fp()
+import docx_xml_utils  # noqa: E402
 
 from ai_client import (
     ApiKeyPool,
@@ -2025,6 +2043,14 @@ def find_top_level_quotes(text: str, start: int = 0) -> List[Tuple[int, int, int
                     spans.append((i, i + 1, k, k + 1))
                     i = k + 1
                     continue
+                if ch == "“":
+                    # Fallback when translator opened with `“` and closed with straight `"`
+                    fb_close = text.find('"', i + 1)
+                    next_open = text.find("“", i + 1)
+                    if fb_close != -1 and (next_open == -1 or fb_close < next_open):
+                        spans.append((i, i + 1, fb_close, fb_close + 1))
+                        i = fb_close + 1
+                        continue
         i += 1
     return spans
 
@@ -2203,6 +2229,160 @@ def _apply_fl_pre_quote_introducer(
         out_bolds[k] = bool(intro_bd and not fl_txt[k].isspace() and k < b_end)
 
 
+def _col3_existing_violates_quote_bounds(
+    en_txt: str,
+    en_cols: List[str],
+    en_bds: List[bool],
+    en_start: int,
+    fl_txt: str,
+    fl_start: int,
+    work_cols: List[str],
+    work_bds: List[bool],
+) -> bool:
+    """Return True if Col 3's existing blue/bold bleeds outside quotes or only partially covers inner quotes."""
+    en_qs = find_top_level_quotes(en_txt, start=en_start)
+    fl_qs = find_top_level_quotes(fl_txt, start=fl_start)
+    if not en_qs or not fl_qs:
+        return False
+
+    en_cits = find_post_quote_citation_spans(en_txt)
+    fl_cits = find_post_quote_citation_spans(fl_txt)
+
+    def _is_word_ch(ch: str) -> bool:
+        return ch.isalnum() or unicodedata.category(ch).startswith("L")
+
+    en_word_idxs = [i for i in range(en_start, len(en_txt)) if _is_word_ch(en_txt[i])]
+    en_bd_words = [i for i in en_word_idxs if en_bds[i]]
+    en_bl_words = [i for i in en_word_idxs if en_cols[i] == "blue"]
+
+    en_bd_in_q = bool(en_bd_words) and all(any(qs <= i < qe for _, qs, qe, _ in en_qs) for i in en_bd_words)
+    en_bl_in_qc = bool(en_bl_words) and all(
+        any(qo <= i < qc for qo, _, _, qc in en_qs) or any(cs <= i < ce for cs, ce in en_cits)
+        for i in en_bl_words
+    )
+
+    for k in range(fl_start, len(fl_txt)):
+        if not _is_word_ch(fl_txt[k]):
+            continue
+        in_fq_inner = any(qs <= k < qe for _, qs, qe, _ in fl_qs)
+        in_fq_outer = any(qo <= k < qc for qo, _, _, qc in fl_qs)
+        in_fcit = any(cs <= k < ce for cs, ce in fl_cits)
+        if en_bd_in_q and work_bds[k] and not in_fq_inner:
+            return True
+        if en_bl_in_qc and work_cols[k] == "blue" and not (in_fq_outer or in_fcit):
+            return True
+
+    # Check partial inner coverage inside Col 3 quotes when Col 2 quotes are fully styled
+    for _, fqs, fqe, _ in fl_qs:
+        q_words = [k for k in range(fqs, fqe) if _is_word_ch(fl_txt[k])]
+        if not q_words:
+            continue
+        bl_cnt = sum(1 for k in q_words if work_cols[k] == "blue")
+        bd_cnt = sum(1 for k in q_words if work_bds[k])
+        if 0 < bl_cnt < len(q_words) or 0 < bd_cnt < len(q_words):
+            return True
+    return False
+
+
+def _enforce_quote_boundary_consistency(
+    en_txt: str,
+    en_cols: List[str],
+    en_bds: List[bool],
+    en_start: int,
+    fl_txt: str,
+    fl_start: int,
+    work_cols: List[str],
+    work_bds: List[bool],
+) -> None:
+    """
+    Post-alignment deterministic Quote-Boundary Clamping & Inner-Quote Completion:
+      1. When all bold in Col 2 sits strictly inside top-level quotes, strip ANY bold outside quotes in Col 3.
+      2. When all blue in Col 2 sits strictly inside top-level quotes (+ citations), strip ANY blue outside quotes/citations in Col 3.
+      3. When every styled quote in Col 2 is 100% uniformly styled inside `(q_in_s, q_in_e)`, promote any partially
+         matched Col 3 quote (`>= 20%` inner words styled) to 100% inner quote coverage so leading/trailing words
+         like `sangat` are never missed!
+    """
+    en_qs = find_top_level_quotes(en_txt, start=en_start)
+    fl_qs = find_top_level_quotes(fl_txt, start=fl_start)
+    if not en_qs or not fl_qs:
+        return
+
+    en_cits = find_post_quote_citation_spans(en_txt)
+    fl_cits = find_post_quote_citation_spans(fl_txt)
+
+    def _is_word_ch(ch: str) -> bool:
+        return ch.isalnum() or unicodedata.category(ch).startswith("L")
+
+    en_word_idxs = [i for i in range(en_start, len(en_txt)) if _is_word_ch(en_txt[i])]
+    en_bd_words = [i for i in en_word_idxs if en_bds[i]]
+    en_bl_words = [i for i in en_word_idxs if en_cols[i] == "blue"]
+
+    en_bd_strictly_in_q = bool(en_bd_words) and all(
+        any(qs <= i < qe for _, qs, qe, _ in en_qs) for i in en_bd_words
+    )
+    en_bl_strictly_in_qc = bool(en_bl_words) and all(
+        any(qo <= i < qc for qo, _, _, qc in en_qs) or any(cs <= i < ce for cs, ce in en_cits)
+        for i in en_bl_words
+    )
+
+    n_fl = len(fl_txt)
+    for k in range(fl_start, n_fl):
+        in_fq_inner = any(qs <= k < qe for _, qs, qe, _ in fl_qs)
+        in_fq_outer = any(qo <= k < qc for qo, _, _, qc in fl_qs)
+        in_fcit = any(cs <= k < ce for cs, ce in fl_cits) or (
+            fl_txt[k] in ".。։।" and k > fl_start and any(cs <= k - 1 < ce for cs, ce in fl_cits)
+        )
+        if en_bd_strictly_in_q and not in_fq_inner:
+            work_bds[k] = False
+        if en_bl_strictly_in_qc and work_cols[k] == "blue" and not (in_fq_outer or in_fcit):
+            work_cols[k] = "none"
+
+    # Check if every styled quote in Col 2 has uniform full-inner coverage (>= 85% of inner words)
+    en_quotes_full = True
+    en_any_styled_q = False
+    en_open_quote_blue = False
+    for qo, qs, qe, _ in en_qs:
+        qw = [i for i in range(qs, qe) if _is_word_ch(en_txt[i])]
+        if not qw:
+            continue
+        bl_n = sum(1 for i in qw if en_cols[i] == "blue")
+        bd_n = sum(1 for i in qw if en_bds[i])
+        if bl_n > 0 or bd_n > 0:
+            en_any_styled_q = True
+            if en_cols[qo] == "blue":
+                en_open_quote_blue = True
+            if (0 < bl_n < len(qw) * 0.85) or (0 < bd_n < len(qw) * 0.85):
+                en_quotes_full = False
+                break
+
+    if en_any_styled_q and en_quotes_full:
+        en_has_any_blue = bool(en_bl_words)
+        en_has_any_bold = bool(en_bd_words)
+        for fqo, fqs, fqe, fqc in fl_qs:
+            fqw = [k for k in range(fqs, fqe) if _is_word_ch(fl_txt[k])]
+            if not fqw:
+                continue
+            f_bl = sum(1 for k in fqw if work_cols[k] == "blue")
+            f_bd = sum(1 for k in fqw if work_bds[k])
+            if (f_bl / len(fqw)) >= 0.20 or (f_bd / len(fqw)) >= 0.20:
+                target_bl = (f_bl > 0) or (en_has_any_blue and en_bl_strictly_in_qc and f_bd > 0)
+                target_bd = (f_bd > 0) or (en_has_any_bold and en_bd_strictly_in_q and f_bl > 0)
+                b_s, b_e = fqs, fqe
+                while b_s < b_e and fl_txt[b_s].isspace():
+                    b_s += 1
+                while b_e > b_s and fl_txt[b_e - 1].isspace():
+                    b_e -= 1
+                for k in range(fqs, fqe):
+                    if target_bl and work_cols[k] != "red":
+                        work_cols[k] = "blue"
+                    work_bds[k] = bool(target_bd and (b_s <= k < b_e))
+                outer_c = "blue" if (target_bl and (en_open_quote_blue or work_cols[fqo] == "blue")) else work_cols[fqo]
+                for k in list(range(fqo, fqs)) + list(range(fqe, fqc)):
+                    if outer_c == "blue" and work_cols[k] != "red":
+                        work_cols[k] = "blue"
+                    work_bds[k] = False
+
+
 def _try_quote_pair_blue_bold_alignment(
     en_txt: str,
     en_colors: List[str],
@@ -2231,21 +2411,25 @@ def _try_quote_pair_blue_bold_alignment(
         return any(s0 <= idx < s1 for s0, s1 in sp_list)
 
     def _region_bb_uniform(s0: int, s1: int, skip_cits: bool = False) -> Optional[Tuple[str, bool]]:
-        seen: Set[Tuple[str, bool]] = set()
+        word_seen: Set[Tuple[str, bool]] = set()
+        any_seen: Set[Tuple[str, bool]] = set()
         for k in range(s0, s1):
-            if en_txt[k].isspace():
+            ch = en_txt[k]
+            if ch.isspace():
                 continue
             if skip_cits and _is_in_spans(k, en_cits):
                 continue
-            # Ignore external trailing period right after citation
-            if skip_cits and en_txt[k] in ".。" and k > s0 and _is_in_spans(k - 1, en_cits):
+            if skip_cits and ch in ".。" and k > s0 and _is_in_spans(k - 1, en_cits):
                 continue
             ck = "blue" if en_colors[k] == "blue" else "none"
-            seen.add((ck, en_bolds[k]))
-        if not seen:
+            any_seen.add((ck, en_bolds[k]))
+            if ch.isalnum() or unicodedata.category(ch).startswith("L"):
+                word_seen.add((ck, en_bolds[k]))
+        target_seen = word_seen if word_seen else any_seen
+        if not target_seen:
             return ("none", False)
-        if len(seen) == 1:
-            return next(iter(seen))
+        if len(target_seen) == 1:
+            return next(iter(target_seen))
         return None
 
     # Inspect each non-quote gap: allow either uniform `(col, bold)` OR 2-state `plain + pre-quote introducer`!
@@ -2879,6 +3063,9 @@ def sync_table_col3_blue_and_bold(
                 if (
                     (not en_rem_has_blue or fl_rem_has_blue)
                     and (not en_rem_has_bold or (fl_rem_has_bold and fl_bd_runs == en_bd_runs))
+                    and not _col3_existing_violates_quote_bounds(
+                        en_txt, en_cols, en_bds, en_rem_start, fl_txt, fl_rem_start, work_cols, work_bds
+                    )
                 ):
                     # Normalize outer quotes & post-quote citations locally
                     for k in range(fl_rem_start, n_fl):
@@ -2951,6 +3138,16 @@ def sync_table_col3_blue_and_bold(
                 )
                 if applied_local > 0:
                     local_fallback_synced += 1
+                _enforce_quote_boundary_consistency(
+                    task["en_txt"],
+                    task["en_cols"],
+                    task["en_bds"],
+                    task["en_rem_start"],
+                    task["fl_txt"],
+                    task["fl_rem_start"],
+                    task["work_cols"],
+                    task["work_bds"],
+                )
                 _write_char_styles_to_paragraph(task["p_fl"], task["work_cols"], task["work_bds"])
             if log_fn:
                 mode_note = "纯本地模式" if not enable_ai_col3 else "未填写 API Key"
@@ -2978,6 +3175,16 @@ def sync_table_col3_blue_and_bold(
                         )
                         if applied_local > 0:
                             local_fallback_synced += 1
+                        _enforce_quote_boundary_consistency(
+                            task["en_txt"],
+                            task["en_cols"],
+                            task["en_bds"],
+                            task["en_rem_start"],
+                            task["fl_txt"],
+                            task["fl_rem_start"],
+                            task["work_cols"],
+                            task["work_bds"],
+                        )
                         _write_char_styles_to_paragraph(task["p_fl"], task["work_cols"], task["work_bds"])
                     continue
 
@@ -3030,6 +3237,16 @@ def sync_table_col3_blue_and_bold(
                                 align_blue_bold=task["need_align_bb"],
                                 align_red=task["need_align_red"],
                             )
+                        _enforce_quote_boundary_consistency(
+                            task["en_txt"],
+                            task["en_cols"],
+                            task["en_bds"],
+                            task["en_rem_start"],
+                            task["fl_txt"],
+                            task["fl_rem_start"],
+                            task["work_cols"],
+                            task["work_bds"],
+                        )
                         _write_char_styles_to_paragraph(task["p_fl"], task["work_cols"], task["work_bds"])
                         if applied_n > 0:
                             ai_synced += 1
@@ -3055,6 +3272,16 @@ def sync_table_col3_blue_and_bold(
                         )
                         if applied_local > 0:
                             local_fallback_synced += 1
+                        _enforce_quote_boundary_consistency(
+                            task["en_txt"],
+                            task["en_cols"],
+                            task["en_bds"],
+                            task["en_rem_start"],
+                            task["fl_txt"],
+                            task["fl_rem_start"],
+                            task["work_cols"],
+                            task["work_bds"],
+                        )
                         _write_char_styles_to_paragraph(task["p_fl"], task["work_cols"], task["work_bds"])
 
     return {
@@ -3412,15 +3639,15 @@ def _solve_equal_height_widths(
         return total_loss + 0.35 * (tot_gap * tot_gap) / max(1, len(row_para_dxa))
 
     # Coarse grid search (step = 0.01) within readable column bounds:
-    # Col 1 Chinese: 18% .. 36% | Col 2 English: 21% .. 45% | Col 3 Foreign: 25% .. 58%
+    # Col 1 Chinese: 16% .. 38% | Col 2 English: 20% .. 48% | Col 3 Foreign: 22% .. 60%
     best_r1, best_r2 = 0.25, 0.36
     best_score = float("inf")
-    for i1 in range(18, 37):
+    for i1 in range(16, 39):
         r1 = i1 / 100.0
-        for i2 in range(21, 46):
+        for i2 in range(20, 49):
             r2 = i2 / 100.0
             r3 = 1.0 - r1 - r2
-            if r3 < 0.25 or r3 > 0.58:
+            if r3 < 0.22 or r3 > 0.60:
                 continue
             sc = _loss(r1, r2)
             if sc < best_score:
@@ -3430,12 +3657,12 @@ def _solve_equal_height_widths(
     # Fine local refinement (step = 0.0025)
     for d1 in range(-4, 5):
         r1 = best_r1 + d1 * 0.0025
-        if not (0.18 <= r1 <= 0.36):
+        if not (0.16 <= r1 <= 0.38):
             continue
         for d2 in range(-4, 5):
             r2 = best_r2 + d2 * 0.0025
             r3 = 1.0 - r1 - r2
-            if not (0.21 <= r2 <= 0.45 and 0.25 <= r3 <= 0.58):
+            if not (0.20 <= r2 <= 0.48 and 0.22 <= r3 <= 0.60):
                 continue
             sc = _loss(r1, r2)
             if sc < best_score:
@@ -3569,6 +3796,8 @@ def balance_three_column_widths(
                 if tcPr is None:
                     tcPr = ET.Element(f"{W}tcPr")
                     tc.insert(0, tcPr)
+                for nw in list(tcPr.findall(f"{W}noWrap")):
+                    tcPr.remove(nw)
                 tcW = tcPr.find(f"{W}tcW")
                 if tcW is None:
                     tcW = ET.Element(f"{W}tcW")
@@ -3606,26 +3835,64 @@ def write_cleaned_docx(
             doc_xml_body = ET.tostring(doc_root, encoding="unicode")
             doc_bytes = ('<?xml version="1.0" encoding="UTF-8" standalone="yes"?>\r\n' + doc_xml_body).encode("utf-8")
 
+            kept_names_low = [
+                it.filename.replace("\\", "/").lower()
+                for it in zin.infolist()
+                if not docx_xml_utils._is_slimmed_bloat_member(it.filename)
+                and not it.filename.replace("\\", "/").lower().startswith("word/comments")
+                and it.filename.replace("\\", "/").lower() != "word/people.xml"
+            ]
+            has_emf = any(n.endswith(".emf") for n in kept_names_low)
+            has_wmf = any(n.endswith(".wmf") for n in kept_names_low)
+
             for item in zin.infolist():
                 fn = item.filename
                 fn_low = fn.replace("\\", "/").lower()
-                # Drop all comment XML parts AND people.xml so zero dangling references remain
-                if fn_low.startswith("word/comments") or fn_low == "word/people.xml":
+                # Drop all comment XML parts, people.xml, embedded fonts, and thumbnail bloat
+                if (
+                    fn_low.startswith("word/comments")
+                    or fn_low == "word/people.xml"
+                    or docx_xml_utils._is_slimmed_bloat_member(fn)
+                ):
                     continue
 
-                if fn == "word/document.xml":
-                    zout.writestr(item, doc_bytes)
+                zi = docx_xml_utils._clone_deflated_zipinfo(item)
+                if fn_low == "word/document.xml":
+                    zout.writestr(zi, doc_bytes, compress_type=zipfile.ZIP_DEFLATED)
                     continue
 
                 raw = _read_zip_member_bounded(zin, item)
-                if fn == "word/settings.xml":
-                    zout.writestr(item, disable_track_revisions_in_settings_xml(raw))
-                elif fn == "word/_rels/document.xml.rels" and cleaned_rels_bytes is not None:
-                    zout.writestr(item, cleaned_rels_bytes)
-                elif fn == "[Content_Types].xml":
-                    zout.writestr(item, strip_comment_and_people_content_types_bytes(raw))
+                if fn_low == "word/settings.xml":
+                    zout.writestr(
+                        zi,
+                        docx_xml_utils._slim_settings_xml(raw, disable_track_revisions=True),
+                        compress_type=zipfile.ZIP_DEFLATED,
+                    )
+                elif fn_low == "word/fonttable.xml":
+                    zout.writestr(
+                        zi,
+                        docx_xml_utils._slim_font_table_xml(raw),
+                        compress_type=zipfile.ZIP_DEFLATED,
+                    )
+                elif fn_low == "_rels/.rels":
+                    zout.writestr(
+                        zi,
+                        docx_xml_utils._slim_root_rels_xml(raw),
+                        compress_type=zipfile.ZIP_DEFLATED,
+                    )
+                elif fn_low == "word/_rels/document.xml.rels" and cleaned_rels_bytes is not None:
+                    zout.writestr(zi, cleaned_rels_bytes, compress_type=zipfile.ZIP_DEFLATED)
+                elif fn_low == "[content_types].xml":
+                    ct_slim = docx_xml_utils._patch_content_types_xml(
+                        raw,
+                        ensure_comments_ct=False,
+                        keep_people=False,
+                        has_emf_media=has_emf,
+                        has_wmf_media=has_wmf,
+                    )
+                    zout.writestr(zi, ct_slim, compress_type=zipfile.ZIP_DEFLATED)
                 else:
-                    zout.writestr(item, raw)
+                    zout.writestr(zi, raw, compress_type=zipfile.ZIP_DEFLATED)
         os.replace(str(tmp_path), str(dst_docx))
     except Exception:
         try:

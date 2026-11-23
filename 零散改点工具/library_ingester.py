@@ -799,36 +799,15 @@ def save_docx_without_track_revisions_flag(
     ns_pairs: Sequence[Tuple[str, str]],
     comments_root: Optional[ET.Element] = None,
 ) -> None:
-    """Save `.docx` and disable `<w:trackRevisions/>` inside `word/settings.xml` (turn off revision mode)."""
-    docx_xml_utils.save_docx_xml(src_path, dst_path, root, ns_pairs, comments_root=comments_root)
-    # Strip <w:trackRevisions/> from word/settings.xml if present
-    tmp_path = dst_path.with_suffix(".tmp_clean.docx")
-    changed_settings = False
-    with zipfile.ZipFile(dst_path, "r") as zin:
-        if "word/settings.xml" in zin.namelist():
-            s_bytes = docx_xml_utils.read_docx_member_bounded(zin, "word/settings.xml")
-            s_root = docx_xml_utils.parse_safe_openxml_bytes(s_bytes)
-            tr_els = list(s_root.findall("w:trackRevisions", NS))
-            if tr_els:
-                for tr_el in tr_els:
-                    s_root.remove(tr_el)
-                changed_settings = True
-                with docx_xml_utils._ET_NS_LOCK:
-                    ET.register_namespace("w", W_URI)
-                    new_s_bytes = (
-                        '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>\r\n'
-                        + ET.tostring(s_root, encoding="unicode")
-                    ).encode("utf-8")
-                with zipfile.ZipFile(tmp_path, "w", zipfile.ZIP_DEFLATED) as zout:
-                    for item in zin.infolist():
-                        if item.filename == "word/settings.xml":
-                            zout.writestr(item, new_s_bytes)
-                        else:
-                            zout.writestr(item, zin.read(item.filename))
-    if changed_settings and tmp_path.is_file():
-        os.replace(tmp_path, dst_path)
-    elif tmp_path.exists():
-        tmp_path.unlink(missing_ok=True)
+    """Save `.docx`, slim embedded fonts/thumbnails, and disable `<w:trackRevisions/>` inside `word/settings.xml`."""
+    docx_xml_utils.save_docx_xml(
+        src_path,
+        dst_path,
+        root,
+        ns_pairs,
+        comments_root=comments_root,
+        disable_track_revisions=True,
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -1719,9 +1698,9 @@ def run_library_ingestion_pipeline(
                 55.0 + (c_idx / max(1, len(lib_files_sorted))) * 38.0,
                 f"正在回写篇目 [{c_idx + 1}/{len(lib_files_sorted)}]：{lib_file.name}",
             )
-        # 1. Exact verbatim copy to `改前/` (NEVER touch `lib_file`!)
+        # 1. Losslessly slimmed copy to `改前/` (NEVER touch `lib_file`!)
         before_copy = docx_xml_utils.safe_join_output_file(before_dir, lib_file.name)
-        shutil.copy2(lib_file, before_copy)
+        docx_xml_utils.slim_docx_file(lib_file, before_copy)
 
         # 2. Load from `before_copy` to produce `改后/` (exact original filename & date!)
         after_copy = docx_xml_utils.safe_join_output_file(after_dir, lib_file.name)

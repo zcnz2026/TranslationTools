@@ -57,6 +57,7 @@ from word_counter import (  # noqa: E402
     extract_full_article_en_title,
     format_counted_docx_name,
     is_top_highlight_instruction_text,
+    parse_doc_filename,
     update_top_highlight_instruction_lines,
 )
 
@@ -1105,7 +1106,7 @@ def _export_master_article_backup_docx(article: dict, dst_docx_path: Path) -> Pa
     dst_docx_path.parent.mkdir(parents=True, exist_ok=True)
     body_range = article.get("body_range")
     if not article.get("is_multi_article") or not isinstance(body_range, (list, tuple)) or len(body_range) != 2:
-        shutil.copy2(master_p, dst_docx_path)
+        docx_xml_utils.slim_docx_file(master_p, dst_docx_path)
         return dst_docx_path
 
     root, _, ns_pairs = docx_xml_utils.load_docx_xml(master_p)
@@ -1254,7 +1255,8 @@ def _repair_skipped_title_rows_in_manifest(
                         _, src_cn_core = split_title_prefix_and_core(docx_xml_utils.get_cell_plain_text(s_tcs[0]))
                         inp_cn = _WS_RE.sub("", inp_cn_core or docx_xml_utils.get_cell_plain_text(inp_tcs[0]))
                         src_cn = _WS_RE.sub("", src_cn_core or docx_xml_utils.get_cell_plain_text(s_tcs[0]))
-                        if inp_cn and (inp_cn == src_cn or inp_cn in src_cn or src_cn in inp_cn):
+                        same_appendix_r0 = (r_idx == 0 and inp_cn.startswith("附篇") and src_cn.startswith("附篇"))
+                        if inp_cn and (inp_cn == src_cn or inp_cn in src_cn or src_cn in inp_cn or same_appendix_r0):
                             inp_en = docx_xml_utils.get_cell_plain_text(inp_tcs[1])
                             src_en = docx_xml_utils.get_cell_plain_text(s_tcs[1])
                             ops = docx_xml_utils.diff_tokens(src_en, inp_en)
@@ -1417,13 +1419,12 @@ def _filter_full_article_to_translator_version(
     def _title_row_count(trs: List[ET.Element]) -> int:
         if not trs:
             return 0
+        if docx_xml_utils.is_two_row_chapter_header(trs):
+            return 3 if (len(trs) >= 3 and _is_blank_row(trs[2])) else 2
         tcs0 = trs[0].findall("w:tc", NS)
         cn0 = docx_xml_utils.get_cell_plain_text(tcs0[0]).strip() if tcs0 else ""
-        en0 = docx_xml_utils.get_cell_plain_text(tcs0[1]).strip() if len(tcs0) >= 2 else ""
-        if len(trs) >= 3 and _is_blank_row(trs[2]) and (en0.endswith(":") or cn0.startswith("附篇")):
-            return 2
         if len(trs) >= 2 and _is_blank_row(trs[1]):
-            return 1
+            return 2
         if len(cn0) <= 60 and (
             (tcs0 and tcs0[0].find(".//w:b", NS) is not None)
             or (len(tcs0) >= 2 and tcs0[1].find(".//w:b", NS) is not None)
@@ -1760,19 +1761,13 @@ def run_full_article_pipeline(
     step2_native_v17 = supports_no_bal and callable(getattr(docx_xml_utils, "format_up_rv_count_tag", None))
 
     total_arts = len(articles_list)
-    use_subfolders = total_arts >= 2
-    if use_subfolders:
-        trans_out_dir = out_d / "给译者版"
-        full_out_dir = out_d / "完整留底版"
-        master_pkg_dir = out_d / "中英最新底稿包"
-        foreign_raw_pkg_dir = out_d / "外文三语原稿包"
-        for sub_d in (trans_out_dir, full_out_dir, master_pkg_dir, foreign_raw_pkg_dir):
-            sub_d.mkdir(parents=True, exist_ok=True)
-    else:
-        trans_out_dir = out_d
-        full_out_dir = out_d
-        master_pkg_dir = out_d
-        foreign_raw_pkg_dir = out_d
+    use_subfolders = True
+    trans_out_dir = out_d / "给译者版"
+    full_out_dir = out_d / "完整留底版"
+    master_pkg_dir = out_d / "中英最新底稿包"
+    foreign_raw_pkg_dir = out_d / "外文三语原稿包"
+    for sub_d in (trans_out_dir, full_out_dir, master_pkg_dir, foreign_raw_pkg_dir):
+        sub_d.mkdir(parents=True, exist_ok=True)
 
     saved_files: List[str] = []
     article_results: List[dict] = []
@@ -1813,9 +1808,11 @@ def run_full_article_pipeline(
                 query_prefix, _ = split_title_prefix_and_core(str(art["query"]))
 
             if is_direct_mode:
-                raw_label = str(art.get("naming_stem") or Path(art["master_file"]).stem).strip()
+                raw_stem = str(art.get("naming_stem") or Path(art["master_file"]).stem).strip()
+                raw_label = parse_doc_filename(raw_stem, strip_draft_prefix=True)["orig_name"]
             else:
-                raw_label = f"{query_prefix}_{en_title}" if query_prefix else en_title
+                clean_en_title = parse_doc_filename(en_title, strip_draft_prefix=True)["orig_name"] if en_title else en_title
+                raw_label = f"{query_prefix}_{clean_en_title}" if query_prefix else clean_en_title
                 et_lookup = f"{query_prefix.lower()}_{en_title.strip().lower()}" if query_prefix else en_title.strip().lower()
                 if en_title_counts.get(et_lookup, 0) > 1:
                     sec_tag = str(art.get("section_path") or "").split("›")[-1].strip()
@@ -2011,8 +2008,8 @@ def run_full_article_pipeline(
             alignments_path = workdir / "step2_alignments.json"
             alignments_path.write_text(json.dumps(alignments, ensure_ascii=False, indent=2), encoding="utf-8")
 
-            # 4A. Deliverable 1: 整篇完整留底版 `{LANG}_{DOC_LABEL}_完整版_{COUNT_TAG}_{DATE}.docx`
-            full_label = f"{doc_label}_完整版"
+            # 4A. Deliverable 1: 整篇完整留底版 `{LANG}_{DOC_LABEL}_{COUNT_TAG}_{DATE}.docx` (inside `完整留底版/`)
+            full_label = doc_label
             argv_full = [
                 "step2_render_final.py",
                 "--tasks", str(tasks_path),

@@ -20,6 +20,7 @@ from docx_xml_utils import (
     format_up_rv_count_tag,
     get_cell_plain_text,
     insert_rpr_child_ordered,
+    is_two_row_chapter_header,
     load_config,
     load_docx_xml,
     make_run,
@@ -217,7 +218,11 @@ def filter_tables_in_body(
             header_idxs = set()
             if keep_first_title_row and len(rem_trs) >= 1:
                 header_idxs.add(0)
-                if len(rem_trs) >= 2 and _is_blank_row(rem_trs[1], active_hl_vals):
+                if is_two_row_chapter_header(rem_trs):
+                    header_idxs.add(1)
+                    if len(rem_trs) >= 3 and _is_blank_row(rem_trs[2], active_hl_vals):
+                        header_idxs.add(2)
+                elif len(rem_trs) >= 2 and _is_blank_row(rem_trs[1], active_hl_vals):
                     header_idxs.add(1)
 
             if keep_changed:
@@ -430,6 +435,7 @@ def main():
             tcs = tr.findall("w:tc", NS)
             if tcs:
                 accept_all_revisions_in_cell(tcs[0])
+                strip_all_highlights_in_cell(tcs[0])
             if not use_hl:
                 for tc_c in tcs:
                     strip_all_highlights_in_cell(tc_c)
@@ -442,7 +448,7 @@ def main():
                 else:
                     normalize_rv_highlights_in_col2(tcs[1], target_rv_color=col2_rv)
 
-    # 2. Apply Col 1 Chinese highlights (yellow=UP, cyan=RV) & Col 3 Foreign highlights (yellow=UP, lightGray=RV)
+    # 2. Apply Col 1 Chinese single underline (`u:single`) & Col 3 Foreign (`shd:D9EEF7` for UP, `lightGray` for RV)
     unmatched = []
     matched_count = 0
     if use_hl:
@@ -458,7 +464,7 @@ def main():
 
             if rt.get("is_full_cell_rv"):
                 if highlight_col1:
-                    c1_full = _full_nonws_char_spans(col1_text, col2_rv)
+                    c1_full = _full_nonws_char_spans(col1_text, "u:single")
                     apply_highlights_to_col3_cell(tc1, c1_full)
                 c3_full = _full_nonws_char_spans(col3_text, col3_rv)
                 apply_highlights_to_col3_cell(tc3, c3_full)
@@ -481,9 +487,9 @@ def main():
                     col1_target = ""
                     col3_target = str(entry or "")
 
-                # Synchronous Col 1 Chinese highlight (yellow for 'up', cyan for 'rv') — only when highlight_col1 is enabled
+                # Synchronous Col 1 Chinese single underline (never yellow/cyan highlight) when highlight_col1 is enabled
                 if highlight_col1 and col1_text.strip():
-                    hl_c1 = col2_rv if sp["type"] == "rv" else col2_up
+                    hl_c1 = "u:single"
                     loc1 = (
                         find_fuzzy_substring_span(col1_text, col1_target, search_from=col1_cursor)
                         if col1_target.strip()

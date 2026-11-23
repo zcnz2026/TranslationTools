@@ -3,6 +3,7 @@ import difflib
 import json
 import re
 import threading
+import unicodedata
 import zipfile
 import xml.etree.ElementTree as ET
 from datetime import datetime, timezone
@@ -1815,8 +1816,136 @@ def _patch_document_rels_xml(rels_bytes: bytes, ensure_comments_rel: bool, keep_
     return "".join(parts).encode("utf-8")
 
 
-def _patch_content_types_xml(ct_bytes: bytes, ensure_comments_ct: bool, keep_people: bool = False) -> bytes:
-    """Update [Content_Types].xml: strip extended comment / orphaned people overrides and sync /word/comments.xml Override."""
+def _clone_deflated_zipinfo(item: zipfile.ZipInfo) -> zipfile.ZipInfo:
+    """Clone ZipInfo forcing ZIP_DEFLATED so previously ZIP_STORED members are compressed."""
+    zi = zipfile.ZipInfo(filename=item.filename, date_time=item.date_time)
+    zi.compress_type = zipfile.ZIP_DEFLATED
+    zi.create_system = item.create_system
+    zi.external_attr = item.external_attr
+    zi.flag_bits = item.flag_bits & ~0x08
+    return zi
+
+
+def _is_slimmed_bloat_member(norm_name: str) -> bool:
+    """Return True if a ZIP entry is embedded font data or thumbnail bloat to strip."""
+    low = norm_name.replace("\\", "/").lower()
+    if low.startswith("word/fonts/"):
+        return True
+    if low == "word/_rels/fonttable.xml.rels":
+        return True
+    if low.startswith("docprops/thumbnail."):
+        return True
+    return False
+
+
+def _serialize_xml_preserving_root_ns(root: ET.Element, orig_bytes: bytes) -> bytes:
+    """Serialize `root` while preserving all original `xmlns:*` declarations on the root tag for `mc:Ignorable`."""
+    orig_text = orig_bytes.decode("utf-8", errors="replace")
+    orig_open_m = re.search(r"<([A-Za-z0-9_.:-]+)\b([^>]*?)(/?)>", orig_text)
+    orig_decls = []
+    if orig_open_m:
+        for dm in re.finditer(r'\bxmlns(?::([A-Za-z0-9_.-]+))?\s*=\s*("[^"]*"|\'[^\']*\')', orig_open_m.group(2)):
+            orig_decls.append((dm.group(1) or "", dm.group(0), dm.group(2)[1:-1]))
+
+    with _ET_NS_LOCK:
+        for pfx, _, uri in orig_decls:
+            if pfx != "xml":
+                ET.register_namespace(pfx, uri)
+        ET.register_namespace("w", W_URI)
+        ET.register_namespace("r", R_URI)
+        xml_str = ET.tostring(root, encoding="unicode")
+
+    m = re.match(r"<([A-Za-z0-9_.:-]+)\b([^>]*?)(/?)>", xml_str)
+    if m and orig_decls:
+        cur_open = m.group(0)
+        missing = []
+        for pfx, full_decl, _ in orig_decls:
+            needle = f"xmlns:{pfx}=" if pfx else "xmlns="
+            if not re.search(r"(?:^|\s)" + re.escape(needle), cur_open):
+                missing.append(full_decl)
+        if missing:
+            if cur_open.endswith("/>"):
+                patched_open = cur_open[:-2] + " " + " ".join(missing) + "/>"
+            else:
+                patched_open = cur_open[:-1] + " " + " ".join(missing) + ">"
+            xml_str = patched_open + xml_str[m.end():]
+
+    return ('<?xml version="1.0" encoding="UTF-8" standalone="yes"?>\r\n' + xml_str).encode("utf-8")
+
+
+_FONT_EMBED_LOCAL_TAGS = frozenset({"embedRegular", "embedBold", "embedItalic", "embedBoldItalic"})
+_SETTINGS_SLIM_LOCAL_TAGS = frozenset({"embedTrueTypeFonts", "saveSubsetFonts", "embedSystemFonts", "rsids"})
+
+
+def _slim_font_table_xml(raw_bytes: bytes) -> bytes:
+    """Strip embedded font references (<w:embedRegular|Bold|Italic|BoldItalic>) from word/fontTable.xml."""
+    _assert_safe_openxml_bytes(raw_bytes)
+    ft_root = ET.fromstring(raw_bytes)
+    changed = False
+    for font_el in ft_root.iter():
+        if _local_name(font_el.tag) == "font":
+            for ch in list(font_el):
+                if _local_name(ch.tag) in _FONT_EMBED_LOCAL_TAGS:
+                    font_el.remove(ch)
+                    changed = True
+    if not changed:
+        return raw_bytes
+    return _serialize_xml_preserving_root_ns(ft_root, raw_bytes)
+
+
+def _slim_settings_xml(raw_bytes: bytes, disable_track_revisions: bool = False) -> bytes:
+    """Strip font-embedding flags & <w:rsids> (and optionally <w:trackRevisions>) from word/settings.xml."""
+    _assert_safe_openxml_bytes(raw_bytes)
+    s_root = ET.fromstring(raw_bytes)
+    changed = False
+    target_tags = set(_SETTINGS_SLIM_LOCAL_TAGS)
+    if disable_track_revisions:
+        target_tags.add("trackRevisions")
+    for ch in list(s_root):
+        if _local_name(ch.tag) in target_tags:
+            s_root.remove(ch)
+            changed = True
+    if not changed:
+        return raw_bytes
+    return _serialize_xml_preserving_root_ns(s_root, raw_bytes)
+
+
+def _slim_root_rels_xml(raw_bytes: bytes) -> bytes:
+    """Strip docProps/thumbnail relationship from _rels/.rels."""
+    _assert_safe_openxml_bytes(raw_bytes)
+    r_root = ET.fromstring(raw_bytes)
+    kept = []
+    changed = False
+    for rel in list(r_root):
+        if _local_name(rel.tag) != "Relationship":
+            continue
+        target_low = rel.attrib.get("Target", "").strip().replace("\\", "/").lstrip("/").lower()
+        rtype_low = rel.attrib.get("Type", "").strip().lower()
+        if target_low.startswith("docprops/thumbnail.") or rtype_low.endswith("/thumbnail"):
+            changed = True
+            continue
+        kept.append(rel)
+    if not changed:
+        return raw_bytes
+    parts = [
+        '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>\r\n',
+        f'<Relationships xmlns="{PKG_REL_URI}">',
+    ]
+    for rel in kept:
+        attr_str = " ".join(f"{_local_name(k)}={quoteattr(v)}" for k, v in rel.attrib.items())
+        parts.append(f"<Relationship {attr_str}/>")
+    parts.append("</Relationships>")
+    return "".join(parts).encode("utf-8")
+
+
+def _patch_content_types_xml(
+    ct_bytes: bytes,
+    ensure_comments_ct: bool,
+    keep_people: bool = False,
+    has_emf_media: bool = True,
+    has_wmf_media: bool = True,
+) -> bytes:
+    """Update [Content_Types].xml: strip embedded-font/thumbnail/comment/people bloat and sync /word/comments.xml."""
     _assert_safe_openxml_bytes(ct_bytes)
     ct_root = ET.fromstring(ct_bytes)
     defaults = []
@@ -1826,6 +1955,16 @@ def _patch_content_types_xml(ct_bytes: bytes, ensure_comments_ct: bool, keep_peo
     for ch in list(ct_root):
         loc = _local_name(ch.tag)
         if loc == "Default":
+            ext_low = ch.attrib.get("Extension", "").strip().lower()
+            ctype_low = ch.attrib.get("ContentType", "").strip().lower()
+            if ext_low == "odttf" or "obfuscatedfont" in ctype_low:
+                continue
+            if ext_low in ("ttf", "otf") and "font" in ctype_low:
+                continue
+            if ext_low == "emf" and not has_emf_media:
+                continue
+            if ext_low == "wmf" and not has_wmf_media:
+                continue
             defaults.append(ch)
         elif loc == "Override":
             pname = ch.attrib.get("PartName", "").strip()
@@ -1833,6 +1972,8 @@ def _patch_content_types_xml(ct_bytes: bytes, ensure_comments_ct: bool, keep_peo
             if any(pname_low.endswith(sfx) for sfx in _STRIPPED_COMMENT_PART_SUFFIXES):
                 continue
             if not keep_people and pname_low.endswith("/people.xml"):
+                continue
+            if pname_low.startswith("/word/fonts/") or pname_low.startswith("/docprops/thumbnail"):
                 continue
             if pname_low == "/word/comments.xml":
                 if not ensure_comments_ct or has_comments_ov:
@@ -1862,6 +2003,105 @@ def _patch_content_types_xml(ct_bytes: bytes, ensure_comments_ct: bool, keep_peo
     return "".join(parts).encode("utf-8")
 
 
+def _patch_content_types_slim_only(
+    ct_bytes: bytes,
+    has_emf_media: bool = False,
+    has_wmf_media: bool = False,
+) -> bytes:
+    """Strip embedded-font and thumbnail entries from [Content_Types].xml without altering comment/people parts."""
+    _assert_safe_openxml_bytes(ct_bytes)
+    ct_root = ET.fromstring(ct_bytes)
+    defaults = []
+    overrides = []
+    changed = False
+    for ch in list(ct_root):
+        loc = _local_name(ch.tag)
+        if loc == "Default":
+            ext_low = ch.attrib.get("Extension", "").strip().lower()
+            ctype_low = ch.attrib.get("ContentType", "").strip().lower()
+            if ext_low == "odttf" or "obfuscatedfont" in ctype_low or (ext_low in ("ttf", "otf") and "font" in ctype_low):
+                changed = True
+                continue
+            if ext_low == "emf" and not has_emf_media:
+                changed = True
+                continue
+            if ext_low == "wmf" and not has_wmf_media:
+                changed = True
+                continue
+            defaults.append(ch)
+        elif loc == "Override":
+            pname_low = ch.attrib.get("PartName", "").strip().replace("\\", "/").lower()
+            if pname_low.startswith("/word/fonts/") or pname_low.startswith("/docprops/thumbnail"):
+                changed = True
+                continue
+            overrides.append(ch)
+    if not changed:
+        return ct_bytes
+    parts = [
+        '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>\r\n',
+        f'<Types xmlns="{CONTENT_TYPES_URI}">',
+    ]
+    for d_el in defaults:
+        attr_str = " ".join(f"{_local_name(k)}={quoteattr(v)}" for k, v in d_el.attrib.items())
+        parts.append(f"<Default {attr_str}/>")
+    for o_el in overrides:
+        attr_str = " ".join(f"{_local_name(k)}={quoteattr(v)}" for k, v in o_el.attrib.items())
+        parts.append(f"<Override {attr_str}/>")
+    parts.append("</Types>")
+    return "".join(parts).encode("utf-8")
+
+
+def slim_docx_file(
+    src_docx_path: Path,
+    dst_docx_path: Path = None,
+    disable_track_revisions: bool = False,
+) -> Path:
+    """
+    Losslessly slim a `.docx` file by stripping embedded fonts (`word/fonts/*.odttf`),
+    `docProps/thumbnail.*`, `<w:rsids>`, and forcing `ZIP_DEFLATED`, while keeping
+    `word/document.xml`, `word/comments.xml`, styles, and media 100% intact.
+    """
+    src_p = Path(src_docx_path).resolve()
+    dst_p = Path(dst_docx_path).resolve() if dst_docx_path is not None else src_p
+    same_file = src_p == dst_p
+    dst_p.parent.mkdir(parents=True, exist_ok=True)
+    tmp_dst = dst_p.with_suffix(".docx.tmp_slim") if same_file else dst_p
+
+    with zipfile.ZipFile(src_p, "r") as zin:
+        _validate_docx_zip(zin)
+        kept_names_low = [
+            it.filename.replace("\\", "/").lower()
+            for it in zin.infolist()
+            if not _is_slimmed_bloat_member(it.filename)
+        ]
+        has_emf = any(n.endswith(".emf") for n in kept_names_low)
+        has_wmf = any(n.endswith(".wmf") for n in kept_names_low)
+
+        with zipfile.ZipFile(tmp_dst, "w", zipfile.ZIP_DEFLATED) as zout:
+            for item in zin.infolist():
+                norm_name = item.filename.replace("\\", "/")
+                norm_low = norm_name.lower()
+                if _is_slimmed_bloat_member(norm_name):
+                    continue
+                with zin.open(item, "r") as mfp:
+                    data = mfp.read(MAX_DOCX_MEMBER_BYTES + 1)
+                if len(data) > MAX_DOCX_MEMBER_BYTES:
+                    raise ValueError(f"Member {item.filename!r} exceeded actual read byte limit.")
+                if norm_low == "word/fonttable.xml":
+                    data = _slim_font_table_xml(data)
+                elif norm_low == "word/settings.xml":
+                    data = _slim_settings_xml(data, disable_track_revisions=disable_track_revisions)
+                elif norm_low == "_rels/.rels":
+                    data = _slim_root_rels_xml(data)
+                elif norm_low == "[content_types].xml":
+                    data = _patch_content_types_slim_only(data, has_emf_media=has_emf, has_wmf_media=has_wmf)
+                zout.writestr(_clone_deflated_zipinfo(item), data, compress_type=zipfile.ZIP_DEFLATED)
+
+    if same_file:
+        tmp_dst.replace(dst_p)
+    return dst_p
+
+
 def _serialize_comments_xml(comments_root: ET.Element) -> bytes:
     with _ET_NS_LOCK:
         ET.register_namespace("w", W_URI)
@@ -1884,6 +2124,7 @@ def save_docx_xml(
     root: ET.Element,
     ns_pairs,
     comments_root: ET.Element = None,
+    disable_track_revisions: bool = False,
 ):
     if comments_root is None:
         comments_root = load_docx_comments_xml(src_docx_path)
@@ -1928,45 +2169,81 @@ def save_docx_xml(
         _validate_docx_zip(zin)
         zin_names = {it.filename.replace("\\", "/") for it in zin.infolist()}
         keep_people = has_active_comments and ("word/people.xml" in zin_names)
+        kept_names_low = [
+            n.lower()
+            for n in zin_names
+            if not _is_slimmed_bloat_member(n)
+        ]
+        has_emf = any(n.endswith(".emf") for n in kept_names_low)
+        has_wmf = any(n.endswith(".wmf") for n in kept_names_low)
+
         with zipfile.ZipFile(tmp_dst, "w", zipfile.ZIP_DEFLATED) as zout:
             for item in zin.infolist():
                 norm_name = item.filename.replace("\\", "/")
+                norm_low = norm_name.lower()
+                if _is_slimmed_bloat_member(norm_name):
+                    continue
                 if norm_name in _STRIPPED_COMMENT_ZIP_NAMES or any(
-                    norm_name.lower().endswith(sfx) for sfx in _STRIPPED_COMMENT_PART_SUFFIXES
+                    norm_low.endswith(sfx) for sfx in _STRIPPED_COMMENT_PART_SUFFIXES
                 ):
                     continue
                 if not keep_people and (
-                    norm_name in _PEOPLE_ZIP_NAMES or norm_name.lower().endswith("/people.xml")
+                    norm_name in _PEOPLE_ZIP_NAMES or norm_low.endswith("/people.xml")
                 ):
                     continue
+                zi = _clone_deflated_zipinfo(item)
                 if norm_name == "word/document.xml":
-                    zout.writestr(item, full_doc_bytes)
+                    zout.writestr(zi, full_doc_bytes, compress_type=zipfile.ZIP_DEFLATED)
                 elif norm_name == "word/comments.xml":
                     if has_active_comments and comments_bytes is not None:
-                        zout.writestr(item, comments_bytes)
+                        zout.writestr(zi, comments_bytes, compress_type=zipfile.ZIP_DEFLATED)
                         wrote_comments = True
                 elif norm_name == "word/_rels/document.xml.rels":
                     with zin.open(item, "r") as mfp:
                         raw_rels = mfp.read(MAX_DOCX_MEMBER_BYTES + 1)
                     zout.writestr(
-                        item,
+                        zi,
                         _patch_document_rels_xml(raw_rels, ensure_comments_rel=has_active_comments, keep_people=keep_people),
+                        compress_type=zipfile.ZIP_DEFLATED,
                     )
                     wrote_rels = True
-                elif norm_name == "[Content_Types].xml":
+                elif norm_low == "[content_types].xml":
                     with zin.open(item, "r") as mfp:
                         raw_ct = mfp.read(MAX_DOCX_MEMBER_BYTES + 1)
                     zout.writestr(
-                        item,
-                        _patch_content_types_xml(raw_ct, ensure_comments_ct=has_active_comments, keep_people=keep_people),
+                        zi,
+                        _patch_content_types_xml(
+                            raw_ct,
+                            ensure_comments_ct=has_active_comments,
+                            keep_people=keep_people,
+                            has_emf_media=has_emf,
+                            has_wmf_media=has_wmf,
+                        ),
+                        compress_type=zipfile.ZIP_DEFLATED,
                     )
                     wrote_ct = True
+                elif norm_low == "word/fonttable.xml":
+                    with zin.open(item, "r") as mfp:
+                        raw_ft = mfp.read(MAX_DOCX_MEMBER_BYTES + 1)
+                    zout.writestr(zi, _slim_font_table_xml(raw_ft), compress_type=zipfile.ZIP_DEFLATED)
+                elif norm_low == "word/settings.xml":
+                    with zin.open(item, "r") as mfp:
+                        raw_st = mfp.read(MAX_DOCX_MEMBER_BYTES + 1)
+                    zout.writestr(
+                        zi,
+                        _slim_settings_xml(raw_st, disable_track_revisions=disable_track_revisions),
+                        compress_type=zipfile.ZIP_DEFLATED,
+                    )
+                elif norm_low == "_rels/.rels":
+                    with zin.open(item, "r") as mfp:
+                        raw_rrels = mfp.read(MAX_DOCX_MEMBER_BYTES + 1)
+                    zout.writestr(zi, _slim_root_rels_xml(raw_rrels), compress_type=zipfile.ZIP_DEFLATED)
                 else:
                     with zin.open(item, "r") as mfp:
                         data = mfp.read(MAX_DOCX_MEMBER_BYTES + 1)
                     if len(data) > MAX_DOCX_MEMBER_BYTES:
                         raise ValueError(f"Member {item.filename!r} exceeded actual read byte limit.")
-                    zout.writestr(item, data)
+                    zout.writestr(zi, data, compress_type=zipfile.ZIP_DEFLATED)
 
             if has_active_comments and not wrote_comments and comments_bytes is not None:
                 zout.writestr("word/comments.xml", comments_bytes)
@@ -2974,17 +3251,34 @@ def sentence_unit_stats(sent_ops: list) -> dict:
 
 def is_strict_rv_sentence(stats: dict) -> bool:
     """
-    Item 8.2 Strict 1–2 Sentence Cyan (`RV`) Criterion:
-    Mark a sentence `"cyan"` (`RV`) ONLY when pre-edit vs post-edit shares at most 3 content words
-    (or `eq_words <= 3`) AND `change_ratio >= 0.75` with NO intact unchanged clause of `>= 5` consecutive `eq` words!
+    Sentence Cyan (`RV`) Criterion:
+      1. Short/general total rewrite: `(shared_cw <= 3 or eq_w <= 3) and ratio >= 0.70 and max_consec < 5`
+      2. Medium/long shattered rewrite (`new_w >= 8` or `del_w >= 8`):
+         - `ratio >= 0.62 and max_consec <= 5` (>= 62% words changed and no intact >= 6-word clause), OR
+         - `ratio >= 0.55 and hunks >= 5 and max_consec <= 4` (shattered into >= 5 hunks, max 4 consecutive unchanged words), OR
+         - `ratio >= 0.72 and (eq_w / max(1, new_w)) <= 0.32 and max_consec <= 6`.
+      Preserves `"yellow"` (`UP`) whenever an intact >= 6-word half-sentence remains and change ratio is moderate.
     """
     if not stats.get("has_edit"):
         return False
     eq_w = int(stats.get("eq_words", 0))
+    new_w = max(1, int(stats.get("new_words", eq_w)))
+    del_w = int(stats.get("del_words", 0))
+    hunks = int(stats.get("edit_hunks", 1))
     shared_cw = int(stats.get("shared_content_words", eq_w))
     max_consec = int(stats.get("max_consec_eq_words", eq_w))
     ratio = float(stats.get("change_ratio", 0.0))
-    return (shared_cw <= 3 or eq_w <= 3) and ratio >= 0.75 and max_consec < 5
+
+    if (shared_cw <= 3 or eq_w <= 3) and ratio >= 0.70 and max_consec < 5:
+        return True
+    if max(new_w, eq_w + del_w) >= 8:
+        if ratio >= 0.62 and max_consec <= 5:
+            return True
+        if ratio >= 0.55 and hunks >= 5 and max_consec <= 4:
+            return True
+        if ratio >= 0.72 and (eq_w / new_w) <= 0.32 and max_consec <= 6:
+            return True
+    return False
 
 
 def _extract_words_lower(s: str) -> list:
@@ -3407,15 +3701,13 @@ def compute_precision_yellow(ops: list, max_gap_words: int = 3) -> list:
 
 def should_promote_region_to_cyan(sents: list, actions: list = None, max_gap_words: int = 3) -> bool:
     """
-    Item 8.4 Whole-Paragraph Cyan (`RV`) Promotion When Entire Paragraph Is Fragmented ("花掉"):
-    For a quoted region / paragraph with `>= 4` sentences, if:
-      - unedited sentences (`not has_edit`) count is `<= 2`, AND
-      - edited sentence ratio is `>= 0.75`, AND
-      - (`total_edit_hunks >= 12` OR (`hl_word_coverage >= 0.60` with `>= 6` separate edit clusters)),
-    return True so all sentences in that region promote to `"cyan"` (`RV`).
+    Item 8.4 Whole-Paragraph Cyan (`RV`) Promotion When Entire Paragraph Is Genuinely Rewritten ("花掉"):
+    Prevents false-positive promotion on long paragraphs with scattered small word tweaks (where < 42% of
+    actual words changed), while promoting paragraphs whose true word-level change ratio is >= 42% (or
+    whose sentences are already >= 60% cyan by word count) and edited sentences cover >= 75% of the region.
     """
     total_sents = len(sents or ())
-    if total_sents < 4:
+    if total_sents < 3:
         return False
 
     eff_actions = (
@@ -3425,30 +3717,34 @@ def should_promote_region_to_cyan(sents: list, actions: list = None, max_gap_wor
     )
 
     unedited_cnt = sum(1 for idx, s in enumerate(sents) if not s.get("has_edit") or eff_actions[idx] == "none")
-    if unedited_cnt > 2:
-        return False
-
     edited_cnt = total_sents - unedited_cnt
     if (edited_cnt / total_sents) < 0.75:
         return False
 
-    total_hunks = 0
     combined_ops = []
     for s in sents:
-        s_ops = s.get("ops") or []
-        combined_ops.extend(s_ops)
-        if "edit_hunks" in s:
-            total_hunks += int(s["edit_hunks"])
-        else:
-            total_hunks += sum(
-                1 for idx, (k, _) in enumerate(s_ops)
-                if k in ("del", "ins") and (idx == 0 or s_ops[idx - 1][0] == "eq")
-            )
+        combined_ops.extend(s.get("ops") or [])
 
-    if total_hunks >= 12:
+    reg_eq_w = count_msword_en_words("".join(t for k, t in combined_ops if k == "eq"))
+    reg_del_w = count_msword_en_words("".join(t for k, t in combined_ops if k == "del"))
+    reg_ins_w = count_msword_en_words("".join(t for k, t in combined_ops if k == "ins"))
+    reg_new_w = max(1, reg_eq_w + reg_ins_w)
+    raw_word_change_ratio = max(reg_del_w, reg_ins_w) / reg_new_w
+
+    cyan_sent_words = 0
+    for idx_c, s in enumerate(sents):
+        if eff_actions[idx_c] == "cyan":
+            cyan_sent_words += _count_ops_words(s.get("ops") or [])
+    cyan_word_share = cyan_sent_words / reg_new_w
+
+    # Hard guard: NEVER promote a paragraph with light/local word tweaks (< 42% words changed)
+    if raw_word_change_ratio < 0.42 and cyan_word_share < 0.60:
+        return False
+
+    if cyan_word_share >= 0.65 and unedited_cnt <= 2:
         return True
 
-    # Count separate edit clusters across combined_ops and compute yellow+cyan word coverage
+    # Count separate edit clusters across combined_ops
     edit_clusters = 0
     in_cl = False
     for k, t in combined_ops:
@@ -3461,6 +3757,9 @@ def should_promote_region_to_cyan(sents: list, actions: list = None, max_gap_wor
 
     if edit_clusters < 6:
         return False
+
+    if raw_word_change_ratio >= 0.48:
+        return True
 
     total_words = 0
     hl_words = 0
@@ -3498,7 +3797,7 @@ def should_promote_region_to_cyan(sents: list, actions: list = None, max_gap_wor
             hl_words += count_msword_en_words("".join(y_buf))
 
     coverage = hl_words / max(1, total_words)
-    return coverage >= 0.60
+    return raw_word_change_ratio >= 0.42 and coverage >= 0.68
 
 
 def apply_clause_yellow_highlights(sent_ops: list) -> list:
@@ -3779,6 +4078,15 @@ def apply_highlights_to_col3_cell(tc: ET.Element, char_spans: list):
                 if isinstance(mark_spec, str) and mark_spec.lower().startswith("shd:"):
                     eff_shd = mark_spec.split(":", 1)[1].strip().lstrip("#").upper() or "D9EEF7"
                     return make_run(seg_txt, base_rPr=base_rPr, highlight=None, shd_fill=eff_shd)
+                if isinstance(mark_spec, str) and mark_spec.lower().startswith("u:"):
+                    u_val = mark_spec.split(":", 1)[1].strip() or "single"
+                    return make_run(
+                        seg_txt,
+                        base_rPr=base_rPr,
+                        highlight=None,
+                        shd_fill=base_shd_fill,
+                        inline_style=(None, False, False, u_val),
+                    )
                 return make_run(seg_txt, base_rPr=base_rPr, highlight=mark_spec, shd_fill=base_shd_fill)
 
             # Group contiguous characters with same highlight/shading inside this run
@@ -4609,18 +4917,178 @@ def _project_bounded_pct_triple(weights: tuple, bounds: tuple, target_sum: int =
     return (ints[0], ints[1], ints[2])
 
 
+def _estimate_visual_dxa_length(text: str, half_pt_sz: int = 24) -> float:
+    """Estimate unwrapped horizontal paragraph width in twips (dxa) for line-wrap simulation."""
+    if not text:
+        return 0.0
+    s = _WS_COLLAPSE_RE.sub(" ", text).strip()
+    if not s:
+        return 0.0
+    sz_scale = max(16, int(half_pt_sz or 24)) / 24.0
+    total = 0.0
+    se_asian_chars = 0
+    latin_chars = 0
+    non_ws_chars = 0
+    for ch in s:
+        if ch.isspace():
+            total += 65.0 * sz_scale
+            continue
+        cp = ord(ch)
+        if unicodedata.combining(ch) or unicodedata.category(ch) == "Mn" or cp in (0x200B, 0x200C, 0x200D, 0xFEFF):
+            continue
+        non_ws_chars += 1
+        if (
+            0x4E00 <= cp <= 0x9FFF
+            or 0x3400 <= cp <= 0x4DBF
+            or 0x3040 <= cp <= 0x30FF
+            or 0x3000 <= cp <= 0x303F
+            or 0xFF00 <= cp <= 0xFFEF
+            or 0xAC00 <= cp <= 0xD7AF
+        ):
+            total += 240.0 * sz_scale
+        elif 0x1780 <= cp <= 0x17FF:  # Khmer
+            total += 168.0 * sz_scale
+            se_asian_chars += 1
+        elif 0x0E80 <= cp <= 0x0EFF:  # Lao
+            total += 162.0 * sz_scale
+            se_asian_chars += 1
+        elif 0x1000 <= cp <= 0x109F:  # Myanmar
+            total += 155.0 * sz_scale
+            se_asian_chars += 1
+        elif 0x0E00 <= cp <= 0x0E7F:  # Thai (Angsana New condensed)
+            total += 112.0 * sz_scale
+            se_asian_chars += 1
+        elif 0x0900 <= cp <= 0x0DFF:  # Indic scripts
+            total += 145.0 * sz_scale
+            latin_chars += 1
+        elif ch.isupper():
+            total += 152.0 * sz_scale
+            latin_chars += 1
+        else:
+            total += 122.0 * sz_scale
+            latin_chars += 1
+
+    if non_ws_chars > 0:
+        if se_asian_chars > non_ws_chars * 0.35:
+            total *= 1.22
+        elif latin_chars > non_ws_chars * 0.35:
+            total *= 1.11
+        else:
+            total *= 1.03
+    return total
+
+
+def _detect_col_dominant_half_pt_sz(rows_3: list, col_idx: int, default_sz: int = 24) -> int:
+    counts = {}
+    for tr in rows_3[:25]:
+        tcs = tr.findall(f"{W}tc")
+        if len(tcs) <= col_idx:
+            continue
+        for sz_el in tcs[col_idx].findall(f".//{W}rPr/{W}sz"):
+            try:
+                v = int(sz_el.attrib.get(f"{W}val", "0"))
+                if 14 <= v <= 48:
+                    counts[v] = counts.get(v, 0) + 1
+            except ValueError:
+                pass
+    if not counts:
+        return default_sz
+    return max(counts.items(), key=lambda kv: kv[1])[0]
+
+
+def _get_visible_para_text_for_wrap(p: ET.Element) -> str:
+    """Include both <w:t> and <w:delText> since Word renders inline deletions in All Markup view."""
+    return "".join(
+        el.text or ""
+        for el in p.iter()
+        if _local_name(el.tag) in ("t", "delText")
+    )
+
+
+def _solve_equal_height_widths_dxa(
+    row_para_dxa: list,
+    line_dxas: tuple,
+    total_w: int,
+) -> tuple:
+    """Solve for `(w0, w1, w2)` summing to `total_w` that equalizes wrapped vertical height across all 3 columns."""
+    CELL_PAD_DXA = 216
+    if not row_para_dxa:
+        w0 = int(round(total_w * 0.25))
+        w1 = int(round(total_w * 0.37))
+        return (w0, w1, total_w - w0 - w1)
+
+    def _loss(r0: float, r1: float) -> float:
+        r2 = 1.0 - r0 - r1
+        u0 = max(1100.0, total_w * r0 - CELL_PAD_DXA)
+        u1 = max(1300.0, total_w * r1 - CELL_PAD_DXA)
+        u2 = max(1400.0, total_w * r2 - CELL_PAD_DXA)
+        usables = (u0, u1, u2)
+        total_loss = 0.0
+        col_totals = [0.0, 0.0, 0.0]
+        for p_lists in row_para_dxa:
+            h_cols = [0.0, 0.0, 0.0]
+            for c_i in range(3):
+                u_c = usables[c_i]
+                ld = line_dxas[c_i]
+                lines_c = 0
+                for pdxa in p_lists[c_i]:
+                    if pdxa <= 1.0:
+                        lines_c += 1
+                    else:
+                        lines_c += max(1, int((pdxa + u_c - 1.0) // u_c))
+                h_cols[c_i] = lines_c * ld
+                col_totals[c_i] += h_cols[c_i]
+            gap = max(h_cols) - min(h_cols)
+            total_loss += gap * gap
+        tot_gap = max(col_totals) - min(col_totals)
+        return total_loss + 0.35 * (tot_gap * tot_gap) / max(1, len(row_para_dxa))
+
+    best_r0, best_r1 = 0.25, 0.36
+    best_score = float("inf")
+    for i0 in range(16, 39):
+        r0 = i0 / 100.0
+        for i1 in range(20, 49):
+            r1 = i1 / 100.0
+            r2 = 1.0 - r0 - r1
+            if r2 < 0.22 or r2 > 0.60:
+                continue
+            sc = _loss(r0, r1)
+            if sc < best_score:
+                best_score = sc
+                best_r0, best_r1 = r0, r1
+
+    for d0 in range(-4, 5):
+        r0 = best_r0 + d0 * 0.0025
+        if not (0.16 <= r0 <= 0.38):
+            continue
+        for d1 in range(-4, 5):
+            r1 = best_r1 + d1 * 0.0025
+            r2 = 1.0 - r0 - r1
+            if not (0.20 <= r1 <= 0.48 and 0.22 <= r2 <= 0.60):
+                continue
+            sc = _loss(r0, r1)
+            if sc < best_score:
+                best_score = sc
+                best_r0, best_r1 = r0, r1
+
+    w0 = int(round(total_w * best_r0))
+    w1 = int(round(total_w * best_r1))
+    w2 = total_w - w0 - w1
+    return (w0, w1, w2)
+
+
 def balance_trilingual_table_widths(root: ET.Element) -> int:
     """
-    Adaptive 3-column table width balancer (`三语拉齐`):
-      - Strips stray gridSpan / gridBefore / wBefore on 3-cell rows;
-      - Computes visual text weight of Col 1 (CJK × 1.8), Col 2, and Col 3 per table;
-      - Sets <w:tblW w:w="5000" w:type="pct"/>, <w:tblGrid> summing to printable width (~14560 dxa),
-        and <w:tcW w:type="pct"> on all 3 cells (Col 1 [950, 1250], Col 2 [1700, 2050], Col 3 [1800, 2150], sum=5000).
+    Adaptive Equal-Height 3-column table width balancer (`三语拉齐`):
+      - Strips stray gridSpan / gridBefore / wBefore / noWrap on 3-cell rows;
+      - Simulates wrapped paragraph line counts per column & script/font size;
+      - Solves for `(w0, w1, w2)` in `dxa` summing to printable page width (~14570 dxa)
+        so all 3 columns render with closely matched vertical height across ANY language!
     Returns count of balanced tables.
     """
     _ensure_landscape_a4_on_root(root)
 
-    printable_dxa = 14560
+    printable_dxa = 14570
     sect = root.find(f".//{W}sectPr")
     if sect is not None:
         pgSz = sect.find(f"{W}pgSz")
@@ -4635,10 +5103,8 @@ def balance_trilingual_table_widths(root: ET.Element) -> int:
             if 9000 <= cand_dxa <= 19000:
                 printable_dxa = cand_dxa
         except ValueError:
-            printable_dxa = 14560
+            printable_dxa = 14570
 
-    # Flexible bounds (20%..35% Col 1, 24%..42% Col 2, 28%..54% Col 3) so any language equalizes height dynamically
-    bounds = ((1000, 1750), (1200, 2100), (1400, 2700))
     balanced_count = 0
 
     for tbl in root.findall(f".//{W}tbl"):
@@ -4647,28 +5113,31 @@ def balance_trilingual_table_widths(root: ET.Element) -> int:
         if not rows_3:
             continue
 
-        w0, w1, w2 = 0.0, 0.0, 0.0
+        sz0 = _detect_col_dominant_half_pt_sz(rows_3, 0, default_sz=24)
+        sz1 = _detect_col_dominant_half_pt_sz(rows_3, 1, default_sz=24)
+        sz2 = _detect_col_dominant_half_pt_sz(rows_3, 2, default_sz=24)
+        col_szs = (sz0, sz1, sz2)
+        line_dxas = (400, 400, 400)
+
+        row_para_dxa = []
         for tr in rows_3:
             _strip_stray_grid_spans_on_row(tr)
             tcs = tr.findall(f"{W}tc")
-            c3_txt = get_cell_plain_text(tcs[2])
-            if c3_txt.strip() == SKIPPED_ROW_MARKER:
-                c3_txt = ""
-            w0 += _compute_text_visual_weight(get_cell_plain_text(tcs[0]), cjk_mult=1.9)
-            w1 += _compute_text_visual_weight(get_cell_plain_text(tcs[1]), cjk_mult=1.0)
-            w2 += _compute_text_visual_weight(c3_txt, cjk_mult=1.2)
+            c3_plain = get_cell_plain_text(tcs[2]).strip()
+            if c3_plain == SKIPPED_ROW_MARKER:
+                continue
+            p_lists = [[], [], []]
+            has_any = False
+            for c_i in range(3):
+                for p in tcs[c_i].findall(f"{W}p"):
+                    ptxt = _get_visible_para_text_for_wrap(p)
+                    if ptxt.strip():
+                        has_any = True
+                    p_lists[c_i].append(_estimate_visual_dxa_length(ptxt, half_pt_sz=col_szs[c_i]))
+            if has_any:
+                row_para_dxa.append((p_lists[0], p_lists[1], p_lists[2]))
 
-        if w1 <= 0 and w2 <= 0:
-            pcts = (1200, 1900, 1900)
-        elif w2 <= 0:
-            pcts = (1200, 1900, 1900)
-        else:
-            pcts = _project_bounded_pct_triple((w0, w1, w2), bounds, target_sum=5000)
-
-        g0 = round(printable_dxa * pcts[0] / 5000)
-        g1 = round(printable_dxa * pcts[1] / 5000)
-        g2 = printable_dxa - g0 - g1
-        dxa_widths = (g0, g1, g2)
+        dxa_widths = _solve_equal_height_widths_dxa(row_para_dxa, line_dxas, printable_dxa)
 
         tblPr = tbl.find(f"{W}tblPr")
         if tblPr is None:
@@ -4696,6 +5165,8 @@ def balance_trilingual_table_widths(root: ET.Element) -> int:
                 if tcPr is None:
                     tcPr = ET.Element(f"{W}tcPr")
                     tcs[col_i].insert(0, tcPr)
+                for nw in list(tcPr.findall(f"{W}noWrap")):
+                    tcPr.remove(nw)
                 insert_tcpr_child_ordered(
                     tcPr,
                     ET.Element(f"{W}tcW", {f"{W}w": str(dxa_widths[col_i]), f"{W}type": "dxa"}),
@@ -4708,20 +5179,20 @@ def balance_trilingual_table_widths(root: ET.Element) -> int:
 
 def format_up_rv_count_tag(up_words: int, rv_words: int) -> str:
     """
-    Format UP/RV English word count tag omitting zero counts:
-      - up > 0 and rv > 0 -> "(UP {up} words, RV {rv} words)"
-      - up > 0 and rv == 0 -> "(UP {up} words)"
-      - up == 0 and rv > 0 -> "(RV {rv} words)"
-      - up == 0 and rv == 0 -> ""
+    Format RV/UP English word count tag (`RV` first, `UP` second; omitting zero counts):
+      - rv > 0 and up > 0 -> "(RV {rv} words, UP {up} words)"
+      - rv > 0 and up == 0 -> "(RV {rv} words)"
+      - rv == 0 and up > 0 -> "(UP {up} words)"
+      - rv == 0 and up == 0 -> ""
     """
     up = max(0, int(up_words or 0))
     rv = max(0, int(rv_words or 0))
-    if up > 0 and rv > 0:
-        return f"(UP {up} words, RV {rv} words)"
-    if up > 0:
-        return f"(UP {up} words)"
+    if rv > 0 and up > 0:
+        return f"(RV {rv} words, UP {up} words)"
     if rv > 0:
         return f"(RV {rv} words)"
+    if up > 0:
+        return f"(UP {up} words)"
     return ""
 
 
@@ -4748,10 +5219,49 @@ def _cell_is_dominantly_bold(tc: ET.Element) -> bool:
     return total_chars > 0 and (bold_chars / total_chars) >= 0.5
 
 
+def is_two_row_chapter_header(trs: list) -> bool:
+    """
+    Return True if `trs` starts with a 2-row chapter header (e.g. Row 0 = `附篇一 | Appendix 1:`
+    and Row 1 = `神的显现带来了新的时代 | The Appearance of God Has Ushered in a New Age`).
+    """
+    if len(trs) < 2:
+        return False
+    tcs0 = trs[0].findall(f"{W}tc")
+    tcs1 = trs[1].findall(f"{W}tc")
+    if len(tcs0) < 2 or len(tcs1) < 2:
+        return False
+    cn0 = re.sub(r"\s+", " ", get_cell_plain_text(tcs0[0])).strip()
+    en0 = re.sub(r"\s+", " ", get_cell_plain_text(tcs0[1])).strip()
+    cn1 = re.sub(r"\s+", " ", get_cell_plain_text(tcs1[0])).strip()
+    en1 = re.sub(r"\s+", " ", get_cell_plain_text(tcs1[1])).strip()
+    if not en0 or not en1 or len(en0) > 48 or len(en1) > 220 or len(cn1) > 100:
+        return False
+
+    is_prefix_row0 = bool(
+        cn0.startswith(("附篇", "序言", "前言", "导言", "引言", "附录"))
+        or en0.endswith(":")
+        or re.match(r"^(?:Appendix|Preface|Introduction|Part|Item|Section|Chapter)\b", en0, re.I)
+    )
+    if not is_prefix_row0:
+        return False
+
+    if len(trs) >= 3:
+        tcs2 = trs[2].findall(f"{W}tc")
+        if tcs2 and all(not get_cell_plain_text(c).strip() for c in tcs2):
+            return True
+
+    r1_bold = _cell_is_dominantly_bold(tcs1[1]) or _cell_is_dominantly_bold(tcs1[0])
+    r1_centered = any(
+        (jc.attrib.get(f"{W}val") or "").strip().lower() == "center"
+        for jc in tcs1[1].findall(f".//{W}pPr/{W}jc")
+    )
+    r1_short_title = "。" not in cn1 and not en1.endswith(".")
+    return bool(r1_bold or r1_centered or r1_short_title)
+
+
 def extract_full_article_en_title(root: ET.Element) -> str:
     """
-    Inspect Row 0 of the first <w:tbl>: if Row 0 has >= 2 cells and looks like a chapter title row
-    (bold or <= 180 chars with Row 1 blank or body text below), return clean `get_cell_plain_text(tcs[1]).strip()`.
+    Inspect Row 0 (and Row 1 for 2-row Appendix headers) of the first <w:tbl> and return clean English title.
     """
     tbl = root.find(f".//{W}tbl")
     if tbl is None:
@@ -4766,6 +5276,12 @@ def extract_full_article_en_title(root: ET.Element) -> str:
     en_title = re.sub(r"\s+", " ", get_cell_plain_text(tcs0[1])).strip()
     if not en_title:
         return ""
+
+    if is_two_row_chapter_header(trs):
+        tcs1 = trs[1].findall(f"{W}tc")
+        en1 = re.sub(r"\s+", " ", get_cell_plain_text(tcs1[1])).strip()
+        if en1:
+            return f"{en_title} {en1}".strip()
 
     is_bold = _cell_is_dominantly_bold(tcs0[1]) or _cell_is_dominantly_bold(tcs0[0])
     is_centered = any(

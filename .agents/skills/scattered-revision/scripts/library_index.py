@@ -23,7 +23,7 @@ INDEX_SCHEMA_VERSION = 3
 _FILES_KEY_MARKER = ',"files":{'
 
 _FINAL_OUTPUT_NAME_RE = re.compile(
-    r"_\((?:UP\s+\d+\s+words(?:,\s*RV\s+\d+\s+words)?|RV\s+\d+\s+words|up\s*\d+(?:[\s,]+rv\s*\d+)?|rv\s*\d+)\)_",
+    r"_\((?:(?:UP|RV|PR)\s+\d+\s+words(?:,\s*(?:UP|RV|PR)\s+\d+\s+words)?|(?:up|rv|pr)\s*\d+(?:[\s,]+(?:up|rv|pr)\s*\d+)?)\)_",
     re.IGNORECASE,
 )
 _WS_RE = re.compile(r"[\s\u3000\u200b\u200c\ufeff]+")

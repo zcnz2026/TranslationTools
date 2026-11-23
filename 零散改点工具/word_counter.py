@@ -27,21 +27,22 @@ _ensure_skill_scripts()
 import docx_xml_utils  # noqa: E402
 from lang_registry import load_languages  # noqa: E402
 
-# Matches new & legacy word-count tags:
-#   _(UP 120 words, RV 45 words)
-#   _(UP  words, RV  words)
-#   _(UP 120 words) / _(RV 45 words)
-#   _(up452 rv609) / _(up0)
+# Matches new & legacy word-count tags (including empty `( words)`, bare `(123 words)`,
+# `(RV 708 words, UP 440 words)`, `(UP 120 words, RV 45 words)`, `(PR 279 words)`, `(up452 rv609)`):
 _WORD_COUNT_TAG_RE = re.compile(
     r"[\s_]*\(\s*(?:"
-    r"(?:UP|RV)\s*\d*\s*(?:words?)?(?:\s*[,，/&\s]\s*(?:UP|RV)\s*\d*\s*(?:words?)?)*"
+    r"(?:(?:UP|RV|PR)\s*\d*\s*(?:words?)?|\d*\s*words?)"
+    r"(?:\s*[,，/&\s]\s*(?:(?:UP|RV|PR)\s*\d*\s*(?:words?)?|\d+\s*words?))*"
     r"|"
-    r"(?:up|rv)\s*\d+(?:\s+(?:up|rv)\s*\d+)*"
+    r"(?:up|rv|pr)\s*\d+(?:\s+(?:up|rv|pr)\s*\d+)*"
     r")\s*\)",
     re.IGNORECASE,
 )
 
 _TRAILING_DATE_RE = re.compile(r"_((?:19|20)\d{6}|\d{4})(?:--[^\s/\\]+)?$")
+_TRAILING_ROLE_SUFFIX_RE = re.compile(
+    r"[\s_]+(?:完整版|完整留底版|给译者版|中英最新底稿|提取三语原稿)$"
+)
 _CJK_CHAR_RE = re.compile(r"[\u3400-\u4dbf\u4e00-\u9fff\uf900-\ufaff]")
 
 _TOP_INSTRUCTION_NORMS = frozenset({
@@ -57,23 +58,23 @@ _TOP_INSTRUCTION_NORMS = frozenset({
 
 def format_up_rv_count_tag(up_words: int, rv_words: int) -> str:
     """
-    Format UP/RV word count tag omitting zero counts:
-      - up > 0, rv > 0 -> '(UP X words, RV Y words)'
-      - up > 0, rv == 0 -> '(UP X words)'
-      - up == 0, rv > 0 -> '(RV Y words)'
-      - up == 0, rv == 0 -> ''
+    Format RV/UP word count tag (`RV` first, `UP` second; omitting zero counts):
+      - rv > 0, up > 0 -> '(RV Y words, UP X words)'
+      - rv > 0, up == 0 -> '(RV Y words)'
+      - rv == 0, up > 0 -> '(UP X words)'
+      - rv == 0, up == 0 -> ''
     """
     fn = getattr(docx_xml_utils, "format_up_rv_count_tag", None)
     if callable(fn):
         return fn(int(up_words or 0), int(rv_words or 0))
     u = max(0, int(up_words or 0))
     r = max(0, int(rv_words or 0))
-    if u > 0 and r > 0:
-        return f"(UP {u} words, RV {r} words)"
-    if u > 0:
-        return f"(UP {u} words)"
+    if r > 0 and u > 0:
+        return f"(RV {r} words, UP {u} words)"
     if r > 0:
         return f"(RV {r} words)"
+    if u > 0:
+        return f"(UP {u} words)"
     return ""
 
 
@@ -433,27 +434,28 @@ def parse_doc_filename(
 
     codes_upper = {c.upper() for c in (known_codes or set())}
 
-    # 1. Extract trailing date before or after word count tag
+    # 1 & 2. Iteratively strip trailing dates, word-count tags (incl. `( words)`), and role suffixes (`_完整版`)
     existing_date = ""
-    m_date = _TRAILING_DATE_RE.search(s)
-    if m_date:
-        raw_dt = m_date.group(1)
-        if len(raw_dt) == 8:
-            existing_date = raw_dt
-        s = s[: m_date.start()].strip(" _")
+    had_word_count = False
+    while True:
+        prev_s = s
+        m_date = _TRAILING_DATE_RE.search(s)
+        if m_date:
+            raw_dt = m_date.group(1)
+            if len(raw_dt) == 8 and not existing_date:
+                existing_date = raw_dt
+            s = s[: m_date.start()].strip(" _")
 
-    # 2. Detect & strip all word-count parenthetical tags
-    had_word_count = bool(_WORD_COUNT_TAG_RE.search(s))
-    if had_word_count:
-        s = _WORD_COUNT_TAG_RE.sub("", s).strip(" _")
+        if _WORD_COUNT_TAG_RE.search(s):
+            had_word_count = True
+            s = _WORD_COUNT_TAG_RE.sub("", s).strip(" _")
 
-    # Check again if a trailing date was sitting before the word count tag
-    m_date2 = _TRAILING_DATE_RE.search(s)
-    if m_date2:
-        raw_dt2 = m_date2.group(1)
-        if len(raw_dt2) == 8 and not existing_date:
-            existing_date = raw_dt2
-        s = s[: m_date2.start()].strip(" _")
+        m_role = _TRAILING_ROLE_SUFFIX_RE.search(s)
+        if m_role:
+            s = s[: m_role.start()].strip(" _")
+
+        if s == prev_s:
+            break
 
     # 3. Extract leading language code (e.g. 'GR_God’s Words')
     existing_lang = ""
@@ -655,8 +657,8 @@ def apply_word_count_filename(
             update_top_highlight_instruction_lines(root, has_up=(up_w > 0), has_rv=(rv_w > 0))
             docx_xml_utils.save_docx_xml(src, dst, root, ns_pairs, comments_root=comments_root)
             return dst, "✅ 已更新说明行并另存副本"
-        shutil.copy2(src, dst)
-        return dst, "✅ 已另存副本"
+        docx_xml_utils.slim_docx_file(src, dst)
+        return dst, "✅ 已另存副本（已自动瘦身）"
 
     dst = docx_xml_utils.safe_join_output_file(src.parent, new_filename)
     same_name = src.name == dst.name
@@ -683,12 +685,13 @@ def apply_word_count_filename(
             return src, "✅ 已更新开头说明行（文件名已是最新）"
         return dst, "✅ 已更新说明行与文件名"
 
-    if same_name:
-        return src, "✅ 文件名已是最新"
-
     try:
-        src.rename(dst)
+        docx_xml_utils.slim_docx_file(src, src)
+        if not same_name:
+            src.rename(dst)
     except PermissionError as pe:
         raise PermissionError(f"文件正在被 Word 或其他程序占用，请先关闭文档后重试：{src.name}") from pe
 
+    if same_name:
+        return src, "✅ 文件名已是最新（已自动瘦身）"
     return dst, "✅ 已更新文件名"

@@ -64,7 +64,7 @@ W = docx_xml_utils.W
 NS = docx_xml_utils.NS
 
 _OUTPUT_COUNT_TAG_RE = re.compile(
-    r"_\((?:UP\s+\d+\s+words(?:,\s*RV\s+\d+\s+words)?|RV\s+\d+\s+words)\)_",
+    r"_\((?:(?:UP|RV|PR)\s+\d+\s+words(?:,\s*(?:UP|RV|PR)\s+\d+\s+words)?)\)_",
     re.IGNORECASE,
 )
 _WORD_COUNTS_STDOUT_RE = re.compile(r"Final Col 2 Word Counts:\s*UP\s*=\s*(\d+)\s*words,\s*RV\s*=\s*(\d+)\s*words")
@@ -291,26 +291,30 @@ def resolve_highlight_mode(
 ) -> Tuple[str, bool, bool]:
     """
     Normalize 3-way highlight mode into `(mode_id, use_highlights, highlight_col1)`:
-      - `"en_foreign"` (default): Col 2 English yellow/cyan + Col 3 Foreign soft light-blue/lightGray; NO Col 1 highlights.
-      - `"all_three"`: Col 1 Chinese yellow/cyan + Col 2 English yellow/cyan + Col 3 Foreign soft light-blue/lightGray.
-      - `"revisions_only"`: NO highlights on any column, only Col 2 track changes (0 AI calls).
+      - `"all_three"` (default): Col 1 Chinese single underline (`u:single`) + Col 2 English yellow/cyan
+        + Col 3 Foreign soft light-blue shading (`#D9EEF7`) / `lightGray`.
+      - `"en_foreign"`: Col 2 English yellow/cyan + Col 3 Foreign `#D9EEF7` / `lightGray`; NO Col 1 mark.
+      - `"revisions_only"`: NO highlights/shading/underline on any column, only Col 2 track changes (0 AI calls).
     """
     raw = (highlight_mode or "").strip().lower()
     if raw in ("revisions_only", "none", "off", "false", "0"):
         return "revisions_only", False, False
-    if raw in ("all_three", "all", "three", "cn_en_foreign"):
-        return "all_three", True, True
-    if raw in ("en_foreign", "en_col3", "default"):
+    if raw in ("en_foreign", "en_col3", "no_col1"):
         return "en_foreign", True, False
+    if raw in ("all_three", "all", "three", "cn_en_foreign", "col1_underline", "default"):
+        return "all_three", True, True
     if not highlight_colors:
         return "revisions_only", False, False
-    return "en_foreign", True, False
+    return "all_three", True, True
 
 
 def _strip_all_highlights_in_root(root: ET.Element) -> None:
-    """Remove all `<w:highlight>` tags across `root` and strip top Blue/Yellow instruction lines."""
+    """Remove all `<w:highlight>` & UP `#D9EEF7` `<w:shd>` tags across `root` and strip top instruction lines."""
     for rPr in root.findall(".//w:rPr", NS):
         docx_xml_utils.remove_rpr_child(rPr, "highlight")
+        shd_el = rPr.find("w:shd", NS)
+        if shd_el is not None and (shd_el.attrib.get(f"{W}fill") or "").upper() == "D9EEF7":
+            docx_xml_utils.remove_rpr_child(rPr, "shd")
     update_top_highlight_instruction_lines(root, has_up=False, has_rv=False)
 
 

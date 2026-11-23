@@ -405,18 +405,18 @@ class IngestTabPanel:
         self.oauth = GoogleOAuthManager.from_dpapi_token(str(cfg.get("ing_google_oauth_dpapi", "")))
         self.col_cfg = ColumnMappingConfig.from_dict(cfg.get("ing_col_mapping"))
 
-        # 3A Vars
-        self.sent_path_var = tk.StringVar(value=str(cfg.get("ing_sent_path", "")))
-        self.ret_path_var = tk.StringVar(value=str(cfg.get("ing_ret_path", "")))
-        self.lib_dir_var = tk.StringVar(value=str(cfg.get("ing_lib_dir", cfg.get("library_dir", ""))))
-        self.out_dir_var = tk.StringVar(value=str(cfg.get("ing_out_dir", "")))
+        # 3A Vars — all task & library paths start empty on fresh launch (`都清空`)
+        self.sent_path_var = tk.StringVar(value="")
+        self.ret_path_var = tk.StringVar(value="")
+        self.lib_dir_var = tk.StringVar(value="")
+        self.out_dir_var = tk.StringVar(value="")
         self.conflict_policy_var = tk.StringVar(value=str(cfg.get("ing_conflict_policy", "keep_library")))
         self.rev_merge_mode_var = tk.StringVar(value=str(cfg.get("ing_rev_merge_mode", "single")))
         self.rev_batch_size_var = tk.StringVar(value=str(cfg.get("ing_rev_batch_size", "10")))
 
-        # 3B Vars
-        self.pr_lib_dir_var = tk.StringVar(value=str(cfg.get("ing_pr_lib_dir", cfg.get("library_dir", ""))))
-        self.pr_out_dir_var = tk.StringVar(value=str(cfg.get("ing_pr_out_dir", "")))
+        # 3B Vars — all task & library paths start empty on fresh launch (`都清空`)
+        self.pr_lib_dir_var = tk.StringVar(value="")
+        self.pr_out_dir_var = tk.StringVar(value="")
         self.pr_enable_ai_var = tk.BooleanVar(value=bool(cfg.get("ing_pr_enable_ai", False)))
 
         # Status Vars
@@ -435,15 +435,9 @@ class IngestTabPanel:
             except Exception:
                 enc_oauth = ""
         return {
-            "ing_sent_path": self.sent_path_var.get().strip(),
-            "ing_ret_path": self.ret_path_var.get().strip(),
-            "ing_lib_dir": self.lib_dir_var.get().strip(),
-            "ing_out_dir": self.out_dir_var.get().strip(),
             "ing_conflict_policy": self.conflict_policy_var.get(),
             "ing_rev_merge_mode": self.rev_merge_mode_var.get(),
             "ing_rev_batch_size": self.rev_batch_size_var.get().strip() or "10",
-            "ing_pr_lib_dir": self.pr_lib_dir_var.get().strip(),
-            "ing_pr_out_dir": self.pr_out_dir_var.get().strip(),
             "ing_pr_enable_ai": self.pr_enable_ai_var.get(),
             "ing_col_mapping": self.col_cfg.to_dict(),
             "ing_google_oauth_dpapi": enc_oauth,
