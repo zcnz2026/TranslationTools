@@ -64,6 +64,7 @@ _ext_record_recent_language = getattr(_lang_reg_mod, "record_recent_language", N
 import pipeline as _pipeline_mod
 
 run_oneclick_pipeline = getattr(_pipeline_mod, "run_oneclick_pipeline", None)
+resolve_sc1_input_docx_list = getattr(_pipeline_mod, "resolve_sc1_input_docx_list", None)
 ensure_library_index = getattr(_pipeline_mod, "ensure_library_index", None)
 
 try:
@@ -104,7 +105,7 @@ try:
 except ImportError:
     _updater_mod = None
 
-RAW_APP_VERSION = "1.9.4"
+RAW_APP_VERSION = "1.9.5"
 APP_VERSION = f"v{RAW_APP_VERSION}"
 check_for_updates = getattr(_updater_mod, "check_for_updates", None)
 download_and_apply_update = getattr(_updater_mod, "download_and_apply_update", None)
@@ -2805,13 +2806,16 @@ class ScatteredRevisionApp:
         path_frame.pack(side=tk.TOP, fill=tk.X, pady=(0, 6))
         path_frame.columnconfigure(1, weight=1)
 
-        self.lbl_input_docx = ttk.Label(path_frame, text="待整理文档 (.docx)：")
+        self.lbl_input_docx = ttk.Label(path_frame, text="待整理文档/目录：")
         self.lbl_input_docx.grid(row=0, column=0, sticky=tk.W, pady=2)
         self.ent_input_docx = ttk.Entry(path_frame, textvariable=self.input_docx_var)
         self.ent_input_docx.grid(row=0, column=1, sticky=tk.EW, pady=2, padx=4)
         inp_btns = ttk.Frame(path_frame)
         inp_btns.grid(row=0, column=2, columnspan=2, sticky=tk.W)
-        ttk.Button(inp_btns, text="浏览...", style="Compact.TButton", command=self._browse_input).pack(
+        ttk.Button(inp_btns, text="选文件...", style="Compact.TButton", command=self._browse_input).pack(
+            side=tk.LEFT, padx=2
+        )
+        ttk.Button(inp_btns, text="选文件夹...", style="Compact.TButton", command=self._browse_input_dir).pack(
             side=tk.LEFT, padx=2
         )
         self.btn_refresh_input = ttk.Button(
@@ -4374,26 +4378,31 @@ class ScatteredRevisionApp:
     def _refresh_input_docx_status(self):
         raw = self.input_docx_var.get().strip()
         if not raw:
-            messagebox.showinfo("提示", "请先选择或拖入【待整理文档 (.docx)】。")
+            messagebox.showinfo("提示", "请先选择或拖入【待整理文档 / 文件夹】。")
             return
-        try:
-            p = Path(raw).resolve()
-        except Exception as ex:
-            messagebox.showwarning("路径无效", _format_exception_concise(ex))
-            return
-        if not p.is_file():
-            msg = f"未在磁盘找到待整理文档：{p}"
+        files = resolve_sc1_input_docx_list(raw) if callable(resolve_sc1_input_docx_list) else []
+        if not files:
+            msg = f"未在指定路径中找到有效的 .docx 文档：{raw}"
             self._append_log(f"⚠️ {msg}", target_tab="main")
-            messagebox.showwarning("文件不存在", msg)
+            messagebox.showwarning("未找到文档", msg)
             return
-        st = p.stat()
-        mtime_str = datetime.fromtimestamp(st.st_mtime).strftime("%Y-%m-%d %H:%M:%S")
-        size_kb = max(1, int(round(st.st_size / 1024.0)))
-        log_msg = (
-            f"🔄 已刷新待整理文档状态：{p.name}（最后修改：{mtime_str}，大小：{size_kb} KB；每次点击运行均自动读取磁盘最新内容）"
-        )
-        self._append_log(log_msg, target_tab="main")
-        self.stage_var.set(f"已刷新待整理文档状态：{p.name}（最后修改 {mtime_str}）")
+        if len(files) == 1:
+            p = files[0]
+            st = p.stat()
+            mtime_str = datetime.fromtimestamp(st.st_mtime).strftime("%Y-%m-%d %H:%M:%S")
+            size_kb = max(1, int(round(st.st_size / 1024.0)))
+            log_msg = (
+                f"🔄 已刷新待整理文档状态：{p.name}（最后修改：{mtime_str}，大小：{size_kb} KB；每次点击运行均自动读取磁盘最新内容）"
+            )
+            self._append_log(log_msg, target_tab="main")
+            self.stage_var.set(f"已刷新待整理文档状态：{p.name}（最后修改 {mtime_str}）")
+        else:
+            latest_m = max(f.stat().st_mtime for f in files)
+            mtime_str = datetime.fromtimestamp(latest_m).strftime("%Y-%m-%d %H:%M:%S")
+            preview_names = "、".join(f.name for f in files[:3]) + (f" 等 {len(files)} 份" if len(files) > 3 else "")
+            log_msg = f"🔄 已刷新待整理批量列表：共检测到 {len(files)} 份 .docx 文档（{preview_names} | 最近修改：{mtime_str}）"
+            self._append_log(log_msg, target_tab="main")
+            self.stage_var.set(f"已载入 {len(files)} 份待整理文档（最近修改 {mtime_str}）")
 
     def _browse_sc1_master_file(self):
         p = filedialog.askopenfilename(
@@ -4457,17 +4466,46 @@ class ScatteredRevisionApp:
             self._append_log(f"📥 已设定【未入库改点包目录】：{target_dir}", target_tab="main")
 
     def _on_drop_input_docx(self, paths: list[Path]):
+        if len(paths) == 1 and paths[0].resolve().is_dir():
+            d_resolved = paths[0].resolve()
+            docxs = resolve_sc1_input_docx_list(d_resolved) if callable(resolve_sc1_input_docx_list) else self._extract_docx_from_paths([d_resolved])
+            if not docxs:
+                messagebox.showinfo("拖拽提示", f"文件夹中未找到待整理的 .docx 文档：\n{d_resolved}")
+                return
+            self.input_docx_var.set(str(d_resolved))
+            if not self.output_dir_var.get().strip():
+                self.output_dir_var.set(str(d_resolved.parent / f"{d_resolved.name}_整理输出"))
+            self._save_settings()
+            self._append_log(
+                f"📥 已拖入【待整理文件夹】：{d_resolved}（共识别到 {len(docxs)} 份 .docx 文档）",
+                target_tab="main",
+            )
+            self.stage_var.set(f"📥 已载入待整理文件夹：{d_resolved.name}（共 {len(docxs)} 份文档）")
+            return
+
         docxs = self._extract_docx_from_paths(paths)
         if not docxs:
-            messagebox.showinfo("拖拽提示", "【待整理文档】请拖入 .docx 格式的 Word 文档。")
+            messagebox.showinfo("拖拽提示", "【待整理文档/目录】请拖入 .docx 文档或包含多个 .docx 的文件夹。")
             return
-        picked = docxs[0]
-        self.input_docx_var.set(str(picked))
-        if not self.output_dir_var.get().strip():
-            self.output_dir_var.set(str(picked.parent))
-        self._save_settings()
-        self._append_log(f"📥 已拖入【待整理文档】：{picked}", target_tab="main")
-        self.stage_var.set(f"📥 已载入待整理文档：{picked.name}")
+        if len(docxs) == 1:
+            picked = docxs[0]
+            self.input_docx_var.set(str(picked))
+            if not self.output_dir_var.get().strip():
+                self.output_dir_var.set(str(picked.parent))
+            self._save_settings()
+            self._append_log(f"📥 已拖入【待整理文档】：{picked}", target_tab="main")
+            self.stage_var.set(f"📥 已载入待整理文档：{picked.name}")
+        else:
+            joined = " ; ".join(str(p) for p in docxs)
+            self.input_docx_var.set(joined)
+            if not self.output_dir_var.get().strip():
+                self.output_dir_var.set(str(docxs[0].parent / "零散改点整理输出"))
+            self._save_settings()
+            self._append_log(
+                f"📥 已批量拖入 {len(docxs)} 份【待整理文档】：{docxs[0].name} 等",
+                target_tab="main",
+            )
+            self.stage_var.set(f"📥 已批量载入 {len(docxs)} 份待整理文档")
 
     def _on_drop_library_dir(self, paths: list[Path]):
         p = paths[0].resolve()
@@ -4504,6 +4542,7 @@ class ScatteredRevisionApp:
                 continue
 
         applied = []
+        pending_inp_docs: list[Path] = []
         for df in docx_files:
             if any(tok in df.name for tok in ("最新中英", "标you")) and (
                 self.input_docx_var.get().strip() or len(docx_files) >= 2
@@ -4513,11 +4552,27 @@ class ScatteredRevisionApp:
                 applied.append(f"最新中英底稿={df.name}")
                 self._append_log(f"📥 已识别并载入【最新中英底稿】：{df}", target_tab="main")
             else:
-                self.input_docx_var.set(str(df))
-                if not self.output_dir_var.get().strip():
-                    self.output_dir_var.set(str(df.parent))
-                applied.append(f"待整理文档={df.name}")
-                self._append_log(f"📥 已载入【待整理文档】：{df}", target_tab="main")
+                pending_inp_docs.append(df)
+
+        if len(pending_inp_docs) == 1:
+            df = pending_inp_docs[0]
+            self.input_docx_var.set(str(df))
+            if not self.output_dir_var.get().strip():
+                self.output_dir_var.set(str(df.parent))
+            applied.append(f"待整理文档={df.name}")
+            self._append_log(f"📥 已载入【待整理文档】：{df}", target_tab="main")
+        elif len(pending_inp_docs) > 1:
+            self.input_docx_var.set(" ; ".join(str(x) for x in pending_inp_docs))
+            if not self.output_dir_var.get().strip():
+                self.output_dir_var.set(str(pending_inp_docs[0].parent / "零散改点整理输出"))
+            applied.append(f"待整理文档={len(pending_inp_docs)}份")
+            self._append_log(
+                f"📥 已批量载入 {len(pending_inp_docs)} 份【待整理文档】：{pending_inp_docs[0].name} 等",
+                target_tab="main",
+            )
+
+        def _looks_like_library_dir(dir_p: Path) -> bool:
+            return any(tok in dir_p.name for tok in ("神话", "总库", "七卷", "1-1-1"))
 
         if len(dirs) == 1:
             d = dirs[0]
@@ -4531,13 +4586,30 @@ class ScatteredRevisionApp:
                 self.sc1_sync_master_var.set(True)
                 applied.append(f"最新中英底稿目录={d.name}")
                 self._append_log(f"📥 已识别并载入【最新中英底稿目录】：{d}", target_tab="main")
+            elif any(tok in d.name.lower() for tok in ("输出", "output")):
+                self.output_dir_var.set(str(d))
+                applied.append(f"输出目录={d.name}")
+                self._append_log(f"📥 已填入【输出保存目录】：{d}", target_tab="main")
+            elif _looks_like_library_dir(d):
+                self.library_dir_var.set(str(d))
+                applied.append(f"总库目录={d.name}")
+                self._append_log(f"📥 已载入【对应语种总库目录】：{d}", target_tab="main")
+                self._warm_library_index_async(str(d), target_tab="main")
+            elif not self.input_docx_var.get().strip() or any(tok in d.name for tok in ("待整理", "改点", "选段")):
+                cnt_d = len(resolve_sc1_input_docx_list(d)) if callable(resolve_sc1_input_docx_list) else len(self._extract_docx_from_paths([d]))
+                self.input_docx_var.set(str(d))
+                if not self.output_dir_var.get().strip():
+                    self.output_dir_var.set(str(d.parent / f"{d.name}_整理输出"))
+                applied.append(f"待整理文件夹={d.name}({cnt_d}份)")
+                self._append_log(f"📥 已载入【待整理文件夹】：{d}（共 {cnt_d} 份 .docx 文档）", target_tab="main")
             else:
                 self.library_dir_var.set(str(d))
                 applied.append(f"总库目录={d.name}")
                 self._append_log(f"📥 已载入【对应语种总库目录】：{d}", target_tab="main")
                 self._warm_library_index_async(str(d), target_tab="main")
         elif len(dirs) >= 2:
-            lib_assigned = False
+            lib_assigned = bool(self.library_dir_var.get().strip())
+            inp_assigned = bool(self.input_docx_var.get().strip())
             for d in dirs:
                 if "未入库" in d.name:
                     self.sc1_dedup_dir_var.set(str(d))
@@ -4549,7 +4621,19 @@ class ScatteredRevisionApp:
                     self.sc1_sync_master_var.set(True)
                     applied.append(f"最新中英底稿目录={d.name}")
                     continue
-                if not lib_assigned:
+                if _looks_like_library_dir(d) or (inp_assigned and not lib_assigned):
+                    self.library_dir_var.set(str(d))
+                    lib_assigned = True
+                    applied.append(f"总库目录={d.name}")
+                    self._append_log(f"📥 已载入【对应语种总库目录】：{d}", target_tab="main")
+                    self._warm_library_index_async(str(d), target_tab="main")
+                elif not inp_assigned:
+                    cnt_d = len(resolve_sc1_input_docx_list(d)) if callable(resolve_sc1_input_docx_list) else len(self._extract_docx_from_paths([d]))
+                    self.input_docx_var.set(str(d))
+                    inp_assigned = True
+                    applied.append(f"待整理文件夹={d.name}({cnt_d}份)")
+                    self._append_log(f"📥 已载入【待整理文件夹】：{d}（共 {cnt_d} 份 .docx 文档）", target_tab="main")
+                elif not lib_assigned:
                     self.library_dir_var.set(str(d))
                     lib_assigned = True
                     applied.append(f"总库目录={d.name}")
@@ -6015,15 +6099,34 @@ class ScatteredRevisionApp:
             self.key_entry.configure(show="" if self.show_key_var.get() else "•")
 
     def _browse_input(self):
-        p = filedialog.askopenfilename(
-            title="选择待整理 Word 文档",
+        ps = filedialog.askopenfilenames(
+            title="选择待整理 Word 文档（可按住 Ctrl/Shift 多选）",
             filetypes=[("Word 文档", "*.docx")],
         )
-        if p:
-            self.input_docx_var.set(p)
-            if not self.output_dir_var.get().strip():
-                self.output_dir_var.set(str(Path(p).parent))
+        if ps:
+            if len(ps) == 1:
+                self.input_docx_var.set(ps[0])
+                if not self.output_dir_var.get().strip():
+                    self.output_dir_var.set(str(Path(ps[0]).parent))
+                self._append_log(f"📥 已选择【待整理文档】：{ps[0]}", target_tab="main")
+            else:
+                self.input_docx_var.set(" ; ".join(ps))
+                if not self.output_dir_var.get().strip():
+                    self.output_dir_var.set(str(Path(ps[0]).parent / "零散改点整理输出"))
+                self._append_log(f"📥 已批量选择 {len(ps)} 份【待整理文档】", target_tab="main")
             self._save_settings()
+
+    def _browse_input_dir(self):
+        d = filedialog.askdirectory(title="选择包含待整理 .docx 文档的文件夹")
+        if d:
+            d_p = Path(d).resolve()
+            cnt = len(resolve_sc1_input_docx_list(d_p)) if callable(resolve_sc1_input_docx_list) else len(self._extract_docx_from_paths([d_p]))
+            self.input_docx_var.set(str(d_p))
+            if not self.output_dir_var.get().strip():
+                self.output_dir_var.set(str(d_p.parent / f"{d_p.name}_整理输出"))
+            self._save_settings()
+            self._append_log(f"📥 已选择【待整理文件夹】：{d_p}（共识别到 {cnt} 份 .docx 文档）", target_tab="main")
+            self.stage_var.set(f"📥 已载入待整理文件夹：{d_p.name}（共 {cnt} 份文档）")
 
     def _browse_library(self):
         d = filedialog.askdirectory(title="选择对应语种《七卷书》总库文件夹")
@@ -6296,10 +6399,15 @@ class ScatteredRevisionApp:
         lib = self.library_dir_var.get().strip()
         out = self.output_dir_var.get().strip()
         if not inp or not lib or not out:
-            messagebox.showwarning("提示", "请先选择【待整理文档】、【对应语种总库目录】和【输出保存目录】。")
+            messagebox.showwarning("提示", "请先选择【待整理文档/目录】、【对应语种总库目录】和【输出保存目录】。")
             return
-        if not Path(inp).is_file():
-            messagebox.showwarning("提示", f"未在磁盘找到待整理文档：\n{inp}")
+        resolved_inp_files = (
+            resolve_sc1_input_docx_list(inp)
+            if callable(resolve_sc1_input_docx_list)
+            else ([Path(inp).resolve()] if Path(inp).is_file() else [])
+        )
+        if not resolved_inp_files:
+            messagebox.showwarning("提示", f"未在指定路径或文件夹中找到待整理的 .docx 文档：\n{inp}")
             return
         if run_oneclick_pipeline is None:
             messagebox.showerror("组件未就绪", "未找到 pipeline.run_oneclick_pipeline，请检查程序文件完整性。")
@@ -6410,6 +6518,9 @@ class ScatteredRevisionApp:
                     progress_fn=self._progress,
                 )
                 saved_files = list(res.get("saved_files") or [])
+                proc_docs = int(res.get("processed_docs_count") or 1)
+                total_inp_docs = int(res.get("total_input_docs") or proc_docs)
+                failed_docs = list(res.get("failed_docs") or [])
                 det_lang = res.get("lang_code") or lang
                 if det_lang and str(det_lang).upper() not in ("AUTO", "XX"):
                     self.log_queue.put(("record_recent_lang", str(det_lang)))
@@ -6418,11 +6529,18 @@ class ScatteredRevisionApp:
                 used_local_fallback = bool(res.get("used_local_fallback", False))
                 up_words = res.get("up_words")
                 rv_words = res.get("rv_words")
-                dup_cnt = int(res.get("duplicate_count") or 0)
+                dup_cnt = int(res.get("duplicate_count") or res.get("dedup_removed_count") or 0)
                 dup_rep = str(res.get("duplicate_report") or res.get("dedup_report") or "")
 
                 files_str = "\n".join(saved_files)
+                popup_files_str = (
+                    "\n".join(saved_files[:14]) + f"\n...（其余 {len(saved_files) - 14} 份文件已保存在输出目录）"
+                    if len(saved_files) > 14
+                    else files_str
+                )
                 extra_notes: list[str] = []
+                if failed_docs:
+                    extra_notes.append("⚠️ 部分文档处理失败：\n" + "\n".join(failed_docs[:6]))
                 if not highlight_colors:
                     extra_notes.append("ℹ️ 输出模式：仅保留第 2 列英文对比修订痕迹（未标记黄/青高亮）")
                 elif effective_enable_ai and used_local_fallback:
@@ -6451,10 +6569,11 @@ class ScatteredRevisionApp:
 
                 wc_line = ""
                 if up_words is not None and rv_words is not None and highlight_colors:
-                    wc_line = f"\n第 2 列统计：RV {rv_words} words, UP {up_words} words"
+                    wc_line = f"\n第 2 列合计统计：RV {rv_words} words, UP {up_words} words" if total_inp_docs > 1 else f"\n第 2 列统计：RV {rv_words} words, UP {up_words} words"
 
+                batch_prefix = f"已整理 {proc_docs}/{total_inp_docs} 份待整理文档，" if total_inp_docs > 1 else ""
                 self._log(
-                    f"🎉 一键输出定稿完成！（语种：{det_disp}）共输出 {len(saved_files)} 份文件：\n{files_str}",
+                    f"🎉 一键输出定稿完成！（语种：{det_disp}）{batch_prefix}共输出 {len(saved_files)} 份文件：\n{files_str}",
                     target_tab="main",
                 )
 
@@ -6469,10 +6588,12 @@ class ScatteredRevisionApp:
                     stage_flags.append(f"跳过 {skipped_count} 行未匹配")
                 if dup_cnt > 0:
                     stage_flags.append(f"剔除 {dup_cnt} 处重复")
+                if failed_docs:
+                    stage_flags.append(f"失败 {len(failed_docs)} 份")
                 flag_suffix = f"；{'，'.join(stage_flags)}" if stage_flags else ""
 
                 self.log_queue.put(
-                    ("done", (True, f"一键输出定稿完成！（{det_disp}，共 {len(saved_files)} 份文件{flag_suffix}）", "main"))
+                    ("done", (True, f"一键输出定稿完成！（{det_disp}，{batch_prefix}共 {len(saved_files)} 份文件{flag_suffix}）", "main"))
                 )
                 notes_block = ("\n\n" + "\n".join(extra_notes)) if extra_notes else ""
                 self.log_queue.put(
@@ -6480,7 +6601,7 @@ class ScatteredRevisionApp:
                         "popup_info",
                         (
                             "一键输出定稿完成",
-                            f"语种：{det_disp}{wc_line}\n已成功生成 {len(saved_files)} 份定稿文档：\n\n{files_str}{notes_block}",
+                            f"语种：{det_disp}{wc_line}\n{batch_prefix}已成功生成 {len(saved_files)} 份定稿文档：\n\n{popup_files_str}{notes_block}",
                         ),
                     )
                 )
@@ -6533,8 +6654,8 @@ def _run_frozen_self_test() -> int:
     from ai_client import format_friendly_api_error as _ai_friendly_err
     from ai_client import local_align_col3_spans
 
-    if RAW_APP_VERSION != "1.9.4":
-        raise RuntimeError(f"RAW_APP_VERSION expected '1.9.4', got {RAW_APP_VERSION!r}")
+    if RAW_APP_VERSION != "1.9.5":
+        raise RuntimeError(f"RAW_APP_VERSION expected '1.9.5', got {RAW_APP_VERSION!r}")
 
     is_frozen = bool(getattr(sys, "frozen", False))
     if is_frozen and hasattr(sys, "_MEIPASS"):
@@ -6683,6 +6804,10 @@ def _run_frozen_self_test() -> int:
         import fellowship_processor as _fp_test
         if not callable(getattr(_fp_test, "verify_and_retain_fellowship_comments", None)):
             raise RuntimeError("fellowship_processor.verify_and_retain_fellowship_comments missing in self-test")
+        if not callable(getattr(_li_test, "analyze_sent_col2_vs_library", None)) or not callable(
+            getattr(_li_test, "evaluate_proofread_sheet_rows", None)
+        ):
+            raise RuntimeError("library_ingester 3A/proofread validators missing in self-test")
 
         for req_fn in ("parse_titles_text_or_file", "parse_titles_multiline", "resolve_full_articles", "run_full_article_pipeline"):
             if not callable(getattr(_fap_test, req_fn, None)):
@@ -6694,8 +6819,11 @@ def _run_frozen_self_test() -> int:
         if not callable(getattr(_dd_test, "check_and_export_duplicates", None)):
             raise RuntimeError("dedup_checker.check_and_export_duplicates missing in self-test")
 
+        if not callable(resolve_sc1_input_docx_list):
+            raise RuntimeError("pipeline.resolve_sc1_input_docx_list missing in self-test")
+
         upd_ver = str(getattr(_upd_test, "APP_VERSION", "")).lstrip("vV")
-        expected_vers = ("1.9.4",) if require_v18_siblings else ("1.7.0", "1.8.0", "1.8.1", "1.9.0", "1.9.1", "1.9.2", "1.9.3", "1.9.4")
+        expected_vers = ("1.9.5",) if require_v18_siblings else ("1.7.0", "1.8.0", "1.8.1", "1.9.0", "1.9.1", "1.9.2", "1.9.3", "1.9.4", "1.9.5")
         if upd_ver not in expected_vers:
             raise RuntimeError(f"updater.APP_VERSION mismatch: {getattr(_upd_test, 'APP_VERSION', None)!r}")
         if not callable(getattr(_upd_test, "check_for_updates", None)) or not callable(

@@ -1064,10 +1064,86 @@ def run_step2_pipeline(
     }
 
 
-def run_oneclick_pipeline(
-    input_docx: str,
-    library_dir: str,
-    output_dir: str,
+def _is_generated_sc1_artifact_name(filename: str) -> bool:
+    """Skip previously generated output artifacts when scanning an input directory."""
+    nm = (filename or "").strip()
+    if not nm or nm.startswith("~$") or nm.startswith("."):
+        return True
+    skip_tokens = (
+        "_提取三语原稿_",
+        "_完整留底版",
+        "_无改点版",
+        "查重结果明细报告",
+        "_初筛稿",
+    )
+    return any(tok in nm for tok in skip_tokens)
+
+
+def resolve_sc1_input_docx_list(input_docx: Union[str, Path, Sequence[Union[str, Path]]]) -> List[Path]:
+    """
+    Resolve Scenario 1 (`零散改点整理`) input specification into an ordered, deduplicated list of `.docx` files.
+    Supports:
+      - A single `.docx` path
+      - A folder path containing multiple `.docx` files (top-level first, recursive fallback)
+      - Multiple `.docx` / folder paths joined by `;` or `\\n`
+      - A Python list/tuple of paths
+    """
+    raw_items: List[str] = []
+    if isinstance(input_docx, (list, tuple, set)):
+        for x in input_docx:
+            if str(x or "").strip():
+                raw_items.append(str(x).strip())
+    else:
+        s = str(input_docx or "").strip()
+        if s:
+            for part in re.split(r"[;\r\n]+", s):
+                clean_p = part.strip().strip('"').strip("'")
+                if clean_p:
+                    raw_items.append(clean_p)
+
+    def _nat_key(p: Path):
+        return [int(tok) if tok.isdigit() else tok.lower() for tok in re.split(r"(\d+)", p.name)]
+
+    resolved: List[Path] = []
+    seen_norm: set = set()
+
+    def _add_file(fp: Path):
+        rp = fp.resolve()
+        nk = os.path.normcase(str(rp))
+        if nk not in seen_norm:
+            seen_norm.add(nk)
+            resolved.append(rp)
+
+    for item in raw_items:
+        p = Path(item)
+        if not p.exists():
+            continue
+        rp = p.resolve()
+        if rp.is_file():
+            if rp.suffix.lower() == ".docx" and not rp.name.startswith("~$"):
+                _add_file(rp)
+        elif rp.is_dir():
+            top_docs = sorted(
+                (f for f in rp.glob("*.docx") if f.is_file() and not _is_generated_sc1_artifact_name(f.name)),
+                key=_nat_key,
+            )
+            if top_docs:
+                for f in top_docs:
+                    _add_file(f)
+            else:
+                sub_docs = sorted(
+                    (f for f in rp.rglob("*.docx") if f.is_file() and not _is_generated_sc1_artifact_name(f.name)),
+                    key=_nat_key,
+                )
+                for f in sub_docs:
+                    _add_file(f)
+    return resolved
+
+
+def _run_single_oneclick_pipeline(
+    inp_p: Path,
+    lib_p: Path,
+    out_d: Path,
     api_key: Union[str, List[str], ApiKeyPool] = "",
     model: str = "gemini-3.5-flash-lite",
     api_mode: str = "auto",
@@ -1080,31 +1156,17 @@ def run_oneclick_pipeline(
     scattered_keyword: str = "",
     balance_columns: bool = True,
     dedup_pkg_dir: str = "",
-    date_str: str = "",
+    eff_date: str = "",
     log_fn: Optional[Callable[[str], None]] = None,
     progress_fn: Optional[Callable[[float, str], None]] = None,
-    date_mmdd: str = "",
     latest_master_path: str = "",
     highlight_colors: bool = True,
     highlight_mode: Optional[str] = None,
     yellow_gap_words: int = 3,
     export_raw_trilingual: bool = True,
+    skip_index_warmup: bool = False,
 ) -> dict:
-    """
-    One-click end-to-end Scattered Revision pipeline:
-      1. Optionally syncs `input_docx` against `latest_master_path` (`{原名}{YYYYMMDD}更新.docx`);
-      2. Warms/loads the persistent multi-threaded library index (checking live `os.stat` on disk);
-      3. Runs Step 1 in a fresh ephemeral workdir (optionally exporting `_提取三语原稿_`);
-      4. Runs Step 2 (respecting 3-way `highlight_mode`: `en_foreign`, `all_three`, `revisions_only`);
-      5. Keeps ALL single-doc outputs flat in `output_dir` (NO subfolders) and cleans up ephemeral workdirs.
-    """
-    inp_p = Path(input_docx).resolve()
-    lib_p = Path(library_dir).resolve()
-    out_d = Path(output_dir).resolve()
-    if not inp_p.exists():
-        raise FileNotFoundError(f"找不到待整理文档：{inp_p}")
-    if not lib_p.exists():
-        raise FileNotFoundError(f"找不到语种总库文件夹：{lib_p}")
+    """Execute one-click Scattered Revision pipeline for a single resolved `inp_p` `.docx` file."""
     out_d.mkdir(parents=True, exist_ok=True)
 
     eff_hl_mode, use_hl, _ = resolve_highlight_mode(highlight_mode, highlight_colors)
@@ -1116,7 +1178,7 @@ def run_oneclick_pipeline(
         enable_ai=eff_enable_ai,
     )
 
-    eff_date = (date_str or date_mmdd or "").strip() or datetime.now().strftime("%Y%m%d")
+    eff_date = (eff_date or "").strip() or datetime.now().strftime("%Y%m%d")
 
     pre_saved_files: List[str] = []
     master_sync_res: Optional[dict] = None
@@ -1136,14 +1198,15 @@ def run_oneclick_pipeline(
         pre_saved_files.append(upd_path_str)
         effective_input_p = Path(upd_path_str).resolve()
 
-    if progress_fn:
-        progress_fn(3.0, "正在预热/加载语种总库检索索引...")
-    idx_stats = ensure_library_index(str(lib_p), log_fn=log_fn)
-    if log_fn:
-        log_fn(
-            f"📚 语种总库索引就绪：共 {idx_stats.get('total_files', 0)} 篇文档"
-            f"（{idx_stats.get('total_rows', 0)} 段，耗时 {idx_stats.get('elapsed_sec', 0.0):.2f}s）"
-        )
+    if not skip_index_warmup:
+        if progress_fn:
+            progress_fn(3.0, "正在预热/加载语种总库检索索引...")
+        idx_stats = ensure_library_index(str(lib_p), log_fn=log_fn)
+        if log_fn:
+            log_fn(
+                f"📚 语种总库索引就绪：共 {idx_stats.get('total_files', 0)} 篇文档"
+                f"（{idx_stats.get('total_rows', 0)} 段，耗时 {idx_stats.get('elapsed_sec', 0.0):.2f}s）"
+            )
 
     resolved_doc_name = _resolve_pipeline_doc_label(
         explicit_doc_name=doc_name,
@@ -1249,6 +1312,7 @@ def run_oneclick_pipeline(
 
     return {
         "saved_files": all_saved,
+        "step2_files": list(r2.get("saved_files") or []),
         "lang_code": r2.get("lang_code") or det_lang,
         "skipped_count": len(skipped_rows),
         "skipped_rows": skipped_rows,
@@ -1263,4 +1327,276 @@ def run_oneclick_pipeline(
         "raw_trilingual_path": r1.get("raw_trilingual_path", ""),
         "updated_master_docx_path": pre_saved_files[0] if pre_saved_files else "",
         "master_sync_result": master_sync_res,
+    }
+
+
+def _disambiguate_batch_dest(dst_dir: Path, filename: str, fallback_tag: str = "") -> Path:
+    """Ensure `dst_dir / filename` never overwrites an existing file from an earlier document in the same batch."""
+    dst_dir.mkdir(parents=True, exist_ok=True)
+    cand = docx_xml_utils.safe_join_output_file(dst_dir, filename)
+    if not cand.exists():
+        return cand
+    stem = Path(filename).stem
+    ext = Path(filename).suffix or ".docx"
+    # Insert fallback_tag or numeric counter before `_(RV` / `_(UP` / `_YYYYMMDD` if present
+    m_tail = re.search(r"(_\((?:RV|UP)\b.*|_\d{8})$", stem)
+    for k in range(2, 500):
+        tag = f"_{fallback_tag}" if (k == 2 and fallback_tag and fallback_tag not in stem) else f"_{k}"
+        if m_tail:
+            new_stem = stem[: m_tail.start()] + tag + stem[m_tail.start() :]
+        else:
+            new_stem = f"{stem}{tag}"
+        cand_k = docx_xml_utils.safe_join_output_file(dst_dir, f"{new_stem}{ext}")
+        if not cand_k.exists():
+            return cand_k
+    return cand
+
+
+def run_oneclick_pipeline(
+    input_docx: Union[str, Path, Sequence[Union[str, Path]]],
+    library_dir: str,
+    output_dir: str,
+    api_key: Union[str, List[str], ApiKeyPool] = "",
+    model: str = "gemini-3.5-flash-lite",
+    api_mode: str = "auto",
+    rotation_mode: str = "round_robin",
+    lang: str = "AUTO",
+    doc_name: str = "",
+    dual_outputs: bool = True,
+    enable_ai: bool = True,
+    naming_mode: str = "scattered",
+    scattered_keyword: str = "",
+    balance_columns: bool = True,
+    dedup_pkg_dir: str = "",
+    date_str: str = "",
+    log_fn: Optional[Callable[[str], None]] = None,
+    progress_fn: Optional[Callable[[float, str], None]] = None,
+    date_mmdd: str = "",
+    latest_master_path: str = "",
+    highlight_colors: bool = True,
+    highlight_mode: Optional[str] = None,
+    yellow_gap_words: int = 3,
+    export_raw_trilingual: bool = True,
+) -> dict:
+    """
+    One-click end-to-end Scattered Revision pipeline supporting BOTH:
+      - Single `.docx` input (flat output in `output_dir`, 100% backward-compatible)
+      - Multi-file / Folder input (`len(input_files) > 1`): warms library index once, processes every
+        `.docx` in order, preserves distinct per-document names without collisions, and neatly archives
+        multi-doc variants into `给译者版/` & `完整留底版/` when `dual_outputs=True`.
+    """
+    input_files = resolve_sc1_input_docx_list(input_docx)
+    lib_p = Path(library_dir).resolve()
+    out_d = Path(output_dir).resolve()
+    if not input_files:
+        raise FileNotFoundError(f"未在待整理路径中找到有效的 .docx 文档：{input_docx}")
+    if not lib_p.exists():
+        raise FileNotFoundError(f"找不到语种总库文件夹：{lib_p}")
+    out_d.mkdir(parents=True, exist_ok=True)
+    eff_date = (date_str or date_mmdd or "").strip() or datetime.now().strftime("%Y%m%d")
+
+    # Single-file fast path: 100% identical flat output behavior
+    if len(input_files) == 1:
+        res_single = _run_single_oneclick_pipeline(
+            inp_p=input_files[0],
+            lib_p=lib_p,
+            out_d=out_d,
+            api_key=api_key,
+            model=model,
+            api_mode=api_mode,
+            rotation_mode=rotation_mode,
+            lang=lang,
+            doc_name=doc_name,
+            dual_outputs=dual_outputs,
+            enable_ai=enable_ai,
+            naming_mode=naming_mode,
+            scattered_keyword=scattered_keyword,
+            balance_columns=balance_columns,
+            dedup_pkg_dir=dedup_pkg_dir,
+            eff_date=eff_date,
+            log_fn=log_fn,
+            progress_fn=progress_fn,
+            latest_master_path=latest_master_path,
+            highlight_colors=highlight_colors,
+            highlight_mode=highlight_mode,
+            yellow_gap_words=yellow_gap_words,
+            export_raw_trilingual=export_raw_trilingual,
+            skip_index_warmup=False,
+        )
+        res_single["processed_docs_count"] = 1
+        res_single["failed_docs"] = []
+        return res_single
+
+    # Multi-document / Folder Batch Mode (`len(input_files) > 1`)
+    total_docs = len(input_files)
+    if log_fn:
+        log_fn(f"📂 批量零散改点模式：共检测到 {total_docs} 份待整理 .docx 文档，开始预热总库索引并逐份整理...")
+    if progress_fn:
+        progress_fn(2.0, f"正在预热语种总库索引（共 {total_docs} 份待整理文档）...")
+
+    idx_stats = ensure_library_index(str(lib_p), log_fn=log_fn)
+    if log_fn:
+        log_fn(
+            f"📚 语种总库索引就绪：共 {idx_stats.get('total_files', 0)} 篇文档"
+            f"（{idx_stats.get('total_rows', 0)} 段，耗时 {idx_stats.get('elapsed_sec', 0.0):.2f}s）"
+        )
+
+    eff_hl_mode, use_hl, _ = resolve_highlight_mode(highlight_mode, highlight_colors)
+    shared_pool, eff_rot, _, _ = _prepare_optional_pool(
+        api_key=api_key,
+        rotation_mode=rotation_mode,
+        enable_ai=bool(enable_ai and use_hl),
+    )
+
+    all_saved_batch: List[str] = []
+    all_skipped_rows: List[dict] = []
+    failed_docs: List[str] = []
+    total_up = 0
+    total_rv = 0
+    total_spans = 0
+    total_edited = 0
+    total_dedup = 0
+    any_local_fallback = False
+    last_fb_reason = ""
+    detected_lang_final = lang
+
+    translator_dir = (out_d / "给译者版") if dual_outputs else out_d
+    archive_dir = out_d / "完整留底版"
+    unchanged_dir = out_d / "无改点版"
+    raw_tri_dir = out_d / "提取三语原稿"
+    master_upd_dir = out_d / "底稿同步更新"
+
+    for doc_idx, cur_inp in enumerate(input_files):
+        base_pct = 5.0 + (doc_idx / total_docs) * 92.0
+        span_pct = 92.0 / total_docs
+        if log_fn:
+            log_fn(f"\n📄 === [{doc_idx + 1}/{total_docs}] 正在整理：{cur_inp.name} ===")
+
+        def _sub_prog(pct_inner: float, msg_inner: str, _b=base_pct, _s=span_pct, _i=doc_idx + 1, _nm=cur_inp.name):
+            if progress_fn:
+                progress_fn(_b + (pct_inner / 100.0) * _s, f"[{_i}/{total_docs} {_nm}] {msg_inner}")
+
+        # Determine safe per-file naming in batch mode so multiple files never collapse onto the same name
+        eff_doc_name = ""
+        eff_naming_mode = naming_mode
+        eff_kw = (scattered_keyword or "").strip()
+        if (doc_name or "").strip():
+            eff_doc_name = f"{doc_name.strip()}_{doc_idx + 1}"
+            eff_naming_mode = "keep"
+        elif (naming_mode or "").strip().lower() == "scattered" and not eff_kw:
+            # When no custom keyword is set in batch mode, preserve each file's own distinct title/stem!
+            eff_naming_mode = "keep"
+
+        stage_dir = Path(tempfile.mkdtemp(prefix=f"sc1_batch_{doc_idx + 1}_"))
+        try:
+            sub_res = _run_single_oneclick_pipeline(
+                inp_p=cur_inp,
+                lib_p=lib_p,
+                out_d=stage_dir,
+                api_key=shared_pool,
+                model=model,
+                api_mode=api_mode,
+                rotation_mode=eff_rot,
+                lang=lang,
+                doc_name=eff_doc_name,
+                dual_outputs=dual_outputs,
+                enable_ai=enable_ai,
+                naming_mode=eff_naming_mode,
+                scattered_keyword=eff_kw,
+                balance_columns=balance_columns,
+                dedup_pkg_dir=dedup_pkg_dir,
+                eff_date=eff_date,
+                log_fn=log_fn,
+                progress_fn=_sub_prog,
+                latest_master_path=latest_master_path,
+                highlight_colors=highlight_colors,
+                highlight_mode=eff_hl_mode,
+                yellow_gap_words=yellow_gap_words,
+                export_raw_trilingual=export_raw_trilingual,
+                skip_index_warmup=True,
+            )
+
+            orig_tag = clean_doc_label(cur_inp.stem)[:32]
+            if sub_res.get("lang_code") and sub_res["lang_code"] != "XX":
+                detected_lang_final = sub_res["lang_code"]
+            total_up += int(sub_res.get("up_words", 0))
+            total_rv += int(sub_res.get("rv_words", 0))
+            total_spans += int(sub_res.get("total_spans", 0))
+            total_edited += int(sub_res.get("edited_sentences", 0))
+            total_dedup += int(sub_res.get("dedup_removed_count", 0))
+            all_skipped_rows.extend(sub_res.get("skipped_rows") or [])
+            if sub_res.get("used_local_fallback"):
+                any_local_fallback = True
+                last_fb_reason = sub_res.get("fallback_reason") or last_fb_reason
+
+            # Move staged outputs into organized destination folders without collisions
+            upd_master_s = sub_res.get("updated_master_docx_path") or ""
+            if upd_master_s and Path(upd_master_s).is_file():
+                src_m = Path(upd_master_s)
+                dst_m = _disambiguate_batch_dest(master_upd_dir, src_m.name, orig_tag)
+                shutil.move(str(src_m), str(dst_m))
+                all_saved_batch.append(str(dst_m))
+
+            step2_list = [Path(x) for x in (sub_res.get("step2_files") or []) if x and Path(x).is_file()]
+            for s2_p in step2_list:
+                nm = s2_p.name
+                if "_完整留底版" in nm:
+                    clean_nm = nm.replace("_完整留底版", "")
+                    dst_p = _disambiguate_batch_dest(archive_dir, clean_nm, orig_tag)
+                elif "_无改点版" in nm:
+                    clean_nm = nm.replace("_无改点版", "")
+                    dst_p = _disambiguate_batch_dest(unchanged_dir, clean_nm, orig_tag)
+                else:
+                    dst_p = _disambiguate_batch_dest(translator_dir, nm, orig_tag)
+                shutil.move(str(s2_p), str(dst_p))
+                all_saved_batch.append(str(dst_p))
+
+            raw_tri_s = sub_res.get("raw_trilingual_path") or ""
+            if raw_tri_s and Path(raw_tri_s).is_file():
+                src_rt = Path(raw_tri_s)
+                dst_rt = _disambiguate_batch_dest(raw_tri_dir, src_rt.name, orig_tag)
+                shutil.move(str(src_rt), str(dst_rt))
+                all_saved_batch.append(str(dst_rt))
+
+            dedup_rep_s = sub_res.get("dedup_report_path") or ""
+            if dedup_rep_s and Path(dedup_rep_s).is_file():
+                src_dr = Path(dedup_rep_s)
+                dst_dr = _disambiguate_batch_dest(out_d, src_dr.name, orig_tag)
+                shutil.move(str(src_dr), str(dst_dr))
+                all_saved_batch.append(str(dst_dr))
+
+        except Exception as ex:
+            failed_docs.append(f"{cur_inp.name}（{ex}）")
+            if log_fn:
+                log_fn(f"❌ [{doc_idx + 1}/{total_docs}] 处理失败：{cur_inp.name} -> {ex}")
+        finally:
+            shutil.rmtree(stage_dir, ignore_errors=True)
+
+    if not all_saved_batch and failed_docs:
+        raise RuntimeError(f"批量处理全部失败（共 {len(failed_docs)} 份）：\n" + "\n".join(failed_docs[:5]))
+
+    if progress_fn:
+        progress_fn(
+            100.0,
+            f"批量整理完成：成功 {total_docs - len(failed_docs)}/{total_docs} 份，共输出 {len(all_saved_batch)} 个文件！",
+        )
+
+    return {
+        "saved_files": all_saved_batch,
+        "lang_code": detected_lang_final,
+        "processed_docs_count": total_docs - len(failed_docs),
+        "total_input_docs": total_docs,
+        "failed_docs": failed_docs,
+        "skipped_count": len(all_skipped_rows),
+        "skipped_rows": all_skipped_rows,
+        "used_local_fallback": any_local_fallback,
+        "fallback_reason": last_fb_reason,
+        "up_words": total_up,
+        "rv_words": total_rv,
+        "total_spans": total_spans,
+        "edited_sentences": total_edited,
+        "dedup_removed_count": total_dedup,
+        "duplicate_count": total_dedup,
+        "dedup_report_path": "",
+        "raw_trilingual_path": "",
     }

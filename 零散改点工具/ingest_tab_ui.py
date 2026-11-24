@@ -892,6 +892,11 @@ class IngestTabPanel:
         self._save_app_settings()
         self._last_out_dir = out_d
         pr_sources = [ln.strip() for ln in self.a3_proofread_txt.get("1.0", tk.END).splitlines() if ln.strip()]
+        keys = self.app._get_all_keys_list() if hasattr(self.app, "_get_all_keys_list") else []
+        model = self.app._get_model_id() if hasattr(self.app, "_get_model_id") else "gemini-3.5-flash-lite"
+        api_mode = self.app._get_api_mode_code() if hasattr(self.app, "_get_api_mode_code") else "auto"
+        rot_mode = self.app._get_rotation_mode_code() if hasattr(self.app, "_get_rotation_mode_code") else "round_robin"
+        pool = ApiKeyPool(keys, rotation_mode=rot_mode) if (pr_sources and keys) else ""
         try:
             bsz = max(1, int(self.rev_batch_size_var.get().strip() or "10"))
         except ValueError:
@@ -915,14 +920,22 @@ class IngestTabPanel:
                     proofread_sources=pr_sources,
                     col_config=self.col_cfg,
                     oauth=self.oauth,
+                    api_key=pool,
+                    model=model,
+                    api_mode=api_mode,
                     log_fn=self._append_log,
                     progress_fn=self._set_progress,
                 )
+                pr_extra = (
+                    f"\n通读定稿表：精确替换 {res.get('proofread_applied', 0)} 条 | 需复核/未替换汇报 {res.get('proofread_report_count', 0)} 条"
+                    if pr_sources
+                    else ""
+                )
                 summary = (
-                    f"完成！总库不一致 {res['mismatches_count']} 处，回稿异常 {res['anomalies_count']} 处。"
+                    f"完成！总库不一致 {res['mismatches_count']} 处，回稿异常 {res['anomalies_count']} 处。{pr_extra}"
                     if check_only
                     else f"入库完成！已更新 {res['updated_chapters']} 篇（{res['updated_rows']} 段），原总库未作任何改动。\n"
-                         f"总库不一致：{res['mismatches_count']} 处 | 回稿异常：{res['anomalies_count']} 处"
+                         f"总库不一致：{res['mismatches_count']} 处 | 回稿异常：{res['anomalies_count']} 处{pr_extra}"
                 )
                 self.parent.after(0, lambda: messagebox.showinfo("改点入库完成", summary))
             except Exception as ex:

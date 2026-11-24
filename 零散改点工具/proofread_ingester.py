@@ -48,8 +48,12 @@ import library_index  # noqa: E402
 import step1_extract_and_diff  # noqa: E402
 from ai_client import ApiKeyPool, call_gemini_json  # noqa: E402
 from library_ingester import (  # noqa: E402
+    PROOFREAD_5COL_HEADERS,
+    PROOFREAD_5COL_WIDTHS,
     _write_simple_report_docx,
     accept_all_revisions_in_cell_safe,
+    evaluate_proofread_sheet_rows,
+    make_proofread_5col_row,
     pick_proofread_new_text,
     render_diff_track_changes_into_cell,
     save_docx_without_track_revisions_flag,
@@ -358,6 +362,7 @@ def run_proofread_ingestion_pipeline(
 
     all_qa_alerts: List[dict] = []
     all_replace_logs: List[dict] = []
+    five_col_report_rows: List[List[str]] = []
     verify_rev_files: List[str] = []
     unmatched_titles: List[str] = []
     processed_chapters = 0
@@ -433,22 +438,50 @@ def run_proofread_ingestion_pipeline(
                 continue
 
             all_group_rows.extend(parsed.rows)
-            alerts, edits = _validate_proofread_rows(
-                chapter_title=ch_title,
-                rows=parsed.rows,
+            rep_items, blocked_5col = evaluate_proofread_sheet_rows(
+                parsed=parsed,
+                chapter_label=ch_title,
                 enable_ai=enable_ai,
                 api_key=api_key,
                 model=model,
                 api_mode=api_mode,
             )
-            all_qa_alerts.extend(alerts)
-            chapter_edits.extend(edits)
+            five_col_report_rows.extend(blocked_5col)
+            for b_row in blocked_5col:
+                all_qa_alerts.append({
+                    "chapter": ch_title,
+                    "sheet": parsed.sheet_name,
+                    "row": 0,
+                    "type": "列一致性校验未通过",
+                    "detail": b_row[1],
+                })
+
+            accepted_by_row_id: Dict[int, str] = {}
+            for item in rep_items:
+                pr_obj = item["row"]
+                new_t = item["new_text"]
+                warns = item["warnings"]
+                chapter_edits.append((pr_obj, new_t))
+                accepted_by_row_id[id(pr_obj)] = new_t
+                if warns:
+                    warn_joined = "；".join(warns)
+                    five_col_report_rows.append(
+                        make_proofread_5col_row(item["source_pos"], "改后异常提醒：" + warn_joined, pr_obj)
+                    )
+                    all_qa_alerts.append({
+                        "chapter": ch_title,
+                        "sheet": parsed.sheet_name,
+                        "row": pr_obj.row_number,
+                        "type": "改前改后对比提醒",
+                        "detail": warn_joined,
+                    })
 
             for pr in parsed.rows:
                 en_clean = clean_cell_spaces(pr.en)
                 if en_clean:
                     merged_sheet_en_parts.append(en_clean)
-                fin_clean = pick_proofread_new_text(pr) or clean_cell_spaces(pr.final) or clean_cell_spaces(pr.target)
+                # Only use accepted new text if row passed `改动列 == 定稿列` consistency check; otherwise keep `target`
+                fin_clean = accepted_by_row_id.get(id(pr)) or clean_cell_spaces(pr.target)
                 if fin_clean:
                     merged_sheet_final_parts.append(fin_clean)
 
@@ -568,9 +601,13 @@ def run_proofread_ingestion_pipeline(
 
         if remaining_unmatched_edits:
             if log_fn:
-                log_fn(f"  ⚠️ [步骤 3] 改前不一致未替换：{len(remaining_unmatched_edits)} 条（详见检查报告）。")
+                log_fn(f"  ⚠️ [步骤 3] 改前不一致未替换：{len(remaining_unmatched_edits)} 条（详见检查报告 5 列明细）。")
             for pr, _ in remaining_unmatched_edits.values():
                 old_exact = clean_cell_spaces(pr.target)
+                pos_lbl = f"{ch_title} [{pr.sheet_name or Path(pr.source_label).name}] 第{pr.row_number}行"
+                five_col_report_rows.append(
+                    make_proofread_5col_row(pos_lbl, "未替换：改前内容与文档不完全一致", pr)
+                )
                 all_replace_logs.append({
                     "chapter": ch_title,
                     "row": pr.row_number,
@@ -579,14 +616,24 @@ def run_proofread_ingestion_pipeline(
                     "detail": f"表格改前句在总库改前文档中未找到完全一致文本：{old_exact[:70]}",
                 })
 
-    # Write combined QA + Replacement Report
+    # Write combined QA + Replacement Report (including full 5-column detail table!)
     rep_rows = []
-    for al in all_qa_alerts:
-        rep_rows.append([al["chapter"], f"{al['sheet']} 第{al['row']}行", al["type"], al["detail"]])
     for rl in all_replace_logs:
         rep_rows.append([rl["chapter"], f"第{rl['row']}行", rl["status"], rl["detail"]])
     for ut in unmatched_titles:
         rep_rows.append([ut, "-", "总库未匹配篇目", "未在总库目录中定位到该篇目文件"])
+    if not rep_rows and all_qa_alerts:
+        for al in all_qa_alerts:
+            rep_rows.append([al["chapter"], f"{al['sheet']} 第{al['row']}行" if al.get("row") else al["sheet"], al["type"], al["detail"]])
+
+    extra_secs = []
+    if five_col_report_rows:
+        extra_secs.append((
+            f"二、未替换 / 列不一致 / 改后异常 5 列完整明细（共 {len(five_col_report_rows)} 条）",
+            PROOFREAD_5COL_HEADERS,
+            five_col_report_rows,
+            PROOFREAD_5COL_WIDTHS,
+        ))
 
     report_path = docx_xml_utils.safe_join_output_file(out_d, f"通读定稿入库检查报告_{eff_date}.docx")
     _write_simple_report_docx(
@@ -594,12 +641,14 @@ def run_proofread_ingestion_pipeline(
         title=f"通读定稿入库检查与替换报告（{eff_date}）",
         summary_lines=[
             f"输入篇目数：{len(chapter_groups)} 篇 | 成功处理：{processed_chapters} 篇 | 未匹配篇目：{len(unmatched_titles)} 篇",
-            f"步骤 2 通读改点异常提醒：{len(all_qa_alerts)} 条",
-            f"步骤 3 改前不一致/多处替换提醒：{len(all_replace_logs)} 条",
+            f"步骤 2 列一致性校验及改前改后对比提醒：{len(all_qa_alerts)} 条",
+            f"步骤 3 改前不一致未替换 / 多处替换提醒：{len(all_replace_logs)} 条",
             f"步骤 4 全篇合并核对差异修订稿：{len(verify_rev_files)} 份",
         ],
         headers=["篇目", "位置", "检查项 / 状态", "详细说明"],
         rows_data=rep_rows or [["全部通过", "-", "正常", "所有通读改点检查、精确替换及全篇合并核对均无异常。"]],
+        col_widths=[3200, 2200, 2600, 6570],
+        extra_sections=extra_secs,
     )
 
     if progress_fn:

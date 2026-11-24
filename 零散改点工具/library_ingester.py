@@ -44,13 +44,17 @@ _ensure_skill_scripts()
 import docx_xml_utils  # noqa: E402
 import library_index  # noqa: E402
 import step1_extract_and_diff  # noqa: E402
-from ai_client import ApiKeyPool  # noqa: E402
+from ai_client import ApiKeyPool, call_gemini_json  # noqa: E402
 from pipeline import ensure_library_index  # noqa: E402
 from sheets_reader import (  # noqa: E402
     ColumnMappingConfig,
     GoogleOAuthManager,
+    ParsedSheetData,
     ProofreadRow,
+    clean_cell_spaces,
+    is_google_sheet_url,
     load_proofread_table,
+    parse_title_link_table,
 )
 
 W = docx_xml_utils.W
@@ -67,7 +71,7 @@ _NO_CHANGE_COMMENT_RE = re.compile(
     re.IGNORECASE,
 )
 _SENT_SPLIT_RE = re.compile(r"(?<=[.!?。？！；;])\s+")
-_PUNCT_SPACE_RE = re.compile(r"[ \t]+([,.;:!?，。；：！？])")
+_PUNCT_SPACE_RE = re.compile(r"[ \t]+([,;:!?，。；：！？]|\.(?!\.))")
 _DOUBLE_SPACE_RE = re.compile(r"[ \t]{2,}")
 _TOKEN_RE = re.compile(r"\S+|\s+")
 
@@ -218,6 +222,233 @@ def _norm_compare_text(s: str) -> str:
     s = re.sub(r"[ \t]+", " ", s)
     lines = [ln.strip() for ln in s.split("\n") if ln.strip()]
     return "\n".join(lines)
+
+
+def _norm_compare_flat_ws(s: str) -> str:
+    """
+    Normalize text for consistency comparison by treating paragraph breaks (`\\n`) and multiple spaces
+    identically to single spaces (and stripping space before punctuation), so isolated RV paragraphs split
+    by blank lines in `发稿` Col 3 are recognized as 100% consistent with single-paragraph library text.
+    """
+    s = (s or "").replace("\u00A0", " ")
+    s = re.sub(r"\s+", " ", s).strip()
+    s = _PUNCT_SPACE_RE.sub(r"\1", s)
+    return s
+
+
+def _align_sent_text_breaks_to_library(sent_text: str, lib_text: str) -> str:
+    """
+    If `sent_text` has identical wording to `lib_text` modulo artificial paragraph breaks (`\\n\\n`),
+    return `lib_text` so Step 1B / Step 3 diffs never produce fake newline revisions or boundary collisions.
+    """
+    if not sent_text or not lib_text:
+        return sent_text
+    if _norm_compare_flat_ws(sent_text) == _norm_compare_flat_ws(lib_text):
+        return lib_text
+    return sent_text
+
+
+def _extract_rejected_cyan_segments(tc2: ET.Element) -> Tuple[str, bool, List[Tuple[str, bool]]]:
+    """
+    Reject all Word revisions in `tc2` first, then extract contiguous `(text, is_cyan_rv)` segments
+    (bridging pure whitespace between two adjacent cyan runs so each cyan sentence forms a single segment).
+    """
+    work = copy.deepcopy(tc2)
+    reject_all_revisions_in_cell(work)
+    full_rej = docx_xml_utils.get_cell_plain_text(work)
+
+    raw_chunks: List[Tuple[str, bool]] = []
+    paras = work.findall("w:p", NS)
+    for p_i, p in enumerate(paras):
+        for r in p.findall(".//w:r", NS):
+            txt = "".join(t.text or "" for t in r.findall("w:t", NS))
+            if not txt:
+                continue
+            hl = r.find("./w:rPr/w:highlight", NS)
+            is_rv = bool(hl is not None and hl.attrib.get(f"{W}val") in RV_HIGHLIGHT_VALS)
+            if raw_chunks and raw_chunks[-1][1] == is_rv:
+                raw_chunks[-1] = (raw_chunks[-1][0] + txt, is_rv)
+            else:
+                raw_chunks.append((txt, is_rv))
+        if p_i < len(paras) - 1:
+            if raw_chunks and not raw_chunks[-1][1]:
+                raw_chunks[-1] = (raw_chunks[-1][0] + "\n", False)
+            else:
+                raw_chunks.append(("\n", False))
+
+    if not any(ic for _, ic in raw_chunks):
+        return full_rej, False, [(full_rej, False)] if full_rej else []
+
+    # Bridge whitespace-only chunks sandwiched between two cyan chunks
+    bridged = list(raw_chunks)
+    for idx in range(1, len(bridged) - 1):
+        txt_c, ic_c = bridged[idx]
+        if not ic_c and not txt_c.strip() and bridged[idx - 1][1] and bridged[idx + 1][1]:
+            bridged[idx] = (txt_c, True)
+
+    merged: List[Tuple[str, bool]] = []
+    for txt_c, ic_c in bridged:
+        if merged and merged[-1][1] == ic_c:
+            merged[-1] = (merged[-1][0] + txt_c, ic_c)
+        else:
+            merged.append((txt_c, ic_c))
+
+    return full_rej, True, merged
+
+
+def analyze_sent_col2_vs_library(sent_tc2: ET.Element, lib_c2_text: str) -> dict:
+    """
+    Step 1A + Step 1B English Analyzer:
+      1. Rejects all `<w:ins>` / `<w:del>` revisions on `sent_tc2`.
+      2. Compares rejected `sent_tc2` against `lib_c2_text` (`三语总库` current Col 2):
+         - Cyan (`RV`) spans in `发稿` naturally differ from `lib_c2_text` (generating revisions on cyan);
+         - Automatically ACCEPTS those Cyan (`RV`) revisions;
+         - Checks whether ANY remaining non-cyan revisions exist (`has_remaining_diff`).
+      3. Simultaneously reconstructs:
+         - `step1a_target`: text with Cyan (`RV`) revisions accepted, so `render_diff_track_changes_into_cell(s_c2_rej, step1a_target)`
+           renders ONLY the remaining non-cyan library mismatches!
+         - `true_old_baseline`: pre-dispatch English text where non-cyan parts come from `sent_tc2` (rejected)
+           and Cyan (`RV`) parts come from `lib_c2_text` (the library's original English before RV rewrite),
+           so Step 1B (`true_old_baseline -> ret_c2_clean`) shows full revisions on Cyan (`RV`) sentences AND
+           Step 3 `merge_keep_library_text` never reverts Cyan (`RV`) back to old library English!
+    """
+    s_rej, has_cyan, segs = _extract_rejected_cyan_segments(sent_tc2)
+    norm_s_flat = _norm_compare_flat_ws(s_rej)
+    norm_l_flat = _norm_compare_flat_ws(lib_c2_text)
+
+    if not lib_c2_text.strip():
+        return {
+            "sent_rej": s_rej,
+            "has_cyan": has_cyan,
+            "is_excerpt": False,
+            "has_remaining_diff": False,
+            "step1a_target": s_rej,
+            "true_old_baseline": s_rej,
+        }
+
+    if not has_cyan:
+        is_exc = bool(norm_s_flat and norm_s_flat != norm_l_flat and norm_s_flat in norm_l_flat)
+        eq_flat = (norm_s_flat == norm_l_flat)
+        has_diff = (not eq_flat) and (not is_exc)
+        return {
+            "sent_rej": s_rej,
+            "has_cyan": False,
+            "is_excerpt": is_exc,
+            "has_remaining_diff": has_diff,
+            "step1a_target": lib_c2_text if has_diff else s_rej,
+            "true_old_baseline": _align_sent_text_breaks_to_library(s_rej, lib_c2_text) if eq_flat else s_rej,
+        }
+
+    # All-cyan cell (100% of sent_tc2 is highlighted cyan, zero non-cyan anchors)
+    nc_indices = [i for i, (tx, ic) in enumerate(segs) if not ic and tx.strip()]
+    if not nc_indices:
+        is_exc = len(lib_c2_text.strip()) > len(s_rej.strip()) * 2.5 + 120
+        return {
+            "sent_rej": s_rej,
+            "has_cyan": True,
+            "is_excerpt": is_exc,
+            "has_remaining_diff": False,  # Accepting cyan leaves 0 remaining revisions
+            "step1a_target": s_rej,
+            "true_old_baseline": s_rej if is_exc else lib_c2_text,
+        }
+
+    # Anchor each non-empty non-cyan segment in `lib_c2_text` in monotonic order
+    anchors: Dict[int, Tuple[int, int]] = {}
+    search_cur = 0
+    all_nc_exact = True
+    for idx in nc_indices:
+        seg_txt = segs[idx][0]
+        core = seg_txt.strip()
+        loc = docx_xml_utils.find_fuzzy_substring_span(lib_c2_text, core, search_from=search_cur)
+        if loc is not None:
+            anchors[idx] = loc
+            search_cur = loc[1]
+        else:
+            all_nc_exact = False
+
+    if all_nc_exact and len(anchors) == len(nc_indices):
+        first_nc = nc_indices[0]
+        last_nc = nc_indices[-1]
+        first_starts_at_zero = (first_nc == 0)
+        last_ends_at_end = (last_nc == len(segs) - 1)
+        leading_unquoted = lib_c2_text[: anchors[first_nc][0]].strip() if first_starts_at_zero else ""
+        trailing_unquoted = lib_c2_text[anchors[last_nc][1] :].strip() if last_ends_at_end else ""
+        is_exc = bool(leading_unquoted or trailing_unquoted)
+
+        # Build `true_old_baseline` by replacing each cyan span with the exact library gap between surrounding non-cyan anchors!
+        baseline_parts: List[str] = []
+        for i, (tx, ic) in enumerate(segs):
+            if not ic:
+                baseline_parts.append(tx)
+            else:
+                # Find nearest preceding & following anchored non-cyan segments
+                prev_nc = max((k for k in anchors if k < i), default=None)
+                next_nc = min((k for k in anchors if k > i), default=None)
+                gap_s = anchors[prev_nc][1] if prev_nc is not None else 0
+                gap_e = anchors[next_nc][0] if next_nc is not None else len(lib_c2_text)
+                lib_gap = lib_c2_text[gap_s:gap_e]
+                # Preserve leading/trailing spaces consistently with `tx`
+                lead_ws = tx[: len(tx) - len(tx.lstrip())]
+                trail_ws = tx[len(tx.rstrip()) :]
+                baseline_parts.append(lead_ws + lib_gap.strip() + trail_ws if lib_gap.strip() else tx)
+
+        return {
+            "sent_rej": s_rej,
+            "has_cyan": True,
+            "is_excerpt": is_exc,
+            "has_remaining_diff": False,
+            "step1a_target": s_rej,
+            "true_old_baseline": "".join(baseline_parts),
+        }
+
+    # At least one non-cyan segment differed from `lib_c2_text` -> real library modification in non-cyan region!
+    # Reconstruct `step1a_target` (accepting cyan segments while keeping library's modified non-cyan segments)
+    # and `true_old_baseline` via token-level alignment of non-cyan tokens.
+    s_tok_pairs: List[Tuple[str, bool]] = []
+    for tx, ic in segs:
+        for tk_s in _TOKEN_RE.findall(tx):
+            s_tok_pairs.append((tk_s, ic))
+    s_toks = [t for t, _ in s_tok_pairs]
+    l_toks = _TOKEN_RE.findall(lib_c2_text)
+    sm = difflib.SequenceMatcher(None, s_toks, l_toks, autojunk=False)
+
+    step1a_out: List[str] = []
+    baseline_out: List[str] = []
+    has_rem = False
+
+    for tag, i1, i2, j1, j2 in sm.get_opcodes():
+        s_piece = "".join(s_toks[i1:i2])
+        l_piece = "".join(l_toks[j1:j2])
+        if tag == "equal":
+            step1a_out.append(s_piece)
+            baseline_out.append(s_piece)
+            continue
+        if _norm_compare_flat_ws(s_piece) == _norm_compare_flat_ws(l_piece):
+            step1a_out.append(s_piece)
+            baseline_out.append(l_piece)
+            continue
+        touches_cyan = any(ic for _, ic in s_tok_pairs[i1:i2] if _.strip())
+        if not touches_cyan and not s_piece.strip():
+            left_cy = next((ic for tx, ic in reversed(s_tok_pairs[:i1]) if tx.strip()), False)
+            right_cy = next((ic for tx, ic in s_tok_pairs[i2:] if tx.strip()), False)
+            touches_cyan = bool(left_cy or right_cy)
+        if touches_cyan:
+            # Accept cyan revision for Step 1A; record library old English for Step 1B/3 baseline
+            step1a_out.append(s_piece)
+            baseline_out.append(l_piece)
+        else:
+            has_rem = True
+            step1a_out.append(l_piece)
+            baseline_out.append(s_piece)
+
+    return {
+        "sent_rej": s_rej,
+        "has_cyan": True,
+        "is_excerpt": False,
+        "has_remaining_diff": has_rem,
+        "step1a_target": "".join(step1a_out),
+        "true_old_baseline": "".join(baseline_out),
+    }
 
 
 def _norm_cn_key(s: str) -> str:
@@ -1039,15 +1270,100 @@ def clean_col23_highlights_and_artifacts(tc: ET.Element) -> None:
             surgical_update_paragraph_text(p, cleaned)
 
 
+PROOFREAD_5COL_HEADERS = [
+    "来源表格与行号",
+    "状态 / 异常说明",
+    "中文",
+    "English",
+    "改前列（目标语）",
+    "定稿列（Final Version-全）",
+    "改动列（Final Version-改动行）",
+]
+PROOFREAD_5COL_WIDTHS = [1550, 2020, 2000, 2200, 2260, 2270, 2270]
+
+_CLOSING_WRAPPERS = '”"’\'」』）)》】»“„›'
+_SENT_END_CHARS = set(".?!。？！…။।។")
+_CLAUSE_END_CHARS = set(",;:，；：、—–-၊")
+_FIRST_ALPHA_RE = re.compile(r'^[“"‘\'(\[（【«„\s]*([A-Za-zÀ-ÖØ-öø-ÿА-Яа-яЁё])')
+
+
+def extract_proofread_sources_list(raw_sources: Optional[Sequence[str]]) -> List[str]:
+    """
+    Extract all Google Sheets URLs (each preserving its `#gid=...`) and local `.xlsx/.csv` paths
+    from multi-line text, 2-column `篇目标题\\t链接` paste, or comma/semicolon-separated inputs.
+    """
+    if not raw_sources:
+        return []
+    blob = "\n".join(str(x or "") for x in raw_sources if str(x or "").strip())
+    if not blob.strip():
+        return []
+    out: List[str] = []
+    seen = set()
+
+    # First try structured 2-column / multi-URL parser
+    for _, urls in parse_title_link_table(blob):
+        for u in urls:
+            u_clean = u.strip().strip('"').strip("'")
+            if u_clean and u_clean not in seen:
+                if is_google_sheet_url(u_clean) or Path(u_clean).suffix.lower() in (".xlsx", ".csv"):
+                    seen.add(u_clean)
+                    out.append(u_clean)
+
+    # Also scan raw lines directly in case of standalone local paths or URLs
+    for raw_ln in blob.splitlines():
+        ln = raw_ln.strip()
+        if not ln:
+            continue
+        urls = re.findall(r"https?://[^\s,，;；\t]+", ln)
+        if urls:
+            for u in urls:
+                if u not in seen:
+                    seen.add(u)
+                    out.append(u)
+        else:
+            for seg in raw_ln.split("\t"):
+                cand = seg.strip().strip('"').strip("'")
+                if cand and cand not in seen and Path(cand).suffix.lower() in (".xlsx", ".csv"):
+                    seen.add(cand)
+                    out.append(cand)
+    return out
+
+
+def _classify_clause_or_sentence_end(text: str) -> Tuple[str, str]:
+    """
+    Classify the ending punctuation of `text` (ignoring trailing closing quotes/brackets):
+      - `("SENT", ch)`   : full sentence end (`. ? ! 。 ？ ！ … ။ । ។`)
+      - `("CLAUSE", ch)` : half-sentence / clause pause (`, ; : ， ； ： 、 — – - ၊`)
+      - `("NONE", "")`   : no ending punctuation
+    """
+    s = (text or "").strip().rstrip(_CLOSING_WRAPPERS).rstrip()
+    if not s:
+        return "NONE", ""
+    last_ch = s[-1]
+    if last_ch in _SENT_END_CHARS:
+        return "SENT", last_ch
+    if last_ch in _CLAUSE_END_CHARS:
+        return "CLAUSE", last_ch
+    return "NONE", ""
+
+
+def _count_sentence_stops(text: str) -> int:
+    s = (text or "").strip()
+    if not s:
+        return 0
+    cnt = sum(1 for ch in re.sub(r"\.{2,}", "…", s) if ch in _SENT_END_CHARS)
+    return max(1, cnt) if cnt > 0 else 0
+
+
 def pick_proofread_new_text(pr: ProofreadRow) -> str:
     """
     Pick the effective post-proofread target text from `ProofreadRow`:
       - Prefer `改动列` (`pr.changes`) when non-empty and different from `pr.target`;
       - Otherwise use `定稿列` (`pr.final`) when non-empty and different from `pr.target`.
     """
-    old_s = (pr.target or "").replace("\u00A0", " ").strip()
-    chg_s = (pr.changes or "").replace("\u00A0", " ").strip()
-    fin_s = (pr.final or "").replace("\u00A0", " ").strip()
+    old_s = clean_cell_spaces(pr.target)
+    chg_s = clean_cell_spaces(pr.changes)
+    fin_s = clean_cell_spaces(pr.final)
     if chg_s and chg_s != old_s:
         return chg_s
     if fin_s and fin_s != old_s:
@@ -1055,27 +1371,232 @@ def pick_proofread_new_text(pr: ProofreadRow) -> str:
     return ""
 
 
-def apply_proofread_updates_to_text(
-    col3_text: str,
-    proofread_rows: Sequence[ProofreadRow],
-) -> Tuple[str, int]:
+def make_proofread_5col_row(source_pos: str, status_reason: str, pr: ProofreadRow) -> List[str]:
+    """Format a 7-cell report row containing location, status/reason, and all 5 original proofread columns."""
+    return [
+        source_pos,
+        status_reason,
+        clean_cell_spaces(pr.cn),
+        clean_cell_spaces(pr.en),
+        clean_cell_spaces(pr.target),
+        clean_cell_spaces(pr.final),
+        clean_cell_spaces(pr.changes),
+    ]
+
+
+def _batch_check_proofread_semantic_with_ai(
+    items: Sequence[Tuple[int, ProofreadRow, str, str]],
+    api_key: Union[str, List[str], ApiKeyPool],
+    model: str = "gemini-3.5-flash-lite",
+    api_mode: str = "auto",
+) -> Dict[int, Tuple[bool, str]]:
     """
-    Apply proofread table updates (`目标语言` -> `改动列` / `定稿列`) onto `col3_text`.
-    Returns `(updated_text, replacements_count)`.
+    Batch-verify changed proofread rows against Chinese (`r.cn`) & English (`r.en`) via Gemini:
+    checks whether meaning matches Chinese, or whether a full sentence became half a sentence / vice versa.
+    Returns `{item_idx: (is_consistent, reason)}`.
     """
-    if not proofread_rows or not col3_text.strip():
-        return col3_text, 0
-    cur = col3_text.replace("\u00A0", " ")
-    count = 0
-    for pr in proofread_rows:
-        old_s = (pr.target or "").replace("\u00A0", " ").strip()
-        new_s = pick_proofread_new_text(pr)
-        if not old_s or not new_s or old_s == new_s:
+    results: Dict[int, Tuple[bool, str]] = {}
+    if not items or not api_key:
+        return results
+
+    batch_size = 10
+    for b_start in range(0, len(items), batch_size):
+        chunk = items[b_start : b_start + batch_size]
+        lines_prompt = [
+            "你是多语种翻译定稿质检专家。请逐条核对以下通读修改行的【改后外文】是否与【中文原文】（及英文参考）在意思和句子完整性上吻合：",
+            "重点排查：1) 原来是一整句被误删成半句（漏译）；2) 原来是半句被误扩成一整句或串入了上下行内容；3) 改后意思与中文原文不符或相反。",
+            "若只是正常的近义词润色、语法微调且意思完整吻合，请判为 `consistent: true`。",
+            '请严格只返回 JSON：{"items": [{"id": 整数ID, "consistent": true或false, "reason": "若不一致请简明指出原因，一致则留空"}]}',
+            "",
+        ]
+        for item_id, pr, old_t, new_t in chunk:
+            lines_prompt.append(
+                f"[ID={item_id}]\n"
+                f"中文：{clean_cell_spaces(pr.cn)}\n"
+                f"English：{clean_cell_spaces(pr.en)}\n"
+                f"改前外文：{old_t}\n"
+                f"改后外文：{new_t}\n"
+            )
+        try:
+            resp = call_gemini_json(
+                api_key=api_key,
+                model=model or "gemini-3.5-flash-lite",
+                system_instruction="你是严谨的多语种翻译通读质检助手，只输出合法 JSON。",
+                user_prompt="\n".join(lines_prompt),
+                api_mode=api_mode or "auto",
+            )
+            if isinstance(resp, dict) and isinstance(resp.get("items"), list):
+                for obj in resp["items"]:
+                    if isinstance(obj, dict) and "id" in obj:
+                        iid = int(obj["id"])
+                        ok = bool(obj.get("consistent", True))
+                        rsn = str(obj.get("reason") or "").strip()
+                        results[iid] = (ok, rsn)
+        except Exception:
             continue
-        if old_s in cur:
-            cur = cur.replace(old_s, new_s, 1)
-            count += 1
-    return cur, count
+    return results
+
+
+def evaluate_proofread_sheet_rows(
+    parsed: ParsedSheetData,
+    chapter_label: str = "",
+    enable_ai: bool = False,
+    api_key: Union[str, List[str], ApiKeyPool] = "",
+    model: str = "gemini-3.5-flash-lite",
+    api_mode: str = "auto",
+) -> Tuple[List[dict], List[List[str]]]:
+    """
+    Unified strict validator for both Scenario 3A and Scenario 3B proofread sheets:
+      1. `改动列 == 改前列` (when `改动列` is non-empty) -> DO NOT replace, report all 5 columns.
+      2. `改动列 != 定稿列` (when both columns exist/are populated) -> DO NOT replace, report all 5 columns.
+      3. All valid changed rows -> compare `改前` vs `改后` for:
+         - 半句变整句 / 整句变半句 / 末尾标点丢失 / 句号后下一行首字母小写 / 句数突变 / 篇幅暴涨暴跌
+         - 与中文原文意思是否吻合（AI 批量核对或本地大幅改动预警）
+         Any abnormal changed row is reported with all 5 columns.
+    Returns `(replaceable_items, blocked_5col_rows)` where each item in `replaceable_items` is:
+      `{"row": ProofreadRow, "source_pos": str, "old_text": str, "new_text": str, "warnings": List[str]}`.
+    """
+    src_short = parsed.sheet_name or Path(parsed.source).name
+    if chapter_label:
+        src_prefix = f"{chapter_label} [{src_short}]"
+    else:
+        src_prefix = src_short
+
+    has_changes_col = ("changes" in parsed.column_indices) and any(
+        bool(clean_cell_spaces(r.changes)) for r in parsed.rows
+    )
+    has_final_col = ("final" in parsed.column_indices) and any(
+        bool(clean_cell_spaces(r.final)) for r in parsed.rows
+    )
+
+    replaceable: List[dict] = []
+    blocked_5col_rows: List[List[str]] = []
+    ai_candidates: List[Tuple[int, ProofreadRow, str, str]] = []
+
+    for idx, r in enumerate(parsed.rows):
+        old_t = clean_cell_spaces(r.target)
+        fin_t = clean_cell_spaces(r.final)
+        chg_t = clean_cell_spaces(r.changes)
+        pos_label = f"{src_prefix} 第{r.row_number}行"
+
+        if not old_t and not fin_t and not chg_t:
+            continue
+
+        # Rule 3b: `改动列` non-empty and identical to `改前列` -> report 5 columns, do NOT replace
+        if chg_t and chg_t == old_t:
+            blocked_5col_rows.append(
+                make_proofread_5col_row(pos_label, "未替换：改动列与改前列内容相同（无实际改动）", r)
+            )
+            continue
+
+        # Rule 3a: `改动列` and `定稿列` differ -> CANNOT replace, report 5 columns
+        if chg_t and fin_t and chg_t != fin_t:
+            blocked_5col_rows.append(
+                make_proofread_5col_row(pos_label, "禁止替换：改动列与定稿列内容不一致", r)
+            )
+            continue
+
+        if has_changes_col and has_final_col:
+            if fin_t and fin_t != old_t and not chg_t:
+                blocked_5col_rows.append(
+                    make_proofread_5col_row(pos_label, "禁止替换：定稿列有改动但改动列为空（改动列与定稿列不一致）", r)
+                )
+                continue
+            if chg_t and chg_t != old_t and not fin_t:
+                blocked_5col_rows.append(
+                    make_proofread_5col_row(pos_label, "禁止替换：改动列有改动但定稿列为空（改动列与定稿列不一致）", r)
+                )
+                continue
+
+        # Determine effective new text for genuinely modified rows
+        if chg_t and chg_t != old_t:
+            eff_new = chg_t
+        elif (not has_changes_col) and fin_t and fin_t != old_t:
+            eff_new = fin_t
+        else:
+            continue
+
+        if not old_t:
+            blocked_5col_rows.append(
+                make_proofread_5col_row(pos_label, "禁止替换：改前列为空，无法定位原句", r)
+            )
+            continue
+
+        # Rule 3c: Compare `改前` vs `改后` on every changed row (half-sentence <-> full-sentence, length, punctuation)
+        warnings: List[str] = []
+        old_kind, old_p = _classify_clause_or_sentence_end(old_t)
+        new_kind, new_p = _classify_clause_or_sentence_end(eff_new)
+
+        if old_kind in ("CLAUSE", "NONE") and new_kind == "SENT":
+            msg = f"【半句变整句】改前末尾为半句（{f'标点「{old_p}」' if old_p else '无句末标点'}），改后变为整句标点「{new_p}」，请核对是否与中文吻合"
+            if old_kind == "CLAUSE" and idx + 1 < len(parsed.rows):
+                nxt = parsed.rows[idx + 1]
+                nxt_txt = clean_cell_spaces(nxt.changes) or clean_cell_spaces(nxt.final) or clean_cell_spaces(nxt.target)
+                m_al = _FIRST_ALPHA_RE.match(nxt_txt)
+                if m_al and m_al.group(1).islower():
+                    msg += f"（且下一行第{nxt.row_number}行首字母「{m_al.group(1)}」仍为小写）"
+            warnings.append(msg)
+        elif old_kind == "SENT" and new_kind in ("CLAUSE", "NONE"):
+            warnings.append(
+                f"【整句变半句】改前为完整句（末尾「{old_p}」），改后变为{f'半句标点「{new_p}」' if new_p else '无末尾标点'}，请核对是否漏译或与中文不符"
+            )
+        elif old_kind == "CLAUSE" and new_kind == "NONE":
+            warnings.append(f"【末尾标点丢失】改前末尾有标点「{old_p}」，改后末尾标点缺失")
+
+        old_sc = _count_sentence_stops(old_t)
+        new_sc = _count_sentence_stops(eff_new)
+        if old_sc >= 1 and new_sc >= 1 and old_sc != new_sc and not any("半句" in w for w in warnings):
+            warnings.append(f"【句数变化】改前约 {old_sc} 句变为改后 {new_sc} 句，请核对是否与中文一致")
+
+        len_ratio = len(eff_new) / max(1, len(old_t))
+        old_words = old_t.split()
+        new_words = eff_new.split()
+        word_sim = (
+            difflib.SequenceMatcher(None, [w.lower() for w in old_words], [w.lower() for w in new_words], autojunk=False).ratio()
+            if old_words
+            else 1.0
+        )
+
+        if len(old_t) >= 16 and len_ratio < 0.68:
+            warnings.append(
+                f"【疑似一句变半句/大幅删减】长度由 {len(old_t)} 缩减至 {len(eff_new)} 字符（-{int((1 - len_ratio) * 100)}%），请对照中文核对有无漏译"
+            )
+        elif len(old_t) >= 16 and len_ratio > 1.45:
+            warnings.append(
+                f"【疑似半句扩写/大幅增加】长度由 {len(old_t)} 增加至 {len(eff_new)} 字符（+{int((len_ratio - 1) * 100)}%），请对照中文核对是否多译或串行"
+            )
+
+        rec_idx = len(replaceable)
+        replaceable.append({
+            "row": r,
+            "source_pos": pos_label,
+            "old_text": old_t,
+            "new_text": eff_new,
+            "warnings": warnings,
+            "word_sim": word_sim,
+        })
+        if enable_ai and api_key and clean_cell_spaces(r.cn):
+            ai_candidates.append((rec_idx, r, old_t, eff_new))
+        elif len(old_words) >= 5 and word_sim < 0.55:
+            warnings.append(f"【大幅改动需核对中文】词相似度较低（{word_sim:.2f}），请人工核对改后意思是否与中文一致")
+
+    if ai_candidates:
+        ai_res = _batch_check_proofread_semantic_with_ai(ai_candidates, api_key=api_key, model=model, api_mode=api_mode)
+        for rec_idx, pr, _, _ in ai_candidates:
+            if rec_idx in ai_res:
+                is_ok, rsn = ai_res[rec_idx]
+                if not is_ok:
+                    replaceable[rec_idx]["warnings"].append(
+                        f"【与中文意思不吻合（AI核对）】{rsn or '改后译文与中文原文存在语义或完整性差异，请人工复核'}"
+                    )
+            else:
+                ws = replaceable[rec_idx]["word_sim"]
+                if len(replaceable[rec_idx]["old_text"].split()) >= 5 and ws < 0.55:
+                    replaceable[rec_idx]["warnings"].append(
+                        f"【大幅改动需核对中文】词相似度较低（{ws:.2f}），请人工核对改后意思是否与中文一致"
+                    )
+
+    return replaceable, blocked_5col_rows
 
 
 # ---------------------------------------------------------------------------
@@ -1088,6 +1609,8 @@ def _write_simple_report_docx(
     summary_lines: Sequence[str],
     headers: Sequence[str],
     rows_data: Sequence[Sequence[str]],
+    col_widths: Optional[Sequence[int]] = None,
+    extra_sections: Optional[Sequence[Tuple[str, Sequence[str], Sequence[Sequence[str]], Optional[Sequence[int]]]]] = None,
 ) -> Path:
     doc = ET.Element(f"{W}document")
     body = ET.SubElement(doc, f"{W}body")
@@ -1108,11 +1631,13 @@ def _write_simple_report_docx(
         if text and (text[0].isspace() or text[-1].isspace()):
             t.set(XML_SPACE, "preserve")
 
-    _add_p(title, bold=True, sz="28", color="1F4E79")
-    for line in summary_lines:
-        _add_p(line, bold=False, sz="20")
-
-    if headers and rows_data:
+    def _add_table(
+        sec_headers: Sequence[str],
+        sec_rows: Sequence[Sequence[str]],
+        sec_widths: Optional[Sequence[int]] = None,
+    ):
+        if not sec_headers or not sec_rows:
+            return
         tbl = ET.SubElement(body, f"{W}tbl")
         tblPr = ET.SubElement(tbl, f"{W}tblPr")
         ET.SubElement(tblPr, f"{W}tblW", {f"{W}w": "14570", f"{W}type": "dxa"})
@@ -1121,35 +1646,59 @@ def _write_simple_report_docx(
         for side in ("top", "left", "bottom", "right", "insideH", "insideV"):
             ET.SubElement(borders, f"{W}{side}", {f"{W}val": "single", f"{W}sz": "4", f"{W}space": "0", f"{W}color": "BFBFBF"})
 
-        col_w = max(1200, 14570 // len(headers))
+        if sec_widths and len(sec_widths) == len(sec_headers):
+            widths = [int(w) for w in sec_widths]
+        else:
+            default_w = max(1000, 14570 // len(sec_headers))
+            widths = [default_w] * len(sec_headers)
+
         grid = ET.SubElement(tbl, f"{W}tblGrid")
-        for _ in headers:
-            ET.SubElement(grid, f"{W}gridCol", {f"{W}w": str(col_w)})
+        for w_val in widths:
+            ET.SubElement(grid, f"{W}gridCol", {f"{W}w": str(w_val)})
+
+        font_sz = "17" if len(sec_headers) >= 6 else "19"
 
         def _add_row(vals: Sequence[str], is_hdr: bool = False):
             tr = ET.SubElement(tbl, f"{W}tr")
-            for v in vals:
+            for c_idx, v in enumerate(vals):
+                w_cur = widths[c_idx] if c_idx < len(widths) else widths[-1]
                 tc = ET.SubElement(tr, f"{W}tc")
                 tcPr = ET.SubElement(tc, f"{W}tcPr")
-                ET.SubElement(tcPr, f"{W}tcW", {f"{W}w": str(col_w), f"{W}type": "dxa"})
+                ET.SubElement(tcPr, f"{W}tcW", {f"{W}w": str(w_cur), f"{W}type": "dxa"})
                 if is_hdr:
                     ET.SubElement(tcPr, f"{W}shd", {f"{W}val": "clear", f"{W}color": "auto", f"{W}fill": "D9E2F3"})
-                p = ET.SubElement(tc, f"{W}p")
-                r = ET.SubElement(p, f"{W}r")
-                rPr = ET.SubElement(r, f"{W}rPr")
-                ET.SubElement(rPr, f"{W}rFonts", {f"{W}ascii": "Georgia", f"{W}eastAsia": "宋体", f"{W}hAnsi": "Georgia"})
-                if is_hdr:
-                    ET.SubElement(rPr, f"{W}b")
-                ET.SubElement(rPr, f"{W}sz", {f"{W}val": "19"})
-                ET.SubElement(rPr, f"{W}szCs", {f"{W}val": "19"})
-                t = ET.SubElement(r, f"{W}t")
-                t.text = str(v or "")
-                if t.text and (t.text[0].isspace() or t.text[-1].isspace()):
-                    t.set(XML_SPACE, "preserve")
+                lines_cell = str(v or "").splitlines() or [""]
+                for ln_txt in lines_cell:
+                    p = ET.SubElement(tc, f"{W}p")
+                    r = ET.SubElement(p, f"{W}r")
+                    rPr = ET.SubElement(r, f"{W}rPr")
+                    ET.SubElement(rPr, f"{W}rFonts", {f"{W}ascii": "Georgia", f"{W}eastAsia": "宋体", f"{W}hAnsi": "Georgia"})
+                    if is_hdr:
+                        ET.SubElement(rPr, f"{W}b")
+                    ET.SubElement(rPr, f"{W}sz", {f"{W}val": font_sz})
+                    ET.SubElement(rPr, f"{W}szCs", {f"{W}val": font_sz})
+                    t = ET.SubElement(r, f"{W}t")
+                    t.text = ln_txt
+                    if ln_txt and (ln_txt[0].isspace() or ln_txt[-1].isspace()):
+                        t.set(XML_SPACE, "preserve")
 
-        _add_row(headers, is_hdr=True)
-        for row_vals in rows_data:
+        _add_row(sec_headers, is_hdr=True)
+        for row_vals in sec_rows:
             _add_row(row_vals, is_hdr=False)
+
+    _add_p(title, bold=True, sz="28", color="1F4E79")
+    for line in summary_lines:
+        _add_p(line, bold=False, sz="20")
+
+    _add_table(headers, rows_data, col_widths)
+
+    if extra_sections:
+        for sec_title, sec_hdrs, sec_rows, sec_ws in extra_sections:
+            if not sec_rows:
+                continue
+            _add_p("", bold=False, sz="16")
+            _add_p(sec_title, bold=True, sz="24", color="1F4E79")
+            _add_table(sec_hdrs, sec_rows, sec_ws)
 
     sect = ET.SubElement(body, f"{W}sectPr")
     ET.SubElement(sect, f"{W}pgSz", {f"{W}w": "16838", f"{W}h": "11906", f"{W}orient": "landscape"})
@@ -1304,20 +1853,24 @@ def run_library_ingestion_pipeline(
     col_config: Optional[ColumnMappingConfig] = None,
     oauth: Optional[GoogleOAuthManager] = None,
     api_key: Union[str, List[str], ApiKeyPool] = "",
+    model: str = "gemini-3.5-flash-lite",
+    api_mode: str = "auto",
     date_str: str = "",
     log_fn: Optional[Callable[[str], None]] = None,
     progress_fn: Optional[Callable[[float, str], None]] = None,
 ) -> dict:
     """
     Execute Scenario 3A (`改点入库`) end-to-end:
-      - Step 1A: Reject revisions on `发稿` & verify consistency with `library_dir` (skipping cyan English diffs).
-      - Step 1B: Diff `发稿(rejected)` vs `回稿` to detect structural anomalies & export annotated `.docx`.
-      - Step 2: Clean formatting artifacts on `回稿` + apply optional proofread table final updates.
+      - Step 1A: Reject revisions on `发稿`, compare with `library_dir` (normalizing artificial Col 3 `\\n` breaks),
+                 automatically ACCEPT normal Cyan (`RV`) English diffs, and output ONLY remaining non-cyan/foreign diffs.
+      - Step 1B: Diff `true_old_baseline` (library old English on Cyan + rejected `发稿` on non-Cyan) vs `回稿`
+                 so both UP and Cyan RV show track changes, and detect structural anomalies with Word comments.
+      - Step 2: Clean formatting artifacts on `回稿` + validate & strictly exact-match replace multi-link proofread tables
+                (reporting full 5 columns whenever `改动列!=定稿列`, `改动列==改前列`, not found in `回稿`, or clause/meaning anomaly).
       - Step 3: Extract matched library chapters to `改前/`, perform surgical write-back to `改后/`
                 (preserving original filenames, dates, inline styles, & overlaying Col 1 Chinese shading),
                 and generate `修订稿/` (shown on `改后`).
     """
-    _ = api_key  # reserved for future optional AI deep semantic verification
     lib_p = Path(library_dir).resolve()
     out_d = Path(output_dir).resolve()
     if not lib_p.is_dir():
@@ -1349,20 +1902,36 @@ def run_library_ingestion_pipeline(
     if log_fn:
         log_fn(f"📚 总库索引就绪：共 {idx_stats.get('total_files', 0)} 篇文档（{idx_stats.get('total_rows', 0)} 段）")
 
-    # Optional: load proofread table rows
-    proofread_rows: List[ProofreadRow] = []
-    for src in (proofread_sources or []):
-        s_clean = (src or "").strip()
-        if not s_clean:
-            continue
+    # Optional: load & strictly validate multiple Google Sheets links / local `.xlsx/.csv` proofread tables
+    clean_pr_sources = extract_proofread_sources_list(proofread_sources)
+    pending_pr_items: List[dict] = []
+    proofread_5col_rows: List[List[str]] = []
+
+    for s_idx, s_clean in enumerate(clean_pr_sources):
         try:
             parsed = load_proofread_table(s_clean, col_config=col_config, oauth=oauth)
-            proofread_rows.extend(parsed.rows)
+            rep_items, blocked_5col = evaluate_proofread_sheet_rows(
+                parsed=parsed,
+                chapter_label="",
+                enable_ai=bool(api_key),
+                api_key=api_key,
+                model=model,
+                api_mode=api_mode,
+            )
+            for it in rep_items:
+                it["matched"] = False
+                pending_pr_items.append(it)
+            proofread_5col_rows.extend(blocked_5col)
             if log_fn:
-                log_fn(f"📊 已读取通读定稿表（{parsed.sheet_name}）：共 {len(parsed.rows)} 行")
+                log_fn(
+                    f"📊 已读取通读表 [{s_idx + 1}/{len(clean_pr_sources)}]（{parsed.sheet_name}）："
+                    f"共 {len(parsed.rows)} 行，有效待替换 {len(rep_items)} 条，列校验拦截 {len(blocked_5col)} 条"
+                )
         except Exception as ex:
+            err_pr = ProofreadRow(row_number=0, cn="", en="", target="", changes="", final="", source_label=s_clean)
+            proofread_5col_rows.append(make_proofread_5col_row(s_clean[:60], f"读取通读表失败：{ex}", err_pr))
             if log_fn:
-                log_fn(f"⚠️ 读取通读表失败（已跳过）：{s_clean} -> {ex}")
+                log_fn(f"⚠️ 读取通读表失败：{s_clean} -> {ex}")
 
     lib_doc_cache: Dict[Path, Tuple[ET.Element, List[ET.Element]]] = {}
 
@@ -1372,7 +1941,7 @@ def run_library_ingestion_pipeline(
             lib_doc_cache[lib_file] = (lr, lr.findall(".//w:tbl/w:tr", NS))
         return lib_doc_cache[lib_file][1]
 
-    # Collect per-library-file updates: {lib_file: [(row_idx, update_spec), ...]}
+    # Collect per-library-file updates: {lib_file: [update_spec, ...]}
     lib_updates: Dict[Path, List[dict]] = {}
     step1a_mismatches: List[dict] = []
     step1b_anomalies: List[dict] = []
@@ -1391,7 +1960,6 @@ def run_library_ingestion_pipeline(
         r_comments_map = docx_xml_utils.load_docx_comments_map(rf)
 
         s_titled_rows = _extract_rows_with_titles(s_root)
-        s_rows = [tr for _, tr in s_titled_rows]
         r_rows = [tr for tr in r_root.findall(".//w:tbl/w:tr", NS) if len(tr.findall("w:tc", NS)) >= 3]
 
         # Build lookup of returned rows by Col 1 Chinese key (with sequential fallback)
@@ -1404,18 +1972,27 @@ def run_library_ingestion_pipeline(
             if k:
                 r_by_cn.setdefault(k, []).append(r_tr)
 
-        # Prepare Step 1B annotated diff document (cloned from `发稿`)
+        # Prepare Step 1B annotated diff document (cloned from `发稿`, with Col 1 revisions rejected cleanly)
         qa_root = copy.deepcopy(s_root)
+        for _tc_qa in qa_root.findall(".//w:tbl/w:tr/w:tc", NS):
+            reject_all_revisions_in_cell(_tc_qa)
+            strip_comments_in_cell(_tc_qa)
         qa_rows = [tr for tr in qa_root.findall(".//w:tbl/w:tr", NS) if len(tr.findall("w:tc", NS)) >= 3]
         qa_comments_root = docx_xml_utils.new_comments_root()
         qa_id_alloc = docx_xml_utils.CommentIdAllocator(doc_root=qa_root, comments_root=qa_comments_root)
         rev_counter = [100]
 
-        # Prepare Step 1A mismatch diff document (only saved if mismatches exist)
+        # Prepare Step 1A mismatch diff document (FIRST reject ALL `发稿` revisions across all cells!)
         mism_root = copy.deepcopy(s_root)
+        for _tc_m in mism_root.findall(".//w:tbl/w:tr/w:tc", NS):
+            reject_all_revisions_in_cell(_tc_m)
+            strip_comments_in_cell(_tc_m)
         mism_rows = [tr for tr in mism_root.findall(".//w:tbl/w:tr", NS) if len(tr.findall("w:tc", NS)) >= 3]
+        mism_row_indices_kept: set = set()
         mism_has_any = False
 
+        # Pre-pass: match all rows of `(sf, rf)` so exact proofread items can match by CN first, then exact Col 3 fallback
+        pair_row_contexts: List[dict] = []
         for r_i, (row_title_hint, s_tr) in enumerate(s_titled_rows):
             s_tcs = s_tr.findall("w:tc", NS)
             s_c1_copy = copy.deepcopy(s_tcs[0])
@@ -1425,7 +2002,6 @@ def run_library_ingestion_pipeline(
             if not cn_key:
                 continue
 
-            # Match corresponding row in `回稿`
             r_tr = None
             if cn_key in r_by_cn and r_by_cn[cn_key]:
                 r_tr = r_by_cn[cn_key].pop(0)
@@ -1435,17 +2011,6 @@ def run_library_ingestion_pipeline(
                 continue
             r_tcs = r_tr.findall("w:tc", NS)
 
-            # Extract rejected `发稿` Col 2 & Col 3
-            s_c2_rej_full_tc = copy.deepcopy(s_tcs[1])
-            reject_all_revisions_in_cell(s_c2_rej_full_tc)
-            s_c2_rej_full = docx_xml_utils.get_cell_plain_text(s_c2_rej_full_tc)
-            s_c2_non_cyan, has_cyan = extract_non_cyan_rejected_text(s_tcs[1])
-
-            s_c3_rej_tc = copy.deepcopy(s_tcs[2])
-            reject_all_revisions_in_cell(s_c3_rej_tc)
-            s_c3_rej = docx_xml_utils.get_cell_plain_text(s_c3_rej_tc)
-
-            # Extract cleaned `回稿` Col 2 & Col 3 + Col 1 shading
             r_c1_clean = copy.deepcopy(r_tcs[0])
             accept_all_revisions_in_cell_safe(r_c1_clean)
             c1_cell_fill, c1_run_spans = extract_col1_shading_spans(r_c1_clean)
@@ -1457,12 +2022,73 @@ def run_library_ingestion_pipeline(
             r_c3_comments = get_cell_comment_texts(r_tcs[2], r_comments_map)
             r_c3_clean_tc = copy.deepcopy(r_tcs[2])
             clean_col23_highlights_and_artifacts(r_c3_clean_tc)
-            r_c3_clean = docx_xml_utils.get_cell_plain_text(r_c3_clean_tc)
+            r_c3_clean = docx_xml_utils.get_cell_plain_text(r_c3_clean_tc).replace("\u00A0", " ")
 
-            # Step 2 optional proofread table merge onto returned Col 3
-            if proofread_rows:
-                r_c3_clean, pr_cnt = apply_proofread_updates_to_text(r_c3_clean, proofread_rows)
-                proofread_applied_total += pr_cnt
+            pair_row_contexts.append({
+                "r_i": r_i,
+                "row_title_hint": row_title_hint,
+                "s_tcs": s_tcs,
+                "s_c1_copy": s_c1_copy,
+                "cn_text": cn_text,
+                "cn_key": cn_key,
+                "c1_cell_fill": c1_cell_fill,
+                "c1_run_spans": c1_run_spans,
+                "r_c2_clean": r_c2_clean,
+                "r_c3_clean": r_c3_clean,
+                "r_c3_comments": r_c3_comments,
+            })
+
+        # Apply strict exact-match proofread replacements (`改前列` must match `回稿` 100% verbatim!)
+        if pending_pr_items and pair_row_contexts:
+            # Pass 1: CN key overlap + 100% exact target match in `r_c3_clean`
+            for item in pending_pr_items:
+                if item["matched"]:
+                    continue
+                old_exact = item["old_text"]
+                new_exact = item["new_text"]
+                pr_cn_k = _norm_cn_key(item["row"].cn)
+                if not pr_cn_k:
+                    continue
+                for ctx in pair_row_contexts:
+                    if (pr_cn_k in ctx["cn_key"] or ctx["cn_key"] in pr_cn_k) and (old_exact in ctx["r_c3_clean"]):
+                        ctx["r_c3_clean"] = ctx["r_c3_clean"].replace(old_exact, new_exact, 1)
+                        item["matched"] = True
+                        proofread_applied_total += 1
+                        break
+
+            # Pass 2: Fallback 100% exact target match across `pair_row_contexts` when CN in sheet was blank/partial
+            for item in pending_pr_items:
+                if item["matched"]:
+                    continue
+                old_exact = item["old_text"]
+                new_exact = item["new_text"]
+                for ctx in pair_row_contexts:
+                    if old_exact in ctx["r_c3_clean"]:
+                        ctx["r_c3_clean"] = ctx["r_c3_clean"].replace(old_exact, new_exact, 1)
+                        item["matched"] = True
+                        proofread_applied_total += 1
+                        break
+
+        for ctx in pair_row_contexts:
+            r_i = ctx["r_i"]
+            row_title_hint = ctx["row_title_hint"]
+            s_tcs = ctx["s_tcs"]
+            s_c1_copy = ctx["s_c1_copy"]
+            cn_text = ctx["cn_text"]
+            c1_cell_fill = ctx["c1_cell_fill"]
+            c1_run_spans = ctx["c1_run_spans"]
+            r_c2_clean = ctx["r_c2_clean"]
+            r_c3_clean = ctx["r_c3_clean"]
+            r_c3_comments = ctx["r_c3_comments"]
+
+            # Extract rejected `发稿` Col 2 & Col 3
+            s_c2_rej_full_tc = copy.deepcopy(s_tcs[1])
+            reject_all_revisions_in_cell(s_c2_rej_full_tc)
+            s_c2_rej_full = docx_xml_utils.get_cell_plain_text(s_c2_rej_full_tc)
+
+            s_c3_rej_tc = copy.deepcopy(s_tcs[2])
+            reject_all_revisions_in_cell(s_c3_rej_tc)
+            s_c3_rej = docx_xml_utils.get_cell_plain_text(s_c3_rej_tc)
 
             # Locate in 3-language library via 5-stage library index search (with title disambiguation + fallback)
             matched_row, _, _ = step1_extract_and_diff.search_library_row_5stage(
@@ -1491,6 +2117,8 @@ def run_library_ingestion_pipeline(
             mismatch_reason = ""
             c2_is_excerpt = False
             c3_is_excerpt = False
+            true_old_c2 = s_c2_rej_full
+            s_c3_aligned = s_c3_rej
 
             if matched_row is not None:
                 lib_file_p = lib_index.resolve_file_path(matched_row["rel_path"]).resolve()
@@ -1506,33 +2134,32 @@ def run_library_ingestion_pipeline(
                         lib_c2_text = docx_xml_utils.get_cell_plain_text(lt2)
                         lib_c3_text = docx_xml_utils.get_cell_plain_text(lt3)
 
-                        norm_s2 = _norm_compare_text(s_c2_rej_full)
-                        norm_l2 = _norm_compare_text(lib_c2_text)
-                        norm_s3 = _norm_compare_text(s_c3_rej)
-                        norm_l3 = _norm_compare_text(lib_c3_text)
+                        # Step 1A Col 2: reject `发稿` revisions -> diff vs `总库` -> accept Cyan (`RV`) revisions -> check remaining!
+                        c2_info = analyze_sent_col2_vs_library(s_tcs[1], lib_c2_text)
+                        en_diff = bool(c2_info["has_remaining_diff"])
+                        c2_is_excerpt = bool(c2_info["is_excerpt"])
+                        step1a_c2_target = str(c2_info["step1a_target"])
+                        true_old_c2 = str(c2_info["true_old_baseline"])
 
-                        c2_is_excerpt = bool(norm_s2 and norm_s2 != norm_l2 and norm_s2 in norm_l2)
-                        c3_is_excerpt = bool(norm_s3 and norm_s3 != norm_l3 and norm_s3 in norm_l3)
+                        # Step 1A Col 3: treat isolated RV blank-line splits (`\n\n`) identically to single spaces!
+                        norm_s3_flat = _norm_compare_flat_ws(s_c3_rej)
+                        norm_l3_flat = _norm_compare_flat_ws(lib_c3_text)
+                        c3_is_excerpt = bool(norm_s3_flat and norm_s3_flat != norm_l3_flat and norm_s3_flat in norm_l3_flat)
+                        f_diff = (norm_s3_flat != norm_l3_flat) and not c3_is_excerpt
+                        s_c3_aligned = _align_sent_text_breaks_to_library(s_c3_rej, lib_c3_text)
 
-                        # Step 1A check: compare non-cyan English & Foreign against current library
-                        en_diff = False
-                        if not has_cyan:
-                            en_diff = (norm_s2 != norm_l2) and not c2_is_excerpt
-                        else:
-                            nc_norm = _norm_compare_text(s_c2_non_cyan)
-                            if len(nc_norm) >= 20 and nc_norm not in norm_l2:
-                                sm_nc = difflib.SequenceMatcher(None, nc_norm, norm_l2, autojunk=False)
-                                if sm_nc.ratio() < 0.55 and all(b.size < 18 for b in sm_nc.get_matching_blocks()):
-                                    en_diff = True
-
-                        f_diff = (norm_s3 != norm_l3) and not c3_is_excerpt
+                        # If library Col 3 is single-paragraph and `发稿` only had artificial RV `\n\n` breaks,
+                        # collapse any leftover `\n` in `r_c3_clean` back to space so `改后/` matches library paragraphing
+                        if "\n" not in lib_c3_text.strip() and "\n" in s_c3_rej.strip() and not f_diff and "\n" in r_c3_clean.strip():
+                            r_c3_clean = re.sub(r"\s*\n+\s*", " ", r_c3_clean).strip()
 
                         if en_diff or f_diff:
                             is_mismatch = True
                             mism_has_any = True
+                            mism_row_indices_kept.add(r_i)
                             reasons = []
                             if en_diff:
-                                reasons.append("英文(非青色)与总库不一致")
+                                reasons.append("英文(接受青色修订后剩余部分)与总库不一致")
                             if f_diff:
                                 reasons.append("外文与总库不一致")
                             mismatch_reason = "；".join(reasons)
@@ -1547,27 +2174,27 @@ def run_library_ingestion_pipeline(
                                 m_tcs = mism_rows[r_i].findall("w:tc", NS)
                                 if en_diff:
                                     render_diff_track_changes_into_cell(
-                                        m_tcs[1], s_c2_rej_full, lib_c2_text, author="总库现状", rev_id_counter=rev_counter
+                                        m_tcs[1], s_c2_rej_full, step1a_c2_target, author="总库现状", rev_id_counter=rev_counter
                                     )
                                 if f_diff:
                                     render_diff_track_changes_into_cell(
-                                        m_tcs[2], s_c3_rej, lib_c3_text, author="总库现状", rev_id_counter=rev_counter
+                                        m_tcs[2], s_c3_aligned, lib_c3_text, author="总库现状", rev_id_counter=rev_counter
                                     )
 
-            # Step 1B: Diff `发稿(rejected)` vs `回稿` & check anomalies
+            # Step 1B: Diff `true_old_c2` (including library old English for Cyan RV!) vs `回稿` & check anomalies
             if r_i < len(qa_rows):
                 qa_tcs = qa_rows[r_i].findall("w:tc", NS)
                 render_diff_track_changes_into_cell(
-                    qa_tcs[1], s_c2_rej_full, r_c2_clean, author="英外验收", rev_id_counter=rev_counter
+                    qa_tcs[1], true_old_c2, r_c2_clean, author="英外验收", rev_id_counter=rev_counter
                 )
                 render_diff_track_changes_into_cell(
-                    qa_tcs[2], s_c3_rej, r_c3_clean, author="英外验收", rev_id_counter=rev_counter
+                    qa_tcs[2], s_c3_aligned, r_c3_clean, author="英外验收", rev_id_counter=rev_counter
                 )
                 anoms = _detect_col3_anomalies(
                     sent_tc2=s_tcs[1],
-                    sent_col2_rej=s_c2_rej_full,
+                    sent_col2_rej=true_old_c2,
                     ret_col2_clean=r_c2_clean,
-                    sent_col3_clean=s_c3_rej,
+                    sent_col3_clean=s_c3_aligned,
                     ret_col3_clean=r_c3_clean,
                     ret_col3_comments=r_c3_comments,
                 )
@@ -1588,8 +2215,8 @@ def run_library_ingestion_pipeline(
                     continue
                 lib_updates.setdefault(lib_file_p, []).append({
                     "row_idx": lib_row_idx,
-                    "sent_c2_rej": s_c2_rej_full,
-                    "sent_c3_rej": s_c3_rej,
+                    "sent_c2_base": true_old_c2,
+                    "sent_c3_base": s_c3_aligned,
                     "ret_c2_clean": r_c2_clean,
                     "ret_c3_clean": r_c3_clean,
                     "c2_is_excerpt": c2_is_excerpt,
@@ -1607,36 +2234,85 @@ def run_library_ingestion_pipeline(
         docx_xml_utils.save_docx_xml(sf, qa_out, qa_root, s_ns, comments_root=final_qa_cmts)
         saved_reports.append(str(qa_out))
 
-        # Save Step 1A mismatch diff doc if any mismatch found
+        # Save Step 1A mismatch diff doc ONLY if remaining mismatches exist (removing clean rows so only mismatched rows remain!)
         if mism_has_any:
+            row_idx_map = {id(tr): idx_r for idx_r, tr in enumerate(mism_rows)}
+            for tbl_m in list(mism_root.findall(".//w:tbl", NS)):
+                for tr_m in list(tbl_m.findall("w:tr", NS)):
+                    idx_m = row_idx_map.get(id(tr_m))
+                    if idx_m is not None and idx_m not in mism_row_indices_kept:
+                        tbl_m.remove(tr_m)
+                if len(tbl_m.findall("w:tr", NS)) == 0:
+                    m_body = mism_root.find("w:body", NS)
+                    if m_body is not None and tbl_m in list(m_body):
+                        m_body.remove(tbl_m)
             mism_out = docx_xml_utils.safe_join_output_file(out_d, f"步1A_发稿与总库不一致核对稿_{safe_stem}_{eff_date}.docx")
             docx_xml_utils.save_docx_xml(sf, mism_out, mism_root, s_ns)
             saved_reports.append(str(mism_out))
 
-    # Write combined Step 1A/1B summary report
+    # Finalize Proofread 5-Column Audit Ledger:
+    #   - Matched items with clause/meaning warnings -> report all 5 columns for review
+    #   - Unmatched items (`找不到完全和回稿一致的`) -> DO NOT replace, report all 5 columns!
+    pr_unmatched_cnt = 0
+    pr_warn_cnt = 0
+    for item in pending_pr_items:
+        r_obj = item["row"]
+        warns = item["warnings"]
+        if not item["matched"]:
+            pr_unmatched_cnt += 1
+            reason_txt = "未替换：回稿中未找到与改前列完全一致的内容"
+            if warns:
+                reason_txt += "；另发现：" + "；".join(warns)
+            proofread_5col_rows.append(make_proofread_5col_row(item["source_pos"], reason_txt, r_obj))
+        elif warns:
+            pr_warn_cnt += 1
+            proofread_5col_rows.append(
+                make_proofread_5col_row(item["source_pos"], "已替换（请人工复核异常）：" + "；".join(warns), r_obj)
+            )
+
+    if clean_pr_sources and log_fn:
+        log_fn(
+            f"📊 通读定稿表核销汇总：成功精确替换 {proofread_applied_total} 条，"
+            f"未找到完全一致/列不一致未替换 {len(proofread_5col_rows) - pr_warn_cnt} 条，改后异常提醒 {pr_warn_cnt} 条。"
+        )
+
+    # Write combined Step 1A/1B + Proofread 5-Column summary report
     rep_rows = []
     for m in step1a_mismatches:
         rep_rows.append(["Step 1A 发稿vs总库", m["chapter"], str(m["row_idx"]), m["cn_preview"], m["reason"]])
     for a in step1b_anomalies:
         rep_rows.append(["Step 1B 回稿验收", a["chapter"], str(a["row_idx"]), a["cn_preview"], a["issues"]])
+
+    extra_secs = []
+    if proofread_5col_rows:
+        extra_secs.append((
+            f"二、通读定稿表核查与未替换/异常明细（共 {len(proofread_5col_rows)} 条，完整列出 5 列）",
+            PROOFREAD_5COL_HEADERS,
+            proofread_5col_rows,
+            PROOFREAD_5COL_WIDTHS,
+        ))
+
     summary_rep_path = docx_xml_utils.safe_join_output_file(out_d, f"步1_改点入库验收报告_{eff_date}.docx")
     _write_simple_report_docx(
         out_path=summary_rep_path,
         title=f"改点入库验收检查报告（{eff_date}）",
         summary_lines=[
             f"配对文档数：{len(pairs)} 组 | 定位涉及总库篇目：{len(lib_updates)} 篇",
-            f"Step 1A 发稿与总库不一致段落：{len(step1a_mismatches)} 处（策略：{'保留总库改动' if conflict_policy == 'keep_library' else '跳过不一致段落'}）",
+            f"Step 1A 发稿与总库不一致段落（已拒绝发稿修订并接受青色正常差异）：{len(step1a_mismatches)} 处（策略：{'保留总库改动' if conflict_policy == 'keep_library' else '跳过不一致段落'}）",
             f"Step 1B 回稿结构/漏改/衔接异常：{len(step1b_anomalies)} 处（已在验收痕迹稿对应位置添加 Word 批注）",
-            f"通读定稿表同步更新：{proofread_applied_total} 句",
+            f"通读定稿表：共读取 {len(clean_pr_sources)} 个表格，成功精确替换 {proofread_applied_total} 条，需人工核查/未替换汇报 {len(proofread_5col_rows)} 条",
         ],
         headers=["检查阶段", "涉及篇目", "段落行", "中文预览", "检查结果 / 异常说明"],
         rows_data=rep_rows or [["全部通过", "-", "-", "-", "未发现总库冲突或回稿结构异常，可放心入库。"]],
+        col_widths=[2100, 3300, 1100, 3270, 4800],
+        extra_sections=extra_secs,
     )
     saved_reports.append(str(summary_rep_path))
 
     if log_fn:
         log_fn(
-            f"📋 验收报告已生成：总库不一致 {len(step1a_mismatches)} 处，回稿异常 {len(step1b_anomalies)} 处。"
+            f"📋 验收报告已生成：总库不一致 {len(step1a_mismatches)} 处，回稿异常 {len(step1b_anomalies)} 处，"
+            f"通读表汇报项 {len(proofread_5col_rows)} 条。"
         )
 
     if check_only:
@@ -1652,6 +2328,7 @@ def run_library_ingestion_pipeline(
             "updated_chapters": 0,
             "updated_rows": 0,
             "proofread_applied": proofread_applied_total,
+            "proofread_report_count": len(proofread_5col_rows),
         }
 
     # ------------------------------------------------------------------
@@ -1673,7 +2350,7 @@ def run_library_ingestion_pipeline(
 
     def _resolve_updated_cell_text(
         cur_cell_text: str,
-        sent_rej: str,
+        sent_base: str,
         ret_clean: str,
         is_excerpt: bool,
         had_conflict: bool,
@@ -1681,7 +2358,7 @@ def run_library_ingestion_pipeline(
     ) -> str:
         if is_excerpt:
             # Substitute only the quoted excerpt inside `cur_cell_text` (preserving unquoted stanzas/paragraphs)
-            s_trim = (sent_rej or "").strip()
+            s_trim = (sent_base or "").strip()
             r_trim = (ret_clean or "").strip()
             if s_trim and s_trim in cur_cell_text:
                 return cur_cell_text.replace(s_trim, r_trim, 1)
@@ -1689,7 +2366,7 @@ def run_library_ingestion_pipeline(
             if loc is not None:
                 return cur_cell_text[: loc[0]] + r_trim + cur_cell_text[loc[1] :]
         if had_conflict and pol == "keep_library":
-            return merge_keep_library_text(sent_rej, cur_cell_text, ret_clean)
+            return merge_keep_library_text(sent_base, cur_cell_text, ret_clean)
         return ret_clean
 
     for c_idx, lib_file in enumerate(lib_files_sorted):
@@ -1738,7 +2415,7 @@ def run_library_ingestion_pipeline(
             cur_c3 = docx_xml_utils.get_cell_plain_text(tcs_a[2])
             new_c2 = _resolve_updated_cell_text(
                 cur_c2,
-                upd["sent_c2_rej"],
+                upd["sent_c2_base"],
                 upd["ret_c2_clean"],
                 bool(upd.get("c2_is_excerpt")),
                 bool(upd.get("had_conflict")),
@@ -1746,7 +2423,7 @@ def run_library_ingestion_pipeline(
             )
             new_c3 = _resolve_updated_cell_text(
                 cur_c3,
-                upd["sent_c3_rej"],
+                upd["sent_c3_base"],
                 upd["ret_c3_clean"],
                 bool(upd.get("c3_is_excerpt")),
                 bool(upd.get("had_conflict")),
@@ -1825,4 +2502,5 @@ def run_library_ingestion_pipeline(
         "updated_chapters": updated_chapters,
         "updated_rows": updated_rows_total,
         "proofread_applied": proofread_applied_total,
+        "proofread_report_count": len(proofread_5col_rows),
     }
