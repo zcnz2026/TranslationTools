@@ -39,14 +39,33 @@ def main() -> None:
     if not skill_scripts_dir.is_dir():
         raise FileNotFoundError(f"Skill scripts directory not found: {skill_scripts_dir}")
 
-    print("[1/5] Running static syntax & secret-leak checks...")
+    print("[1/5] Running static syntax, eager-annotation & secret-leak checks...", flush=True)
     py_files = sorted(list(tool_dir.rglob("*.py")) + list(skill_scripts_dir.rglob("*.py")))
     for pf in py_files:
         py_compile.compile(str(pf), doraise=True)
         txt = pf.read_text(encoding="utf-8")
         if SECRET_RX.search(txt):
             raise RuntimeError(f"Hardcoded secret pattern detected in {pf.name}!")
-    print(f"      Passed ({len(py_files)} Python files verified clean).")
+    # Verify all module imports & type annotations resolve cleanly (prevents Python 3.13 vs 3.14+ PEP 649 drift)
+    import inspect
+    sys.path.insert(0, str(tool_dir))
+    sys.path.insert(0, str(skill_scripts_dir))
+    ann_lib = None
+    try:
+        import annotationlib as _al  # Python 3.14+
+        ann_lib = _al
+    except ImportError:
+        pass
+    for pf in py_files:
+        mod = __import__(pf.stem)
+        if ann_lib is not None:
+            for _, obj in inspect.getmembers(mod):
+                if inspect.isfunction(obj) or inspect.isclass(obj):
+                    ann_lib.get_annotations(obj, format=ann_lib.Format.VALUE)
+                if inspect.isclass(obj):
+                    for _, m in inspect.getmembers(obj, inspect.isfunction):
+                        ann_lib.get_annotations(m, format=ann_lib.Format.VALUE)
+    print(f"      Passed ({len(py_files)} Python files verified clean).", flush=True)
 
     if check_only:
         return
@@ -146,9 +165,18 @@ def main() -> None:
     if not built_exe.is_file():
         raise RuntimeError(f"Expected built EXE not found: {built_exe}")
 
-    print("[3.5/5] Verifying frozen EXE self-test (bundled config.json & modules)...")
-    subprocess.check_call([str(built_exe), "--self-test"], env=env)
-    print("      Frozen EXE self-test passed!")
+    print("[3.5/5] Verifying frozen EXE self-test (bundled config.json & modules)...", flush=True)
+    self_test_log = work_root / "self_test_error.log"
+    env_st = dict(env)
+    env_st["SCATTERED_SELF_TEST_LOG"] = str(self_test_log)
+    try:
+        subprocess.run([str(built_exe), "--self-test"], env=env_st, check=True, timeout=60)
+    except Exception:
+        if self_test_log.is_file():
+            print("=== Frozen EXE self-test traceback ===", flush=True)
+            print(self_test_log.read_text(encoding="utf-8", errors="replace"), flush=True)
+        raise
+    print("      Frozen EXE self-test passed!", flush=True)
 
     print("[4/5] Packaging portable ZIP with UTF-8 filenames...")
     art_dir = repo_root / "artifact_out"

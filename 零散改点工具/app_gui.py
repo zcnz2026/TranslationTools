@@ -1,3 +1,5 @@
+from __future__ import annotations
+
 import ctypes
 from datetime import datetime
 import inspect
@@ -8,8 +10,27 @@ import re
 import sys
 import threading
 import time
+import traceback
 import webbrowser
 from pathlib import Path
+
+if "--self-test" in sys.argv:
+    def _headless_self_test_excepthook(exc_type, exc_value, exc_tb):
+        tb_txt = "".join(traceback.format_exception(exc_type, exc_value, exc_tb))
+        log_p = os.environ.get("SCATTERED_SELF_TEST_LOG", "").strip()
+        if log_p:
+            try:
+                Path(log_p).write_text(tb_txt, encoding="utf-8")
+            except OSError:
+                pass
+        try:
+            sys.stderr.write(tb_txt)
+            sys.stderr.flush()
+        except Exception:
+            pass
+        os._exit(1)
+
+    sys.excepthook = _headless_self_test_excepthook
 import tkinter as tk
 from tkinter import filedialog, messagebox, ttk
 import xml.etree.ElementTree as ET

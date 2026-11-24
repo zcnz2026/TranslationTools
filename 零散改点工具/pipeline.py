@@ -1,3 +1,5 @@
+from __future__ import annotations
+
 from concurrent.futures import ThreadPoolExecutor
 import copy
 import importlib
@@ -13,7 +15,7 @@ import time
 from contextlib import redirect_stdout
 from datetime import datetime
 from pathlib import Path
-from typing import Callable, Dict, List, Optional, Tuple, Union
+from typing import Callable, Dict, List, Optional, Sequence, Tuple, Union
 from unittest.mock import patch
 import xml.etree.ElementTree as ET
 
