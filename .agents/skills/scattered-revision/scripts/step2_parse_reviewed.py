@@ -1,4 +1,5 @@
 import argparse
+import copy
 import json
 from pathlib import Path
 
@@ -91,6 +92,7 @@ def main():
     cur_title = ""
     global_row_idx = 0
     row_tasks = []
+    bilingual_2col = False
 
     for body_idx, ch in enumerate(body):
         local = ch.tag.split("}")[-1]
@@ -101,17 +103,27 @@ def main():
         elif local == "tbl":
             for r_idx, tr in enumerate(ch.findall("w:tr", NS)):
                 tcs = tr.findall("w:tc", NS)
-                if len(tcs) < 3:
+                if len(tcs) < 2:
                     continue
-                col3_text = get_cell_plain_text(tcs[2])
-                if not col3_text.strip() or col3_text.strip() == SKIPPED_ROW_MARKER:
-                    global_row_idx += 1
-                    continue
-
-                accept_all_revisions_in_cell(tcs[0])
-                col1_text = get_cell_plain_text(tcs[0])
-
-                segments = extract_col2_spans(tcs[1])
+                is_2col = len(tcs) == 2
+                if is_2col:
+                    bilingual_2col = True
+                    col3_text = get_cell_plain_text(tcs[1])
+                    if not col3_text.strip() or col3_text.strip() == SKIPPED_ROW_MARKER:
+                        global_row_idx += 1
+                        continue
+                    c1_tmp = copy.deepcopy(tcs[0])
+                    accept_all_revisions_in_cell(c1_tmp)
+                    col1_text = get_cell_plain_text(c1_tmp)
+                    segments = extract_col2_spans(tcs[0])
+                else:
+                    col3_text = get_cell_plain_text(tcs[2])
+                    if not col3_text.strip() or col3_text.strip() == SKIPPED_ROW_MARKER:
+                        global_row_idx += 1
+                        continue
+                    accept_all_revisions_in_cell(tcs[0])
+                    col1_text = get_cell_plain_text(tcs[0])
+                    segments = extract_col2_spans(tcs[1])
                 is_full_cell_rv = _is_full_cell_rv_segments(segments)
                 old_en_full = "".join(seg["old_en"] for seg in segments)
                 spans_to_align = []
@@ -138,7 +150,7 @@ def main():
                         right_ctx = old_en_full[c_end : c_end + 45]
                         spans_to_align.append({
                             "span_id": f"R{global_row_idx}_S{len(spans_to_align)}",
-                            "type": seg["hl_group"],  # 'up' -> Col1 yellow / Col3 yellow; 'rv' -> Col1 cyan / Col3 lightGray
+                            "type": seg["hl_group"],
                             "old_en_in_col3": stripped_old,
                             "old_en_char_start": c_start,
                             "old_en_char_end": c_end,
@@ -152,6 +164,7 @@ def main():
                         "global_row_idx": global_row_idx,
                         "body_idx": body_idx,
                         "row_idx": r_idx,
+                        "bilingual_2col": is_2col,
                         "article_title": cur_title,
                         "col1_text": col1_text,
                         "col3_text": col3_text,
@@ -165,6 +178,7 @@ def main():
     with open(out_json, "w", encoding="utf-8") as f:
         json.dump({
             "draft_docx": str(draft_path),
+            "bilingual_2col": bilingual_2col,
             "row_tasks": row_tasks,
         }, f, ensure_ascii=False, indent=2)
 

@@ -19,7 +19,7 @@ from docx_xml_utils import (
     load_config,
 )
 
-INDEX_SCHEMA_VERSION = 3
+INDEX_SCHEMA_VERSION = 4
 _FILES_KEY_MARKER = ',"files":{'
 
 _FINAL_OUTPUT_NAME_RE = re.compile(
@@ -242,16 +242,17 @@ def _parse_single_library_docx(task: tuple) -> tuple:
     rows_out = []
     for r_idx, tr in enumerate(all_trs):
         tcs = tr.findall(tc_tag)
-        if len(tcs) < 3:
+        if len(tcs) < 2:
             continue
-        col3_txt = _cell_plain_text_fast(tcs[2])
+        col_count = 3 if len(tcs) >= 3 else 2
+        col3_txt = _cell_plain_text_fast(tcs[2] if col_count == 3 else tcs[1])
         if not col3_txt.strip():
             continue
         cn_raw = _cell_plain_text_fast(tcs[0])
         cn_norm = normalize_cn(cn_raw)
         if not cn_norm:
             continue
-        en_raw = _cell_plain_text_fast(tcs[1])
+        en_raw = _cell_plain_text_fast(tcs[1]) if col_count == 3 else ""
         sents = split_cn_sentences(cn_raw)
         open_sents = sents[:3] if sents else [cn_norm[:80]]
         close_sents = sents[-3:] if sents else [cn_norm[-80:]]
@@ -267,6 +268,7 @@ def _parse_single_library_docx(task: tuple) -> tuple:
             "rel_path": rel_posix,
             "title_candidates": row_titles,
             "row_idx": r_idx,
+            "col_count": col_count,
             "cn_norm": cn_norm,
             "opening_sentences": open_sents,
             "closing_sentences": close_sents,

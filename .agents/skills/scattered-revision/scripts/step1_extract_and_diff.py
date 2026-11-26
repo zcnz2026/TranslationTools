@@ -10,21 +10,32 @@ from docx_xml_utils import (
     NS,
     W,
     accept_all_revisions_in_cell,
+    cn_sentence_unit_stats,
+    diff_cn_tokens,
     diff_tokens,
     ensure_three_column_tables_and_landscape,
+    ensure_two_column_tables_and_landscape,
     extract_cell_char_inline_styles,
     extract_char_shading,
     extract_ops_inline_styles,
+    extract_preexisting_pronoun_tag_spans,
     get_cell_plain_text,
+    inject_preexisting_pronoun_tag_ops,
+    is_strict_rv_cn_sentence,
     is_strict_rv_sentence,
     load_config,
     load_docx_comments_xml,
     load_docx_xml,
     merge_same_doc_duplicate_rows,
     project_unquoted_inline_styles,
+    promote_dense_cn_sentence_runs_to_cyan,
+    promote_dense_sentence_runs_to_cyan,
     save_docx_xml,
+    segment_cn_diff_into_sentences,
     segment_diff_into_sentences,
     sentence_unit_stats,
+    should_promote_cn_region_to_cyan,
+    should_promote_region_to_cyan,
     split_into_bg_regions,
     split_into_bg_regions_with_offsets,
 )
@@ -779,6 +790,7 @@ def _resolve_live_source_row(
     inp_cn: str,
     inp_en: str,
     matched_cn_norm: str = "",
+    bilingual_2col: bool = False,
 ) -> Tuple[int, Optional[List[ET.Element]]]:
     """
     Re-verify `expected_row_idx` against the live `src_file` XML on disk.
@@ -786,10 +798,12 @@ def _resolve_live_source_row(
     search `live_trs` live so we NEVER extract a shifted or stale row!
     """
     inp_norm = normalize_cn(inp_cn)
+    min_cols = 2 if bilingual_2col else 3
+    tgt_idx = 1 if bilingual_2col else 2
 
     if 0 <= expected_row_idx < len(live_trs):
         tcs0 = live_trs[expected_row_idx].findall("w:tc", NS)
-        if len(tcs0) >= 3 and get_cell_plain_text(tcs0[2]).strip():
+        if len(tcs0) >= min_cols and get_cell_plain_text(tcs0[tgt_idx]).strip():
             live_norm0 = normalize_cn(get_cell_plain_text(tcs0[0]))
             if live_norm0 and (
                 live_norm0 == inp_norm
@@ -804,7 +818,7 @@ def _resolve_live_source_row(
     best_rank = 0.0
     for idx, tr in enumerate(live_trs):
         tcs = tr.findall("w:tc", NS)
-        if len(tcs) < 3 or not get_cell_plain_text(tcs[2]).strip():
+        if len(tcs) < min_cols or not get_cell_plain_text(tcs[tgt_idx]).strip():
             continue
         live_cn = get_cell_plain_text(tcs[0])
         live_norm = normalize_cn(live_cn)
@@ -815,7 +829,7 @@ def _resolve_live_source_row(
         csim = best_local_cn_similarity(inp_cn, live_norm)
         if csim < 0.72:
             continue
-        esc = compute_en_overlap_score(inp_en, get_cell_plain_text(tcs[1]))
+        esc = 0.5 if bilingual_2col else compute_en_overlap_score(inp_en, get_cell_plain_text(tcs[1]))
         rank = 0.72 * csim + 0.28 * esc
         if rank > best_rank:
             best_rank = rank
@@ -850,9 +864,18 @@ def main():
     inp_root, _, inp_ns_pairs = load_docx_xml(inp_path)
     inp_comments_root = load_docx_comments_xml(inp_path)
 
-    # Preprocess input: accept Col 1 Chinese track changes, auto-expand 2-col -> 3-col + Landscape A4, and merge duplicate rows
+    all_idx_files = [lib_index.resolve_file_path(rp) for rp in list(lib_index.files_map.keys())[:20]]
+    prelim_lang = args.lang.strip().upper() or detect_lang_code(lib_dir, all_idx_files, cfg)
+    sample_lib_rows = lib_index.rows[:50]
+    lib_is_2col = bool(sample_lib_rows) and sum(1 for r in sample_lib_rows if r.get("col_count") == 2) > (len(sample_lib_rows) // 2)
+    bilingual_2col = (prelim_lang in ("KO", "KR")) or lib_is_2col
+
+    # Preprocess input: accept Col 1 Chinese track changes, normalize 2-col (Korean) or 3-col + Landscape A4, and merge duplicate rows
     xml_before_preproc = ET.tostring(inp_root, encoding="unicode")
-    exp_cnt = ensure_three_column_tables_and_landscape(inp_root)
+    if bilingual_2col:
+        exp_cnt = ensure_two_column_tables_and_landscape(inp_root)
+    else:
+        exp_cnt = ensure_three_column_tables_and_landscape(inp_root)
     col1_accepted_cnt = 0
     for tr_pre in inp_root.findall(".//w:tbl/w:tr", NS):
         tcs_pre = tr_pre.findall("w:tc", NS)
@@ -873,15 +896,18 @@ def main():
         effective_inp_path = preproc_path
         inp_root, _, _ = load_docx_xml(effective_inp_path)
         if exp_cnt > 0:
-            print(f"📐 已自动将 {exp_cnt} 个两列表格扩展为三列表格并设为横向 A4 页面。")
+            if bilingual_2col:
+                print(f"📐 已自动将 {exp_cnt} 个表格规范化为中韩两列横向 A4 布局。")
+            else:
+                print(f"📐 已自动将 {exp_cnt} 个两列表格扩展为三列表格并设为横向 A4 页面。")
         if col1_accepted_cnt > 0:
             print(f"✅ 已自动接受第 1 列中文中的 {col1_accepted_cnt} 处修订痕迹。")
 
     body = inp_root.find("w:body", NS)
 
-    # Check if ANY shading exists across all tables in input Col 2
+    # Check if ANY shading exists across all tables in input Col 2 (3-col English mode only)
     any_doc_shading = False
-    if not args.force_full_diff:
+    if not bilingual_2col and not args.force_full_diff:
         for tbl in body.findall("w:tbl", NS):
             for tr in tbl.findall("w:tr", NS):
                 tcs = tr.findall("w:tc", NS)
@@ -899,8 +925,6 @@ def main():
     live_src_cache: Dict[Path, List[ET.Element]] = {}
     warned_open_files: Set[Path] = set()
 
-    rv_threshold = cfg.get("rv_word_change_ratio_threshold", 0.42)
-
     for body_idx, ch in enumerate(body):
         local = ch.tag.split("}")[-1]
         if local == "p":
@@ -910,14 +934,20 @@ def main():
         elif local == "tbl":
             for r_idx, tr in enumerate(ch.findall("w:tr", NS)):
                 tcs = tr.findall("w:tc", NS)
-                if len(tcs) < 3:
+                if len(tcs) < (2 if bilingual_2col else 3):
                     continue
                 inp_cn = get_cell_plain_text(tcs[0])
-                inp_en, inp_fills = extract_char_shading(tcs[1])
-                if not normalize_cn(inp_cn) and not inp_en.strip():
-                    continue
-                if args.force_full_diff or not any_doc_shading:
-                    inp_fills = ["NONE_FULL"] * len(inp_en)
+                if bilingual_2col:
+                    inp_en = ""
+                    inp_fills = []
+                    if not normalize_cn(inp_cn):
+                        continue
+                else:
+                    inp_en, inp_fills = extract_char_shading(tcs[1])
+                    if not normalize_cn(inp_cn) and not inp_en.strip():
+                        continue
+                    if args.force_full_diff or not any_doc_shading:
+                        inp_fills = ["NONE_FULL"] * len(inp_en)
 
                 matched_row, match_conf, match_stage = search_library_row_5stage(
                     cur_title=cur_title,
@@ -972,6 +1002,7 @@ def main():
                     inp_cn=inp_cn,
                     inp_en=inp_en,
                     matched_cn_norm=matched_row.get("cn_norm", ""),
+                    bilingual_2col=bilingual_2col,
                 )
                 if live_tcs is None:
                     cn_prev = normalize_cn(inp_cn)[:80]
@@ -987,61 +1018,129 @@ def main():
                 if src_file not in matched_lib_paths:
                     matched_lib_paths.append(src_file)
 
-                _, inp_styles = extract_cell_char_inline_styles(tcs[1])
-                src_en, src_styles = extract_cell_char_inline_styles(live_tcs[1])
-                col3_preview = get_cell_plain_text(live_tcs[2])[:120]
-
-                regions = split_into_bg_regions_with_offsets(src_en, inp_en, inp_fills)
-                region_entries = []
-                for reg_idx, (fill_hex, s_c1, s_c2, t_c1, t_c2) in enumerate(regions):
-                    src_seg = src_en[s_c1:s_c2]
-                    inp_seg = inp_en[t_c1:t_c2]
-                    s_st_slice = src_styles[s_c1:s_c2]
-                    i_st_slice = inp_styles[t_c1:t_c2]
-                    if fill_hex is None:
-                        unq_entry = {
-                            "region_idx": reg_idx,
-                            "is_quoted": False,
-                            "fill_hex": None,
-                            "src_text": src_seg,
+                if bilingual_2col:
+                    inp_cn_exact, inp_cn_styles = extract_cell_char_inline_styles(tcs[0])
+                    src_cn_exact, src_cn_styles = extract_cell_char_inline_styles(live_tcs[0])
+                    col3_preview = get_cell_plain_text(live_tcs[1])[:120]
+                    ops = diff_cn_tokens(src_cn_exact, inp_cn_exact)
+                    all_op_styles = extract_ops_inline_styles(
+                        ops, src_cn_exact, src_cn_styles, inp_cn_exact, inp_cn_styles
+                    )
+                    sent_op_lists = segment_cn_diff_into_sentences(ops)
+                    sent_items = []
+                    op_cursor = 0
+                    for s_i, s_ops in enumerate(sent_op_lists):
+                        s_op_styles = all_op_styles[op_cursor : op_cursor + len(s_ops)]
+                        op_cursor += len(s_ops)
+                        stats = cn_sentence_unit_stats(s_ops)
+                        sent_id = f"T{tbl_counter}_R{r_idx}_G0_S{s_i}"
+                        if not stats["has_edit"]:
+                            suggested = "none"
+                        elif is_strict_rv_cn_sentence(stats):
+                            suggested = "cyan"
+                        else:
+                            suggested = "yellow"
+                        s_entry = {
+                            "sent_id": sent_id,
+                            "suggested_action": suggested,
+                            **stats,
+                            "ops": s_ops,
                         }
-                        st_spans = project_unquoted_inline_styles(src_seg, s_st_slice, inp_seg, i_st_slice)
-                        if st_spans:
-                            unq_entry["style_spans"] = st_spans
-                        region_entries.append(unq_entry)
-                    else:
-                        actual_fill = None if fill_hex == "NONE_FULL" else fill_hex
-                        ops = diff_tokens(src_seg, inp_seg)
-                        all_op_styles = extract_ops_inline_styles(ops, src_seg, s_st_slice, inp_seg, i_st_slice)
-                        sent_op_lists = segment_diff_into_sentences(ops)
-                        sent_items = []
-                        op_cursor = 0
-                        for s_i, s_ops in enumerate(sent_op_lists):
-                            s_op_styles = all_op_styles[op_cursor : op_cursor + len(s_ops)]
-                            op_cursor += len(s_ops)
-                            stats = sentence_unit_stats(s_ops)
-                            sent_id = f"T{tbl_counter}_R{r_idx}_G{reg_idx}_S{s_i}"
-                            if not stats["has_edit"]:
-                                suggested = "none"
-                            elif is_strict_rv_sentence(stats):
-                                suggested = "cyan"
-                            else:
-                                suggested = "yellow"
-                            s_entry = {
-                                "sent_id": sent_id,
-                                "suggested_action": suggested,
-                                **stats,
-                                "ops": s_ops,
+                        if any(s_op_styles):
+                            s_entry["op_styles"] = s_op_styles
+                        sent_items.append(s_entry)
+
+                    init_acts = [si["suggested_action"] for si in sent_items]
+                    prom_acts = promote_dense_cn_sentence_runs_to_cyan(sent_items, init_acts)
+                    if should_promote_cn_region_to_cyan(sent_items, prom_acts):
+                        prom_acts = ["cyan" if si["has_edit"] or len(sent_items) >= 2 else si["suggested_action"] for si in sent_items]
+                        if all(a in ("cyan", "none") for a in prom_acts) and any(a == "cyan" for a in prom_acts):
+                            prom_acts = ["cyan"] * len(sent_items)
+                    for si, pa in zip(sent_items, prom_acts):
+                        si["suggested_action"] = pa
+
+                    region_entries = [{
+                        "region_idx": 0,
+                        "is_quoted": True,
+                        "fill_hex": None,
+                        "sentences": sent_items,
+                    }]
+                else:
+                    _, inp_styles = extract_cell_char_inline_styles(tcs[1])
+                    pre_pron_spans = extract_preexisting_pronoun_tag_spans(tcs[1])
+                    src_en, src_styles = extract_cell_char_inline_styles(live_tcs[1])
+                    col3_preview = get_cell_plain_text(live_tcs[2])[:120]
+
+                    regions = split_into_bg_regions_with_offsets(src_en, inp_en, inp_fills)
+                    region_entries = []
+                    for reg_idx, (fill_hex, s_c1, s_c2, t_c1, t_c2) in enumerate(regions):
+                        src_seg = src_en[s_c1:s_c2]
+                        inp_seg = inp_en[t_c1:t_c2]
+                        s_st_slice = src_styles[s_c1:s_c2]
+                        i_st_slice = inp_styles[t_c1:t_c2]
+                        if fill_hex is None:
+                            unq_entry = {
+                                "region_idx": reg_idx,
+                                "is_quoted": False,
+                                "fill_hex": None,
+                                "src_text": src_seg,
                             }
-                            if any(s_op_styles):
-                                s_entry["op_styles"] = s_op_styles
-                            sent_items.append(s_entry)
-                        region_entries.append({
-                            "region_idx": reg_idx,
-                            "is_quoted": True,
-                            "fill_hex": actual_fill,
-                            "sentences": sent_items,
-                        })
+                            st_spans = project_unquoted_inline_styles(src_seg, s_st_slice, inp_seg, i_st_slice)
+                            if st_spans:
+                                unq_entry["style_spans"] = st_spans
+                            region_entries.append(unq_entry)
+                        else:
+                            actual_fill = None if fill_hex == "NONE_FULL" else fill_hex
+                            reg_pron_spans = [
+                                (pa - t_c1, pb - t_c1)
+                                for (pa, pb) in pre_pron_spans
+                                if t_c1 <= pa < pb <= t_c2
+                            ]
+                            ops = inject_preexisting_pronoun_tag_ops(
+                                diff_tokens(src_seg, inp_seg),
+                                reg_pron_spans,
+                            )
+                            all_op_styles = extract_ops_inline_styles(ops, src_seg, s_st_slice, inp_seg, i_st_slice)
+                            sent_op_lists = segment_diff_into_sentences(ops)
+                            sent_items = []
+                            op_cursor = 0
+                            for s_i, s_ops in enumerate(sent_op_lists):
+                                s_op_styles = all_op_styles[op_cursor : op_cursor + len(s_ops)]
+                                op_cursor += len(s_ops)
+                                stats = sentence_unit_stats(s_ops)
+                                sent_id = f"T{tbl_counter}_R{r_idx}_G{reg_idx}_S{s_i}"
+                                if not stats["has_edit"]:
+                                    suggested = "none"
+                                elif is_strict_rv_sentence(stats):
+                                    suggested = "cyan"
+                                else:
+                                    suggested = "yellow"
+                                s_entry = {
+                                    "sent_id": sent_id,
+                                    "suggested_action": suggested,
+                                    **stats,
+                                    "ops": s_ops,
+                                }
+                                if any(s_op_styles):
+                                    s_entry["op_styles"] = s_op_styles
+                                sent_items.append(s_entry)
+
+                            # Promote contiguous dense multi-sentence blocks & heavily rewritten whole paragraphs
+                            init_acts = [si["suggested_action"] for si in sent_items]
+                            prom_acts = promote_dense_sentence_runs_to_cyan(sent_items, init_acts)
+                            if should_promote_region_to_cyan(sent_items, prom_acts):
+                                prom_acts = ["cyan" if si["has_edit"] or len(sent_items) >= 2 else si["suggested_action"] for si in sent_items]
+                                if all(a in ("cyan", "none") for a in prom_acts) and any(a == "cyan" for a in prom_acts):
+                                    prom_acts = ["cyan"] * len(sent_items)
+                            for si, pa in zip(sent_items, prom_acts):
+                                si["suggested_action"] = pa
+
+                            region_entries.append({
+                                "region_idx": reg_idx,
+                                "is_quoted": True,
+                                "fill_hex": actual_fill,
+                                "sentences": sent_items,
+                            })
 
                 rows_manifest.append({
                     "tbl_idx": tbl_counter,
@@ -1057,13 +1156,15 @@ def main():
                 })
             tbl_counter += 1
 
-    all_idx_files = [lib_index.resolve_file_path(rp) for rp in list(lib_index.files_map.keys())[:20]]
     lang_code = args.lang.strip().upper() or detect_lang_code(lib_dir, matched_lib_paths or all_idx_files, cfg)
+    if bilingual_2col and lang_code == "XX":
+        lang_code = "KO"
     manifest = {
         "input_docx": str(effective_inp_path),
         "original_input_docx": str(inp_path),
         "library_dir": str(lib_dir),
         "lang_code": lang_code,
+        "bilingual_2col": bilingual_2col,
         "any_doc_shading": any_doc_shading,
         "force_full_diff": bool(args.force_full_diff),
         "expanded_2col_tables": exp_cnt,

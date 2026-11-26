@@ -375,9 +375,14 @@ def _build_raw_trilingual_docx_from_manifest(
     with open(manifest_path, "r", encoding="utf-8") as f:
         manifest = json.load(f)
 
+    bilingual_2col = bool(manifest.get("bilingual_2col"))
+    min_cols = 2 if bilingual_2col else 3
     inp_path = Path(manifest["input_docx"]).resolve()
     root, _, ns_pairs = docx_xml_utils.load_docx_xml(inp_path)
-    ensure_three_column_tables_and_landscape(root)
+    if bilingual_2col and callable(getattr(docx_xml_utils, "ensure_two_column_tables_and_landscape", None)):
+        docx_xml_utils.ensure_two_column_tables_and_landscape(root)
+    else:
+        ensure_three_column_tables_and_landscape(root)
     orig_comments = docx_xml_utils.load_docx_comments_xml(inp_path)
     inp_had_comments = orig_comments is not None
     working_comments = orig_comments if orig_comments is not None else docx_xml_utils.new_comments_root()
@@ -389,7 +394,7 @@ def _build_raw_trilingual_docx_from_manifest(
         body_el = body[rm["body_idx"]]
         tr = body_el.findall("w:tr", NS)[rm["row_idx"]]
         tcs = tr.findall("w:tc", NS)
-        if len(tcs) < 3:
+        if len(tcs) < min_cols:
             continue
 
         src_file = Path(rm["source_file"])
@@ -416,7 +421,7 @@ def _build_raw_trilingual_docx_from_manifest(
         step1_render_draft._populate_clean_library_cell(
             src_tc=s_tcs[1],
             target_tc=tcs[1],
-            fallback_tc=tcs[1],
+            fallback_tc=tcs[0] if bilingual_2col else tcs[1],
             src_comments_map=s_cmap,
             target_comments_root=working_comments,
             id_allocator=id_allocator,
@@ -424,26 +429,30 @@ def _build_raw_trilingual_docx_from_manifest(
             ensure_cjk_songti=False,
             preserve_shading_and_highlights=True,
         )
-        step1_render_draft._populate_clean_library_cell(
-            src_tc=s_tcs[2],
-            target_tc=tcs[2],
-            fallback_tc=tcs[1],
-            src_comments_map=s_cmap,
-            target_comments_root=working_comments,
-            id_allocator=id_allocator,
-            src_styles_root=s_styles,
-            ensure_cjk_songti=False,
-            preserve_shading_and_highlights=True,
-        )
+        if not bilingual_2col and len(tcs) >= 3 and len(s_tcs) >= 3:
+            step1_render_draft._populate_clean_library_cell(
+                src_tc=s_tcs[2],
+                target_tc=tcs[2],
+                fallback_tc=tcs[1],
+                src_comments_map=s_cmap,
+                target_comments_root=working_comments,
+                id_allocator=id_allocator,
+                src_styles_root=s_styles,
+                ensure_cjk_songti=False,
+                preserve_shading_and_highlights=True,
+            )
 
     for sr in manifest.get("skipped_rows", []):
         body_el = body[sr["body_idx"]]
         trs = body_el.findall("w:tr", NS)
         if 0 <= sr["row_idx"] < len(trs):
             tcs = trs[sr["row_idx"]].findall("w:tc", NS)
-            if len(tcs) >= 3:
+            if len(tcs) >= min_cols:
                 _strip_all_highlights_in_root(trs[sr["row_idx"]])
-                step1_render_draft.populate_skipped_col3_cell(tcs[2], fallback_tc=tcs[1])
+                if bilingual_2col:
+                    step1_render_draft.populate_skipped_col3_cell(tcs[1], fallback_tc=tcs[0])
+                else:
+                    step1_render_draft.populate_skipped_col3_cell(tcs[2], fallback_tc=tcs[1])
 
     update_top_highlight_instruction_lines(root, has_up=False, has_rv=False)
     if balance_columns:

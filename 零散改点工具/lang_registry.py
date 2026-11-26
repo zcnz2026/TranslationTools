@@ -19,6 +19,10 @@ _CODE_ALIASES: Dict[str, str] = {
     "UA": "UK",
     "EL": "GR",
     "FIL": "TL",
+    "FP": "TL",
+    "IN": "ID",
+    "KR": "KO",
+    "CR": "HT",
 }
 
 DEFAULT_LANGUAGES: List[Dict] = [
@@ -30,7 +34,7 @@ DEFAULT_LANGUAGES: List[Dict] = [
     {"code": "GR", "name": "希腊语", "keywords": ["希腊语", "腊语", "希腊", "中英腊"], "font": "Georgia"},
     {"code": "RU", "name": "俄语", "keywords": ["俄语", "中英俄"], "font": "Times New Roman"},
     {"code": "UK", "name": "乌克兰语", "keywords": ["乌克兰语", "乌语", "乌克兰", "中英乌"], "font": "Arial"},
-    {"code": "KO", "name": "韩语", "keywords": ["韩语", "朝鲜语", "中英韩"], "font": "Malgun Gothic"},
+    {"code": "KO", "name": "韩语", "keywords": ["韩语", "朝鲜语", "中韩", "中英韩", "KR"], "font": "Malgun Gothic"},
     {"code": "JA", "name": "日语", "keywords": ["日语", "日本语", "中英日"], "font": ""},
     {
         "code": "TH",
@@ -44,16 +48,16 @@ DEFAULT_LANGUAGES: List[Dict] = [
     {"code": "VI", "name": "越南语", "keywords": ["越南语", "越语", "越南", "中英越"], "font": "Times New Roman"},
     {"code": "ID", "name": "印尼语", "keywords": ["印尼语", "印度尼西亚语", "印尼", "中英印尼"], "font": "Times New Roman"},
     {"code": "MS", "name": "马来语", "keywords": ["马来语", "中英马来", "中英马"], "font": ""},
-    {"code": "TL", "name": "塔加洛语", "keywords": ["塔加洛语", "他加禄语", "菲律宾语", "菲语", "中英塔", "中英菲"], "font": "Georgia"},
+    {"code": "TL", "name": "塔加洛语", "keywords": ["塔加洛语", "他加禄语", "菲律宾语", "菲语", "中英塔", "中英菲", "FP"], "font": "Georgia"},
     {"code": "MY", "name": "缅甸语", "keywords": ["缅甸语", "缅语", "缅甸", "中英缅"], "font": "Myanmar Text"},
-    {"code": "KM", "name": "高棉语", "keywords": ["高棉语", "柬埔寨语", "柬语", "中英柬", "中英高棉"], "font": "Leelawadee UI"},
+    {"code": "KM", "name": "高棉语", "keywords": ["高棉语", "高棉", "柬埔寨语", "柬语", "中英柬", "中英高棉"], "font": "Leelawadee UI"},
     {"code": "LO", "name": "老挝语", "keywords": ["老挝语", "老语", "老挝", "挝语", "中英老", "中英挝"], "font": "DokChampa"},
     {"code": "AR", "name": "阿拉伯语", "keywords": ["阿拉伯语", "阿语", "中英阿"], "font": "Simplified Arabic"},
     {"code": "TR", "name": "土耳其语", "keywords": ["土耳其语", "土语", "中英土"], "font": ""},
     {"code": "FA", "name": "波斯语", "keywords": ["波斯语", "中英波斯"], "font": ""},
     {"code": "HE", "name": "希伯来语", "keywords": ["希伯来语", "希伯来", "中英希伯来"], "font": "FrankRuehl"},
     {"code": "HI", "name": "印地语", "keywords": ["印地语", "中英印地"], "font": "Mangal"},
-    {"code": "NE", "name": "尼泊尔语", "keywords": ["尼泊尔语", "尼语", "中英尼"], "font": "Mangal"},
+    {"code": "NE", "name": "尼泊尔语", "keywords": ["尼泊尔语", "尼泊尔", "尼语", "中英尼"], "font": "Mangal"},
     {"code": "UR", "name": "乌尔都语", "keywords": ["乌尔都语", "中英乌尔都"], "font": ""},
     {"code": "BN", "name": "孟加拉语", "keywords": ["孟加拉语", "中英孟"], "font": ""},
     {"code": "TA", "name": "泰米尔语", "keywords": ["泰米尔语", "中英泰米尔"], "font": ""},
@@ -61,19 +65,21 @@ DEFAULT_LANGUAGES: List[Dict] = [
     {"code": "TE", "name": "泰卢固语", "keywords": ["泰卢固语", "中英泰卢固"], "font": ""},
     {"code": "MR", "name": "马拉地语", "keywords": ["马拉地语", "中英马拉地"], "font": ""},
     {"code": "PL", "name": "波兰语", "keywords": ["波兰语", "波语", "中英波", "PO"], "font": "Georgia"},
-    {"code": "NL", "name": "荷兰语", "keywords": ["荷兰语", "荷语", "中英荷"], "font": "Georgia"},
+    {"code": "NL", "name": "荷兰语", "keywords": ["荷兰语", "荷兰", "荷语", "中英荷"], "font": "Georgia"},
     {"code": "RO", "name": "罗马尼亚语", "keywords": ["罗马尼亚语", "罗语", "罗马尼亚", "中英罗"], "font": "Georgia"},
     {"code": "CS", "name": "捷克语", "keywords": ["捷克语", "中英捷"], "font": ""},
     {"code": "SK", "name": "斯洛伐克语", "keywords": ["斯洛伐克语", "斯洛伐克", "中英斯洛伐克"], "font": "Times New Roman"},
-    {"code": "HU", "name": "匈牙利语", "keywords": ["匈牙利语", "马扎尔语", "匈语", "中英匈", "中英马扎尔"], "font": "Times New Roman"},
-    {"code": "BG", "name": "保加利亚语", "keywords": ["保加利亚语", "保语", "中英保"], "font": "Georgia"},
-    {"code": "SR", "name": "塞尔维亚语", "keywords": ["塞尔维亚语", "中英塞"], "font": "Georgia"},
-    {"code": "HR", "name": "克罗地亚语", "keywords": ["克罗地亚语", "中英克"], "font": "Georgia"},
+    {"code": "HU", "name": "匈牙利语", "keywords": ["匈牙利语", "马扎尔语", "马扎尔", "匈语", "中英匈", "中英马扎尔"], "font": "Times New Roman"},
+    {"code": "BG", "name": "保加利亚语", "keywords": ["保加利亚语", "保加利亚", "保语", "中英保"], "font": "Georgia"},
+    {"code": "SR", "name": "塞尔维亚语", "keywords": ["塞尔维亚语", "塞尔维亚", "中英塞"], "font": "Georgia"},
+    {"code": "HR", "name": "克罗地亚语", "keywords": ["克罗地亚语", "克罗地亚", "中英克"], "font": "Georgia"},
     {"code": "SL", "name": "斯洛文尼亚语", "keywords": ["斯洛文尼亚语", "斯洛文尼亚", "中英斯洛文尼亚"], "font": ""},
+    {"code": "LT", "name": "立陶宛语", "keywords": ["立陶宛语", "立陶宛", "中英立", "中英立陶宛"], "font": "Georgia"},
     {"code": "SV", "name": "瑞典语", "keywords": ["瑞典语", "中英瑞"], "font": ""},
     {"code": "MN", "name": "蒙古语", "keywords": ["蒙古语", "蒙语", "中英蒙"], "font": "Times New Roman"},
     {"code": "HMN", "name": "苗语", "keywords": ["苗语", "中英苗"], "font": "Georgia"},
-    {"code": "SW", "name": "斯瓦希里语", "keywords": ["斯瓦希里语", "中英斯"], "font": "Georgia"},
+    {"code": "SW", "name": "斯瓦希里语", "keywords": ["斯瓦希里语", "斯瓦希里", "中英斯"], "font": "Georgia"},
+    {"code": "HT", "name": "克利奥语", "keywords": ["克利奥语", "克利奥", "海地克里奥尔语", "克里奥尔语", "中英克利奥"], "font": "Georgia"},
     {"code": "AM", "name": "阿姆哈拉语", "keywords": ["阿姆哈拉语", "中英阿姆"], "font": ""},
     {"code": "HY", "name": "亚美尼亚语", "keywords": ["亚美尼亚语", "亚美尼亚", "中英亚美尼亚"], "font": "Noto Sans Armenian"},
     {"code": "KA", "name": "格鲁吉亚语", "keywords": ["格鲁吉亚语", "格鲁吉亚", "中英格鲁吉亚"], "font": "Sylfaen"},
@@ -183,14 +189,13 @@ def load_languages() -> List[Dict]:
 
             cleaned.append(entry_out)
         if cleaned:
-            # Seamless upgrade from pre-v1.7.0 languages.json: append any newly added standard languages
-            if not had_any_font_field:
-                seen_codes = {e["code"] for e in cleaned}
-                for d in DEFAULT_LANGUAGES:
-                    if d["code"] not in seen_codes:
-                        item_copy = dict(d)
-                        item_copy["keywords"] = list(d.get("keywords", []))
-                        cleaned.append(item_copy)
+            # Seamless upgrade: backfill any newly added standard languages (e.g. LT, HT) missing from local languages.json
+            seen_codes = {e["code"] for e in cleaned}
+            for d in DEFAULT_LANGUAGES:
+                if d["code"] not in seen_codes:
+                    item_copy = dict(d)
+                    item_copy["keywords"] = list(d.get("keywords", []))
+                    cleaned.append(item_copy)
             return cleaned
     except Exception:
         pass

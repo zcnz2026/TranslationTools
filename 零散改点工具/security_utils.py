@@ -173,10 +173,15 @@ def validate_model_id(model: str) -> str:
     return m
 
 
+_REGIONAL_VERTEX_HOST_RE = re.compile(r"^[a-z0-9-]+-aiplatform\.googleapis\.com$")
+
+
 def validate_https_endpoint(url: str) -> None:
     """Ensure outbound API requests only target allowlisted Google HTTPS endpoints."""
     parsed = urllib.parse.urlsplit(url)
-    if parsed.scheme != "https" or parsed.hostname not in ALLOWED_API_HOSTS:
+    host = (parsed.hostname or "").lower()
+    is_trusted_host = host in ALLOWED_API_HOSTS or bool(_REGIONAL_VERTEX_HOST_RE.fullmatch(host))
+    if parsed.scheme != "https" or not is_trusted_host:
         raise ValueError(f"已拦截非受信任的 API 请求地址：{url!r}")
 
 

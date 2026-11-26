@@ -1227,6 +1227,9 @@ def _repair_skipped_title_rows_in_manifest(
     if not tbl_to_src:
         return 0
 
+    bilingual_2col = bool(manifest.get("bilingual_2col"))
+    min_src_cols = 2 if bilingual_2col else 3
+    tgt_src_idx = 1 if bilingual_2col else 2
     inp_root, _, _ = docx_xml_utils.load_docx_xml(Path(manifest["input_docx"]))
     inp_body = inp_root.find("w:body", NS)
     cfg = docx_xml_utils.load_config()
@@ -1250,21 +1253,29 @@ def _repair_skipped_title_rows_in_manifest(
                 if r_idx < len(inp_trs) and r_idx < len(s_trs):
                     inp_tcs = inp_trs[r_idx].findall("w:tc", NS)
                     s_tcs = s_trs[r_idx].findall("w:tc", NS)
-                    if len(inp_tcs) >= 2 and len(s_tcs) >= 3 and docx_xml_utils.get_cell_plain_text(s_tcs[2]).strip():
+                    if len(inp_tcs) >= 2 and len(s_tcs) >= min_src_cols and docx_xml_utils.get_cell_plain_text(s_tcs[tgt_src_idx]).strip():
                         _, inp_cn_core = split_title_prefix_and_core(docx_xml_utils.get_cell_plain_text(inp_tcs[0]))
                         _, src_cn_core = split_title_prefix_and_core(docx_xml_utils.get_cell_plain_text(s_tcs[0]))
                         inp_cn = _WS_RE.sub("", inp_cn_core or docx_xml_utils.get_cell_plain_text(inp_tcs[0]))
                         src_cn = _WS_RE.sub("", src_cn_core or docx_xml_utils.get_cell_plain_text(s_tcs[0]))
                         same_appendix_r0 = (r_idx == 0 and inp_cn.startswith("附篇") and src_cn.startswith("附篇"))
                         if inp_cn and (inp_cn == src_cn or inp_cn in src_cn or src_cn in inp_cn or same_appendix_r0):
-                            inp_en = docx_xml_utils.get_cell_plain_text(inp_tcs[1])
-                            src_en = docx_xml_utils.get_cell_plain_text(s_tcs[1])
-                            ops = docx_xml_utils.diff_tokens(src_en, inp_en)
-                            sent_op_lists = docx_xml_utils.segment_diff_into_sentences(ops)
+                            if bilingual_2col:
+                                inp_txt0 = docx_xml_utils.get_cell_plain_text(inp_tcs[0])
+                                src_txt0 = docx_xml_utils.get_cell_plain_text(s_tcs[0])
+                                ops = docx_xml_utils.diff_cn_tokens(src_txt0, inp_txt0)
+                                sent_op_lists = docx_xml_utils.segment_cn_diff_into_sentences(ops)
+                                stats_fn = docx_xml_utils.cn_sentence_unit_stats
+                            else:
+                                inp_en = docx_xml_utils.get_cell_plain_text(inp_tcs[1])
+                                src_en = docx_xml_utils.get_cell_plain_text(s_tcs[1])
+                                ops = docx_xml_utils.diff_tokens(src_en, inp_en)
+                                sent_op_lists = docx_xml_utils.segment_diff_into_sentences(ops)
+                                stats_fn = docx_xml_utils.sentence_unit_stats
                             tbl_cnt = tbl_to_idx[b_idx]
                             sent_items = []
                             for s_i, s_ops in enumerate(sent_op_lists):
-                                stats = docx_xml_utils.sentence_unit_stats(s_ops)
+                                stats = stats_fn(s_ops)
                                 sid = f"T{tbl_cnt}_R{r_idx}_G0_S{s_i}"
                                 if not stats["has_edit"]:
                                     sug = "none"
@@ -1304,7 +1315,7 @@ def _repair_skipped_title_rows_in_manifest(
                                     "source_row_idx": r_idx,
                                     "match_confidence": 1.0,
                                     "match_stage": "chapter_title_row0",
-                                    "col3_preview": docx_xml_utils.get_cell_plain_text(s_tcs[2])[:120],
+                                    "col3_preview": docx_xml_utils.get_cell_plain_text(s_tcs[tgt_src_idx])[:120],
                                     "regions": [
                                         {
                                             "region_idx": 0,
@@ -1342,7 +1353,11 @@ def _manifest_has_any_en_edits(manifest: dict, review_items: list) -> bool:
                 if sent.get("has_edit"):
                     return True
                 for k_op, t_op in sent.get("ops") or []:
-                    if k_op in ("del", "ins") and str(t_op).strip():
+                    if (
+                        k_op in ("del", "ins")
+                        and str(t_op).strip()
+                        and not docx_xml_utils.is_pure_pronoun_tag_op(k_op, str(t_op))
+                    ):
                         return True
     return False
 
@@ -1356,7 +1371,8 @@ def _docx_has_any_col2_revisions(docx_path: Path) -> bool:
             continue
         tcs = tr.findall("w:tc", NS)
         if len(tcs) >= 2:
-            if tcs[1].find(".//w:ins", NS) is not None or tcs[1].find(".//w:del", NS) is not None:
+            tc_diff = tcs[0] if len(tcs) == 2 else tcs[1]
+            if docx_xml_utils.cell_has_substantive_revisions(tc_diff):
                 return True
     return False
 
@@ -1367,11 +1383,11 @@ def _row_has_up_or_rv_changes(tr: ET.Element, up_color: str, rv_color: str) -> b
     tcs = tr.findall("w:tc", NS)
     if len(tcs) < 2:
         return False
-    tc2 = tcs[1]
-    if tc2.find(".//w:ins", NS) is not None or tc2.find(".//w:del", NS) is not None:
+    tc_diff = tcs[0] if len(tcs) == 2 else tcs[1]
+    if docx_xml_utils.cell_has_substantive_revisions(tc_diff):
         return True
     active_hls = {up_color, rv_color, "cyan", "blue", "darkCyan"}
-    for hl in tc2.findall(".//w:rPr/w:highlight", NS):
+    for hl in tc_diff.findall(".//w:rPr/w:highlight", NS):
         if hl.attrib.get(f"{W}val") in active_hls:
             return True
     return False

@@ -3140,11 +3140,16 @@ def extract_ops_inline_styles(
 
 def split_into_bg_regions_with_offsets(src_text: str, inp_text: str, inp_char_fills: list):
     """
-    Align old library English (`src_text`) with new input English (`inp_text`)
+    Align old library text (`src_text`) with new input text (`inp_text`)
     and return `[(fill_hex_or_None, s_c1, s_c2, t_c1, t_c2), ...]`.
+    Supports both space-delimited English and non-space CJK text.
     """
-    inp_matches = list(re.finditer(r"\S+", inp_text))
-    src_matches = list(re.finditer(r"\S+", src_text))
+    if re.search(r"[\u3400-\u4dbf\u4e00-\u9fff]", inp_text) or re.search(r"[\u3400-\u4dbf\u4e00-\u9fff]", src_text):
+        tok_pat = re.compile(r"[\u3400-\u4dbf\u4e00-\u9fff]|[A-Za-z0-9]+|[^\s\u3400-\u4dbf\u4e00-\u9fff]")
+    else:
+        tok_pat = re.compile(r"\S+")
+    inp_matches = list(tok_pat.finditer(inp_text))
+    src_matches = list(tok_pat.finditer(src_text))
     inp_words = [m.group() for m in inp_matches]
     src_words = [m.group() for m in src_matches]
     inp_w_fills = [inp_char_fills[m.start()] for m in inp_matches]
@@ -3236,6 +3241,19 @@ def is_word_token(tok: str) -> bool:
 
 
 PRON_TAG_RE = re.compile(r"^(you|your|yours)(?:\((s|pl)\))?$", re.IGNORECASE)
+_PURE_PRON_NUM_TAG_RE = re.compile(r"^\((?:s|pl)\)$", re.IGNORECASE)
+
+
+def is_pure_pronoun_tag_op(kind: str, txt: str) -> bool:
+    """
+    Return True when `(kind, txt)` is a pure `(s)` / `(pl)` number-annotation insertion or deletion
+    on an unchanged pronoun stem (`you` -> `you(pl)`, `your` -> `your(s)`, etc.).
+    Such revisions MUST be preserved as Word track changes (`<w:ins>`/`<w:del>`) without being
+    accepted or rejected, while NOT triggering yellow/cyan highlights or word counts on their own.
+    (Note: `you(s)` -> `you(pl)` produces `('del', 'you(s)'), ('ins', 'you(pl)')`, which returns False
+    so actual singular<->plural changes ARE highlighted yellow and counted!)
+    """
+    return kind in ("ins", "del") and bool(_PURE_PRON_NUM_TAG_RE.fullmatch((txt or "").strip()))
 
 
 def is_non_revision_pronoun_pair(old_tok: str, new_tok: str) -> bool:
@@ -3253,10 +3271,229 @@ def is_non_revision_pronoun_pair(old_tok: str, new_tok: str) -> bool:
     return stem1 == stem2 and ((tag1 == "") != (tag2 == ""))
 
 
+def _emit_pronoun_tag_diff_ops(old_tok: str, new_tok: str) -> list:
+    """
+    Emit track-change ops preserving pure `(s)` / `(pl)` additions or removals on `you`/`your`/`yours`
+    (never auto-accepting or auto-rejecting them!).
+    """
+    if len(new_tok) > len(old_tok) and new_tok.startswith(old_tok):
+        return [("eq", old_tok), ("ins", new_tok[len(old_tok) :])]
+    if len(old_tok) > len(new_tok) and old_tok.startswith(new_tok):
+        return [("eq", new_tok), ("del", old_tok[len(new_tok) :])]
+    return [("del", old_tok), ("ins", new_tok)]
+
+
+def cell_has_substantive_revisions(tc: ET.Element) -> bool:
+    """
+    Return True if `tc` contains any `<w:del>` or `<w:ins>` track change OTHER than a pure
+    `(s)` / `(pl)` pronoun number tag (`you` -> `you<w:ins>(pl)</w:ins>`).
+    Note: `you(s)` -> `you(pl)` has `<w:del>you(s)</w:del><w:ins>you(pl)</w:ins>` (or `<w:del>(s)</w:del><w:ins>(pl)</w:ins>`),
+    so if BOTH `<w:del>` and `<w:ins>` pure tags are immediately adjacent inside a paragraph (singular <-> plural swap),
+    that IS a substantive revision!
+    """
+    if tc is None:
+        return False
+    for p in tc.findall(f".//{W}p"):
+        prev_was_pure_tag_kind = None
+        for ch in p:
+            loc = _local_name(ch.tag)
+            if loc == "ins":
+                txt = "".join(t.text or "" for t in ch.findall(f".//{W}t"))
+                if not txt.strip():
+                    continue
+                if not is_pure_pronoun_tag_op("ins", txt):
+                    return True
+                if prev_was_pure_tag_kind == "del":
+                    return True
+                prev_was_pure_tag_kind = "ins"
+            elif loc == "del":
+                txt = "".join(t.text or "" for t in ch.findall(f".//{W}delText"))
+                if not txt.strip():
+                    continue
+                if not is_pure_pronoun_tag_op("del", txt):
+                    return True
+                if prev_was_pure_tag_kind == "ins":
+                    return True
+                prev_was_pure_tag_kind = "del"
+            elif loc == "r":
+                rtxt = "".join(t.text or "" for t in ch.findall(f"{W}t"))
+                if rtxt:
+                    prev_was_pure_tag_kind = None
+    return False
+
+
+def extract_preexisting_pronoun_tag_spans(tc: ET.Element) -> list:
+    """
+    Walk `tc` in exact `extract_char_shading` visible character order (skipping `<w:del>`)
+    and return `[(char_start, char_end), ...]` for any pre-existing `<w:ins>` pure `(s)` / `(pl)`
+    pronoun tag (including `<w:del>you</w:del><w:ins>you(pl)</w:ins>` where only `(pl)` was added).
+    """
+    if tc is None:
+        return []
+    spans = []
+    pos = 0
+    paras = tc.findall(f"{W}p")
+    for p_i, p in enumerate(paras):
+        if p_i > 0:
+            pos += 1  # '\n'
+        prev_del_txt = ""
+        for ch in p:
+            loc = _local_name(ch.tag)
+            if loc == "del":
+                prev_del_txt = "".join(t.text or "" for t in ch.findall(f".//{W}delText")).strip()
+                continue
+            if loc == "ins":
+                ins_txt = "".join(t.text or "" for t in ch.findall(f".//{W}t"))
+                if ins_txt:
+                    s_trim = ins_txt.strip()
+                    if _PURE_PRON_NUM_TAG_RE.fullmatch(s_trim):
+                        lead = len(ins_txt) - len(ins_txt.lstrip())
+                        spans.append((pos + lead, pos + lead + len(s_trim)))
+                    elif prev_del_txt and is_non_revision_pronoun_pair(prev_del_txt, s_trim) and len(s_trim) > len(prev_del_txt):
+                        lead = len(ins_txt) - len(ins_txt.lstrip())
+                        tag_off = lead + len(prev_del_txt)
+                        spans.append((pos + tag_off, pos + lead + len(s_trim)))
+                    pos += len(ins_txt)
+                prev_del_txt = ""
+            else:
+                r_txt = "".join(t.text or "" for t in ch.findall(f".//{W}t")) if loc != "pPr" else ""
+                if loc == "r":
+                    r_txt = "".join(t.text or "" for t in ch.findall(f"{W}t"))
+                pos += len(r_txt)
+                if r_txt:
+                    prev_del_txt = ""
+    return spans
+
+
+def inject_preexisting_pronoun_tag_ops(ops: list, seg_tag_spans: list) -> list:
+    """
+    Preserve pre-existing `<w:ins>(s)</w:ins>` / `<w:ins>(pl)</w:ins>` revisions from the input cell
+    even when the matched library text already contained `you(s)` / `you(pl)` (which `diff_tokens`
+    would otherwise emit as `('eq', 'you(pl)')`).
+    """
+    if not ops or not seg_tag_spans:
+        return ops
+    span_set = {(int(a), int(b)) for a, b in seg_tag_spans if b > a}
+    if not span_set:
+        return ops
+
+    out = []
+    inp_pos = 0
+    for kind, txt in ops:
+        if kind == "del":
+            out.append((kind, txt))
+            continue
+        t_len = len(txt)
+        op_s = inp_pos
+        op_e = inp_pos + t_len
+        inp_pos = op_e
+        if kind != "eq" or not txt:
+            out.append((kind, txt))
+            continue
+        hits = sorted((a, b) for (a, b) in span_set if op_s <= a < b <= op_e)
+        if not hits:
+            out.append((kind, txt))
+            continue
+        cur = op_s
+        for a, b in hits:
+            if a > cur:
+                out.append(("eq", txt[cur - op_s : a - op_s]))
+            tag_piece = txt[a - op_s : b - op_s]
+            if _PURE_PRON_NUM_TAG_RE.fullmatch(tag_piece):
+                out.append(("ins", tag_piece))
+            else:
+                out.append(("eq", tag_piece))
+            cur = b
+        if cur < op_e:
+            out.append(("eq", txt[cur - op_s :]))
+    return out
+
+
+def _coalesce_whitespace_separated_edits(raw_ops: list) -> list:
+    """
+    Merge adjacent word/phrase track-change edits that are separated ONLY by horizontal whitespace
+    into a single clean `('del', old_phrase) + ('ins', new_phrase)` pair (e.g.
+    `[-Once-][+When+] [-people-][+man+] [-have-][+has+] real` -> `[-Once people have -][+When man has +]real`),
+    preserving 100% exact `old_text` (on reject) and `new_text` (on accept) while eliminating word-by-word
+    alternating clutter for human reviewers. Pure `(s)`/`(pl)` tag ops stay anchored to their pronoun stem.
+    """
+    if not raw_ops:
+        return []
+
+    def _is_mergeable_edit(op: tuple) -> bool:
+        k, t = op
+        return k in ("del", "ins") and not is_pure_pronoun_tag_op(k, t)
+
+    def _is_horiz_ws_eq(op: tuple) -> bool:
+        k, t = op
+        return k == "eq" and bool(t) and t.isspace() and ("\n" not in t)
+
+    out: list = []
+    n = len(raw_ops)
+    i = 0
+    while i < n:
+        if not _is_mergeable_edit(raw_ops[i]):
+            out.append(raw_ops[i])
+            i += 1
+            continue
+
+        start = i
+        end = i
+        while True:
+            while end + 1 < n and _is_mergeable_edit(raw_ops[end + 1]):
+                end += 1
+            # Look ahead across pure horizontal whitespace to another mergeable edit
+            if (
+                end + 2 < n
+                and _is_horiz_ws_eq(raw_ops[end + 1])
+                and _is_mergeable_edit(raw_ops[end + 2])
+            ):
+                # Do not merge across sentence-ending punctuation inside the preceding edit
+                prev_new = "".join(t for k, t in raw_ops[start : end + 1] if k in ("eq", "ins")).rstrip()
+                if prev_new and prev_new[-1] in (".", "?", "!"):
+                    break
+                end = end + 2
+                continue
+            break
+
+        old_chunk = "".join(t for k, t in raw_ops[start : end + 1] if k in ("eq", "del"))
+        new_chunk = "".join(t for k, t in raw_ops[start : end + 1] if k in ("eq", "ins"))
+
+        # Ensure clean visual spacing between deleted phrase and inserted phrase in Word All-Markup view
+        # without ever changing accepted (`new_text`) or rejected (`old_text`) strings!
+        if old_chunk and new_chunk and not old_chunk[-1].isspace() and not new_chunk[-1].isspace():
+            if end + 1 < n and _is_horiz_ws_eq(raw_ops[end + 1]):
+                ws_after = raw_ops[end + 1][1]
+                old_chunk += ws_after
+                new_chunk += ws_after
+                end += 1
+            elif (
+                out
+                and _is_horiz_ws_eq(out[-1])
+                and not old_chunk[0].isspace()
+                and not new_chunk[0].isspace()
+            ):
+                ws_before = out.pop()[1]
+                old_chunk = ws_before + old_chunk
+                new_chunk = ws_before + new_chunk
+
+        if old_chunk:
+            out.append(("del", old_chunk))
+        if new_chunk:
+            out.append(("ins", new_chunk))
+        i = end + 1
+
+    return out
+
+
 def diff_tokens(old_text: str, new_text: str) -> list:
     """
-    Produce fine-grained diff operations [('eq'|'del'|'ins', text), ...]
-    auto-accepting pure (s)/(pl) tag additions/removals on you/your/yours into 'eq'.
+    Produce phrase-coalesced diff operations `[('eq'|'del'|'ins', text), ...]`:
+      - Retains pure `(s)`/`(pl)` tag additions/removals on `you`/`your`/`yours` as track changes
+        (`('eq', 'you'), ('ins', '(pl)')`) without accepting or rejecting them;
+      - Treats `you(s)` <-> `you(pl)` number changes as full substantive word edits;
+      - Coalesces consecutive whitespace-separated word replacements into clean phrase-level
+        `('del', old_phrase), ('ins', new_phrase)` blocks.
     """
     a = tokenize_en_fine(old_text)
     b = tokenize_en_fine(new_text)
@@ -3271,32 +3508,32 @@ def diff_tokens(old_text: str, new_text: str) -> list:
         elif tag == "insert":
             ops.append(("ins", "".join(b[j1:j2])))
         elif tag == "replace":
-            # Peel leading non-revision pronoun pairs (e.g. 'you' <-> 'you(pl)') directly as accepted 'eq'
+            # Peel leading pure-(s)/(pl) pronoun pairs as preserved tag revisions (`you` + `<w:ins>(pl)</w:ins>`)
             while i1 < i2 and j1 < j2 and is_non_revision_pronoun_pair(a[i1], b[j1]):
-                ops.append(("eq", b[j1]))
+                ops.extend(_emit_pronoun_tag_diff_ops(a[i1], b[j1]))
                 i1 += 1
                 j1 += 1
                 if i1 < i2 and j1 < j2 and a[i1] == b[j1] and a[i1].isspace():
                     ops.append(("eq", b[j1]))
                     i1 += 1
                     j1 += 1
-            # Peel trailing non-revision pronoun pairs
-            trailing_eq = []
+            # Peel trailing pure-(s)/(pl) pronoun pairs
+            trailing_chunks = []
             while i1 < i2 and j1 < j2 and is_non_revision_pronoun_pair(a[i2 - 1], b[j2 - 1]):
-                trailing_eq.append(("eq", b[j2 - 1]))
+                trailing_chunks.append(_emit_pronoun_tag_diff_ops(a[i2 - 1], b[j2 - 1]))
                 i2 -= 1
                 j2 -= 1
                 if i1 < i2 and j1 < j2 and a[i2 - 1] == b[j2 - 1] and a[i2 - 1].isspace():
-                    trailing_eq.append(("eq", b[j2 - 1]))
+                    trailing_chunks.append([("eq", b[j2 - 1])])
                     i2 -= 1
                     j2 -= 1
             if i1 < i2:
                 ops.append(("del", "".join(a[i1:i2])))
             if j1 < j2:
                 ops.append(("ins", "".join(b[j1:j2])))
-            for eq_op in reversed(trailing_eq):
-                ops.append(eq_op)
-    return ops
+            for ch_ops in reversed(trailing_chunks):
+                ops.extend(ch_ops)
+    return _coalesce_whitespace_separated_edits(ops)
 
 
 SENT_END_CHARS = {".", "?", "!"}
@@ -3393,31 +3630,61 @@ def _extract_content_word_set(s: str) -> set:
 
 
 def sentence_unit_stats(sent_ops: list) -> dict:
-    has_edit = any(k in ("del", "ins") and not t.isspace() for k, t in sent_ops)
+    has_edit = any(
+        k in ("del", "ins") and not t.isspace() and not is_pure_pronoun_tag_op(k, t)
+        for k, t in sent_ops
+    )
+    has_pronoun_tag_only = (not has_edit) and any(is_pure_pronoun_tag_op(k, t) for k, t in sent_ops)
     old_txt = "".join(t for k, t in sent_ops if k in ("eq", "del"))
     new_txt = "".join(t for k, t in sent_ops if k in ("eq", "ins"))
     preview = "".join(
         t if k == "eq" else (f"{{-{t}-}}" if k == "del" else f"{{+{t}+}}")
         for k, t in sent_ops
     )
-    eq_words = sum(len(re.findall(r"[A-Za-z0-9’']+", t)) for k, t in sent_ops if k == "eq")
-    del_words = sum(len(re.findall(r"[A-Za-z0-9’']+", t)) for k, t in sent_ops if k == "del")
-    ins_words = sum(len(re.findall(r"[A-Za-z0-9’']+", t)) for k, t in sent_ops if k == "ins")
+    eq_words = sum(count_msword_en_words(t) for k, t in sent_ops if k == "eq")
+    del_words = sum(
+        count_msword_en_words(t)
+        for k, t in sent_ops
+        if k == "del" and not is_pure_pronoun_tag_op(k, t)
+    )
+    ins_words = sum(
+        count_msword_en_words(t)
+        for k, t in sent_ops
+        if k == "ins" and not is_pure_pronoun_tag_op(k, t)
+    )
     total_new_words = max(1, eq_words + ins_words)
     change_ratio = round(max(del_words, ins_words) / total_new_words, 3)
-    edit_hunks = sum(1 for idx, (k, _) in enumerate(sent_ops) if k in ("del", "ins") and (idx == 0 or sent_ops[idx - 1][0] == "eq"))
 
-    # Compute max consecutive unchanged ('eq') words (unbroken by any non-space edit)
+    # Count coalesced substantive edit hunks (consecutive del/ins count as 1 hunk)
+    edit_hunks = 0
+    in_hunk = False
+    for k, t in sent_ops:
+        if k in ("del", "ins") and not t.isspace() and not is_pure_pronoun_tag_op(k, t):
+            if not in_hunk:
+                edit_hunks += 1
+                in_hunk = True
+        elif k == "eq" and not t.isspace():
+            in_hunk = False
+
+    # Compute max consecutive unchanged ('eq') words + leading/trailing unchanged words for line-spacing rules
     max_consec_eq_words = 0
     cur_consec_eq = 0
+    leading_eq_words = 0
+    seen_substantive_edit = False
+    trailing_eq_words = 0
     for k, t in sent_ops:
         if k == "eq":
-            w_cnt = len(re.findall(r"[A-Za-z0-9’']+", t))
+            w_cnt = count_msword_en_words(t)
             cur_consec_eq += w_cnt
             if cur_consec_eq > max_consec_eq_words:
                 max_consec_eq_words = cur_consec_eq
-        elif not t.isspace():
+            if not seen_substantive_edit:
+                leading_eq_words += w_cnt
+            trailing_eq_words += w_cnt
+        elif not t.isspace() and not is_pure_pronoun_tag_op(k, t):
+            seen_substantive_edit = True
             cur_consec_eq = 0
+            trailing_eq_words = 0
 
     old_cw = _extract_content_word_set(old_txt)
     new_cw = _extract_content_word_set(new_txt)
@@ -3425,6 +3692,7 @@ def sentence_unit_stats(sent_ops: list) -> dict:
 
     return {
         "has_edit": has_edit,
+        "has_pronoun_tag_only": has_pronoun_tag_only,
         "old_text": old_txt.strip(),
         "new_text": new_txt.strip(),
         "diff_preview": preview.strip(),
@@ -3434,6 +3702,8 @@ def sentence_unit_stats(sent_ops: list) -> dict:
         "ins_words": ins_words,
         "shared_content_words": shared_content_words,
         "max_consec_eq_words": max_consec_eq_words,
+        "leading_eq_words": leading_eq_words,
+        "trailing_eq_words": trailing_eq_words,
         "change_ratio": change_ratio,
         "edit_hunks": edit_hunks,
     }
@@ -3441,34 +3711,128 @@ def sentence_unit_stats(sent_ops: list) -> dict:
 
 def is_strict_rv_sentence(stats: dict) -> bool:
     """
-    Sentence Cyan (`RV`) Criterion:
-      1. Short/general total rewrite: `(shared_cw <= 3 or eq_w <= 3) and ratio >= 0.70 and max_consec < 5`
-      2. Medium/long shattered rewrite (`new_w >= 8` or `del_w >= 8`):
-         - `ratio >= 0.62 and max_consec <= 5` (>= 62% words changed and no intact >= 6-word clause), OR
-         - `ratio >= 0.55 and hunks >= 5 and max_consec <= 4` (shattered into >= 5 hunks, max 4 consecutive unchanged words), OR
-         - `ratio >= 0.72 and (eq_w / max(1, new_w)) <= 0.32 and max_consec <= 6`.
-      Preserves `"yellow"` (`UP`) whenever an intact >= 6-word half-sentence remains and change ratio is moderate.
+    Sentence Cyan (`RV` 整句重翻) Criterion (strictly full-sentence bounded, never starting at `,` or `;`):
+      1. Short/total rewrite: `(shared_cw <= 3 or eq_w <= 3) and ratio >= 0.60 and max_consec < 6`
+      2. Substantial syntactic/structural rewrite: `ratio >= 0.36 and changed_w >= 6 and (hunks >= 2 or new_w >= 14)`
+      3. Long multi-line sentence rewrite (> 4–5 table lines, `new_w >= 42`):
+         - `(changed_w >= 12 and hunks >= 5)` OR `(changed_w >= 15 and ratio >= 0.25)` OR `(hunks >= 6 and ratio >= 0.22)`
+      4. Medium-sentence multi-hunk fragmentation (`new_w >= 18`):
+         - `hunks >= 5 and changed_w >= 8 and ratio >= 0.25`
+      Preserves `"yellow"` (`UP`) on localized lexical/phrase edits (e.g. `1–3` hunks with low `changed_w` / `ratio < 0.22`).
     """
     if not stats.get("has_edit"):
         return False
     eq_w = int(stats.get("eq_words", 0))
     new_w = max(1, int(stats.get("new_words", eq_w)))
     del_w = int(stats.get("del_words", 0))
+    ins_w = int(stats.get("ins_words", 0))
+    changed_w = max(del_w, ins_w)
     hunks = int(stats.get("edit_hunks", 1))
     shared_cw = int(stats.get("shared_content_words", eq_w))
     max_consec = int(stats.get("max_consec_eq_words", eq_w))
     ratio = float(stats.get("change_ratio", 0.0))
 
-    if (shared_cw <= 3 or eq_w <= 3) and ratio >= 0.70 and max_consec < 5:
+    if (shared_cw <= 3 or eq_w <= 3) and ratio >= 0.60 and max_consec < 6:
         return True
-    if max(new_w, eq_w + del_w) >= 8:
-        if ratio >= 0.62 and max_consec <= 5:
+    if ratio >= 0.36 and changed_w >= 6 and (hunks >= 2 or new_w >= 14):
+        return True
+    if new_w >= 42:
+        if (changed_w >= 12 and hunks >= 4) or (changed_w >= 15 and ratio >= 0.25) or (hunks >= 5 and ratio >= 0.22):
             return True
-        if ratio >= 0.55 and hunks >= 5 and max_consec <= 4:
-            return True
-        if ratio >= 0.72 and (eq_w / new_w) <= 0.32 and max_consec <= 6:
-            return True
+    if new_w >= 18 and hunks >= 5 and changed_w >= 8 and ratio >= 0.25:
+        return True
     return False
+
+
+def promote_dense_sentence_runs_to_cyan(sents: list, actions: list = None) -> list:
+    """
+    Contiguous Multi-Sentence Block Cyan (`RV`) Promotion (Line-Spacing & Density Rules 1–3):
+      - Rule 1 (Distant small edits >= 5–6 lines apart, ~45+ unchanged words): NEVER merge across >= 45 unchanged words,
+        and NEVER absorb trivial 1–2 word connector tweaks (`changed_w <= 2 and ratio < 0.10`, e.g. `+and`).
+      - Rule 3 (Frequent close-together edits separated by <= 1–3 lines inside a paragraph):
+        Promote a contiguous run `S[a .. b]` (`>= 2` full sentences) to `"cyan"` when:
+          * At least one sentence in `S[a .. b]` is already `"cyan"` AND neighboring sentences in the run have
+            substantial edits (`changed_w >= 4` or `ratio >= 0.14`) with inter-edit gap `<= 35` words (or are sandwiched
+            between two `"cyan"` sentences), OR
+          * `len(run) >= 3`, total `changed_w >= 24`, total `hunks >= 8`, and run change ratio `>= 0.22`.
+    """
+    n = len(sents or ())
+    if n == 0:
+        return []
+    out_actions = (
+        list(actions)
+        if (actions is not None and len(actions) == n)
+        else [s.get("suggested_action", "yellow" if s.get("has_edit") else "none") for s in sents]
+    )
+    if n < 2:
+        return out_actions
+
+    def _sent_changed_w(s: dict) -> int:
+        return max(int(s.get("del_words", 0)), int(s.get("ins_words", 0)))
+
+    def _is_run_eligible(idx: int) -> bool:
+        s = sents[idx]
+        if not s.get("has_edit") or out_actions[idx] == "none":
+            return False
+        cw = _sent_changed_w(s)
+        ratio = float(s.get("change_ratio", 0.0))
+        # Trivial 1-2 word tweak (e.g. `+and` in Case 2 S[03]) breaks Cyan runs and stays Yellow!
+        if out_actions[idx] != "cyan" and cw <= 2 and ratio < 0.10:
+            return False
+        return True
+
+    def _inter_edit_gap(i_prev: int, i_cur: int) -> int:
+        sp = sents[i_prev]
+        sc = sents[i_cur]
+        return int(sp.get("trailing_eq_words", 0)) + int(sc.get("leading_eq_words", 0))
+
+    i = 0
+    while i < n:
+        if not _is_run_eligible(i):
+            i += 1
+            continue
+        j = i
+        while j + 1 < n and _is_run_eligible(j + 1) and _inter_edit_gap(j, j + 1) < 45:
+            j += 1
+
+        if j > i:
+            run_idxs = list(range(i, j + 1))
+            has_cyan = any(out_actions[k] == "cyan" for k in run_idxs)
+            run_cw = sum(_sent_changed_w(sents[k]) for k in run_idxs)
+            run_new_w = max(1, sum(int(sents[k].get("new_words", 1)) for k in run_idxs))
+            run_hunks = sum(int(sents[k].get("edit_hunks", 1)) for k in run_idxs)
+
+            if not has_cyan and len(run_idxs) >= 3 and run_cw >= 24 and run_hunks >= 8 and (run_cw / run_new_w) >= 0.22:
+                for k in run_idxs:
+                    out_actions[k] = "cyan"
+            elif has_cyan:
+                # Iteratively absorb adjacent substantial sentences (and bridge 1-2 substantial sentences sandwiched between cyan sentences)
+                changed = True
+                while changed:
+                    changed = False
+                    for pos_r, k in enumerate(run_idxs):
+                        if out_actions[k] == "cyan":
+                            continue
+                        cw_k = _sent_changed_w(sents[k])
+                        rat_k = float(sents[k].get("change_ratio", 0.0))
+                        if cw_k < 4 and rat_k < 0.14:
+                            continue
+                        left_cyan = pos_r > 0 and out_actions[run_idxs[pos_r - 1]] == "cyan"
+                        right_cyan = pos_r + 1 < len(run_idxs) and out_actions[run_idxs[pos_r + 1]] == "cyan"
+                        any_left_cyan = any(out_actions[run_idxs[p]] == "cyan" for p in range(0, pos_r))
+                        any_right_cyan = any(out_actions[run_idxs[p]] == "cyan" for p in range(pos_r + 1, len(run_idxs)))
+                        if any_left_cyan and any_right_cyan:
+                            out_actions[k] = "cyan"
+                            changed = True
+                        elif left_cyan and _inter_edit_gap(run_idxs[pos_r - 1], k) <= 35:
+                            out_actions[k] = "cyan"
+                            changed = True
+                        elif right_cyan and _inter_edit_gap(k, run_idxs[pos_r + 1]) <= 35:
+                            out_actions[k] = "cyan"
+                            changed = True
+        i = j + 1
+
+    return out_actions
 
 
 def _extract_words_lower(s: str) -> list:
@@ -3498,26 +3862,33 @@ def compute_precision_yellow(ops: list, max_gap_words: int = 3) -> list:
 
     hl = [False] * n
 
-    # Step A: Identify raw edit clusters
+    # Step A: Identify raw substantive edit clusters (ignoring standalone pure `(s)`/`(pl)` tag ops!)
+    def _is_substantive_op(idx_op: int) -> bool:
+        ko, to = ops[idx_op]
+        return ko in ("del", "ins") and not to.isspace() and not is_pure_pronoun_tag_op(ko, to)
+
     raw_clusters = []
     i = 0
     while i < n:
-        if ops[i][0] in ("del", "ins") and not ops[i][1].isspace():
+        if _is_substantive_op(i):
             start = i
             end = i
             while True:
                 if ops[end][1].strip() in (":", ";"):
                     break
                 j = end + 1
-                while j < n and ops[j][0] == "eq" and ops[j][1].isspace():
+                while j < n and (
+                    (ops[j][0] == "eq" and ops[j][1].isspace())
+                    or is_pure_pronoun_tag_op(ops[j][0], ops[j][1])
+                ):
                     j += 1
                 if (
                     j < n and ops[j][0] == "eq" and ops[j][1] == ","
-                    and j + 1 < n and ops[j + 1][0] in ("del", "ins")
+                    and j + 1 < n and _is_substantive_op(j + 1)
                 ):
                     end = j + 1
                     continue
-                if j < n and ops[j][0] in ("del", "ins") and not ops[j][1].isspace():
+                if j < n and _is_substantive_op(j):
                     end = j
                     continue
                 if (
@@ -3525,7 +3896,7 @@ def compute_precision_yellow(ops: list, max_gap_words: int = 3) -> list:
                     and end + 2 < n
                     and ops[end + 1][0] == "eq"
                     and is_word_token(ops[end + 1][1])
-                    and ops[end + 2][0] in ("del", "ins")
+                    and _is_substantive_op(end + 2)
                     and ops[end + 2][1].strip() in ("”", '"', "’", "'")
                 ):
                     end = end + 2
@@ -3891,103 +4262,80 @@ def compute_precision_yellow(ops: list, max_gap_words: int = 3) -> list:
 
 def should_promote_region_to_cyan(sents: list, actions: list = None, max_gap_words: int = 3) -> bool:
     """
-    Item 8.4 Whole-Paragraph Cyan (`RV`) Promotion When Entire Paragraph Is Genuinely Rewritten ("花掉"):
-    Prevents false-positive promotion on long paragraphs with scattered small word tweaks (where < 42% of
-    actual words changed), while promoting paragraphs whose true word-level change ratio is >= 42% (or
-    whose sentences are already >= 60% cyan by word count) and edited sentences cover >= 75% of the region.
+    Item 8.4 Whole-Paragraph Cyan (`RV`) Promotion When Entire Paragraph Is Densely Rewritten ("花掉"):
+      - Supports both multi-sentence paragraphs AND single semicolon-chained long paragraphs (`total_sents >= 1`);
+      - Computes per-op word counts accurately without glueing adjacent ops;
+      - Promotes whole paragraph when edited sentences cover >= 75% of paragraph words (and <= 2 unedited sentences)
+        AND either `cyan_word_share >= 0.55` or `(raw_word_change_ratio >= 0.25 and reg_changed_w >= 20 and edit_clusters >= 6)`.
+      - Never promotes long paragraphs with isolated light tweaks!
     """
     total_sents = len(sents or ())
-    if total_sents < 3:
+    if total_sents < 1:
         return False
 
-    eff_actions = (
-        list(actions)
-        if (actions is not None and len(actions) == total_sents)
-        else [s.get("suggested_action", "yellow" if s.get("has_edit") else "none") for s in sents]
-    )
+    eff_actions = promote_dense_sentence_runs_to_cyan(sents, actions)
+
+    if total_sents == 1:
+        return eff_actions[0] == "cyan"
 
     unedited_cnt = sum(1 for idx, s in enumerate(sents) if not s.get("has_edit") or eff_actions[idx] == "none")
-    edited_cnt = total_sents - unedited_cnt
-    if (edited_cnt / total_sents) < 0.75:
+    if unedited_cnt > 2 or ((total_sents - unedited_cnt) / total_sents) < 0.75:
         return False
+
+    # Never swallow a >= 2-line (>= 20-word) sentence that is unedited or only has a trivial 1-2 word tweak (e.g. Case 2 S[03] `+and`)!
+    for idx_chk, s_chk in enumerate(sents):
+        if eff_actions[idx_chk] != "cyan" and int(s_chk.get("new_words", 0)) >= 20:
+            cw_chk = max(int(s_chk.get("del_words", 0)), int(s_chk.get("ins_words", 0)))
+            if not s_chk.get("has_edit") or (cw_chk <= 2 and float(s_chk.get("change_ratio", 0.0)) < 0.10):
+                return False
 
     combined_ops = []
-    for s in sents:
-        combined_ops.extend(s.get("ops") or [])
-
-    reg_eq_w = count_msword_en_words("".join(t for k, t in combined_ops if k == "eq"))
-    reg_del_w = count_msword_en_words("".join(t for k, t in combined_ops if k == "del"))
-    reg_ins_w = count_msword_en_words("".join(t for k, t in combined_ops if k == "ins"))
-    reg_new_w = max(1, reg_eq_w + reg_ins_w)
-    raw_word_change_ratio = max(reg_del_w, reg_ins_w) / reg_new_w
-
+    edited_sent_words = 0
     cyan_sent_words = 0
     for idx_c, s in enumerate(sents):
+        s_ops = s.get("ops") or []
+        combined_ops.extend(s_ops)
+        w_s = _count_ops_words(s_ops)
+        if s.get("has_edit") and eff_actions[idx_c] != "none":
+            edited_sent_words += w_s
         if eff_actions[idx_c] == "cyan":
-            cyan_sent_words += _count_ops_words(s.get("ops") or [])
-    cyan_word_share = cyan_sent_words / reg_new_w
+            cyan_sent_words += w_s
 
-    # Hard guard: NEVER promote a paragraph with light/local word tweaks (< 42% words changed)
-    if raw_word_change_ratio < 0.42 and cyan_word_share < 0.60:
+    reg_eq_w = sum(count_msword_en_words(t) for k, t in combined_ops if k == "eq")
+    reg_del_w = sum(
+        count_msword_en_words(t) for k, t in combined_ops if k == "del" and not is_pure_pronoun_tag_op(k, t)
+    )
+    reg_ins_w = sum(
+        count_msword_en_words(t) for k, t in combined_ops if k == "ins" and not is_pure_pronoun_tag_op(k, t)
+    )
+    reg_new_w = max(1, reg_eq_w + reg_ins_w)
+    reg_changed_w = max(reg_del_w, reg_ins_w)
+    raw_word_change_ratio = reg_changed_w / reg_new_w
+    cyan_word_share = cyan_sent_words / reg_new_w
+    edited_word_share = edited_sent_words / reg_new_w
+
+    if edited_word_share < 0.75 or reg_changed_w < 12:
         return False
 
+    if cyan_word_share >= 0.55 and unedited_cnt <= 1:
+        return True
     if cyan_word_share >= 0.65 and unedited_cnt <= 2:
         return True
 
-    # Count separate edit clusters across combined_ops
     edit_clusters = 0
     in_cl = False
     for k, t in combined_ops:
-        if k in ("del", "ins") and not t.isspace():
+        if k in ("del", "ins") and not t.isspace() and not is_pure_pronoun_tag_op(k, t):
             if not in_cl:
                 edit_clusters += 1
                 in_cl = True
         elif k == "eq" and not t.isspace():
             in_cl = False
 
-    if edit_clusters < 6:
-        return False
-
-    if raw_word_change_ratio >= 0.48:
+    if edit_clusters >= 6 and raw_word_change_ratio >= 0.25 and reg_changed_w >= 20:
         return True
 
-    total_words = 0
-    hl_words = 0
-    idx_s = 0
-    while idx_s < total_sents:
-        if eff_actions[idx_s] == "cyan":
-            c_ops = []
-            while idx_s < total_sents and eff_actions[idx_s] == "cyan":
-                c_ops.extend(sents[idx_s].get("ops") or [])
-                idx_s += 1
-            w_c = _count_ops_words(c_ops)
-            total_words += w_c
-            hl_words += w_c
-        else:
-            nc_ops = []
-            while idx_s < total_sents and eff_actions[idx_s] != "cyan":
-                s_obj = sents[idx_s]
-                act = eff_actions[idx_s]
-                if not s_obj.get("has_edit") or act == "none":
-                    for k, t in (s_obj.get("ops") or ()):
-                        if k != "del":
-                            nc_ops.append(("eq", t))
-                else:
-                    nc_ops.extend(s_obj.get("ops") or [])
-                idx_s += 1
-            total_words += _count_ops_words(nc_ops)
-            toks = compute_precision_yellow(nc_ops, max_gap_words=max_gap_words)
-            y_buf = []
-            for k, t, h in toks:
-                if k in ("eq", "ins"):
-                    if h == "yellow":
-                        y_buf.append(t)
-                    elif y_buf:
-                        y_buf.append(" ")
-            hl_words += count_msword_en_words("".join(y_buf))
-
-    coverage = hl_words / max(1, total_words)
-    return raw_word_change_ratio >= 0.42 and coverage >= 0.68
+    return False
 
 
 def apply_clause_yellow_highlights(sent_ops: list) -> list:
@@ -4057,6 +4405,437 @@ def count_msword_en_words(text: str) -> int:
     return sum(1 for tok in tokens if re.search(r"[A-Za-z0-9]", tok))
 
 
+_CN_UNIT_TOKEN_RE = re.compile(r"[\u3400-\u4dbf\u4e00-\u9fff\uf900-\ufaff]|[A-Za-z0-9]+(?:[’'][A-Za-z0-9]+)*")
+_CN_FINE_TOKEN_RE = re.compile(
+    r"[\u3400-\u4dbf\u4e00-\u9fff\uf900-\ufaff]"
+    r"|[A-Za-z0-9]+(?:[’'][A-Za-z0-9]+)*(?:-[A-Za-z0-9]+)*"
+    r"|\n"
+    r"|[ \t\u3000]+"
+    r"|[^\w\s]"
+)
+CN_SENT_END_CHARS = frozenset({"。", "？", "！", "?", "!"})
+CN_CLAUSE_DELIMS = frozenset({"，", "、", "；", "：", "。", "？", "！", ",", ";", ":", "?", "!", "—", "…"})
+
+
+def count_msword_cn_units(text: str) -> int:
+    """MS Word Chinese character + alphanumeric word count (punctuation and whitespace excluded)."""
+    if not text:
+        return 0
+    return len(_CN_UNIT_TOKEN_RE.findall(text))
+
+
+def diff_cn_tokens(old_text: str, new_text: str) -> list:
+    """
+    Fine-grained Chinese + mixed-alnum diff `[('eq'|'del'|'ins', text), ...]`,
+    coalescing adjacent deletions/insertions into clean phrase-level track changes.
+    """
+    a = _CN_FINE_TOKEN_RE.findall(old_text or "")
+    b = _CN_FINE_TOKEN_RE.findall(new_text or "")
+    sm = difflib.SequenceMatcher(None, a, b, autojunk=False)
+    ops = []
+    for tag, i1, i2, j1, j2 in sm.get_opcodes():
+        if tag == "equal":
+            for tok in a[i1:i2]:
+                ops.append(("eq", tok))
+        elif tag == "delete":
+            ops.append(("del", "".join(a[i1:i2])))
+        elif tag == "insert":
+            ops.append(("ins", "".join(b[j1:j2])))
+        elif tag == "replace":
+            ops.append(("del", "".join(a[i1:i2])))
+            ops.append(("ins", "".join(b[j1:j2])))
+    return ops
+
+
+def segment_cn_diff_into_sentences(ops: list) -> list:
+    """
+    Split Chinese diff ops into full-sentence units bounded ONLY by `。？！?!` (plus closing quotes) or `\\n`.
+    NEVER splits at `，` or `；` or `：` so Cyan (`RV`) always covers complete Chinese sentences!
+    """
+    sentences = []
+    cur = []
+    quote_depth = 0
+    closing_quotes = {"”", "’", "」", "』", "）", ")", '"', "'"}
+    n = len(ops)
+    i = 0
+    while i < n:
+        kind, txt = ops[i]
+        cur.append((kind, txt))
+        if kind != "del":
+            for ch in txt:
+                if ch in ("“", "「", "『"):
+                    quote_depth += 1
+                elif ch in ("”", "」", "』") and quote_depth > 0:
+                    quote_depth -= 1
+
+        split_here = False
+        if kind == "eq" and (txt == "\n" or txt in CN_SENT_END_CHARS):
+            while i + 1 < n and ops[i + 1][0] == "eq" and ops[i + 1][1] in closing_quotes:
+                i += 1
+                cur.append(ops[i])
+                if ops[i][1] in ("”", "」", "』") and quote_depth > 0:
+                    quote_depth -= 1
+            if txt == "\n" or quote_depth == 0:
+                split_here = True
+        elif kind == "del" and i + 1 < n and ops[i + 1][0] == "eq":
+            # Standalone purely-deleted full sentence right after a previous sentence boundary
+            del_trim = txt.rstrip("”’」』）)\"' ")
+            prev_clean = "".join(t for k, t in cur[:-1] if k != "del").strip()
+            if not prev_clean and del_trim and del_trim[-1] in CN_SENT_END_CHARS and quote_depth == 0:
+                split_here = True
+        elif kind == "ins" and len(cur) >= 2 and cur[-2][0] == "del":
+            del_s = cur[-2][1].rstrip("”’」』）)\"' ")
+            ins_s = txt.rstrip("”’」』）)\"' ")
+            if del_s and ins_s and del_s[-1] in CN_SENT_END_CHARS and ins_s[-1] in CN_SENT_END_CHARS and quote_depth == 0:
+                split_here = True
+
+        if split_here:
+            sentences.append(cur)
+            cur = []
+        i += 1
+    if cur:
+        sentences.append(cur)
+    return sentences
+
+
+def cn_sentence_unit_stats(sent_ops: list) -> dict:
+    has_edit = any(k in ("del", "ins") and not t.isspace() for k, t in sent_ops)
+    old_txt = "".join(t for k, t in sent_ops if k in ("eq", "del"))
+    new_txt = "".join(t for k, t in sent_ops if k in ("eq", "ins"))
+    preview = "".join(
+        t if k == "eq" else (f"{{-{t}-}}" if k == "del" else f"{{+{t}+}}")
+        for k, t in sent_ops
+    )
+    eq_u = sum(count_msword_cn_units(t) for k, t in sent_ops if k == "eq")
+    del_u = sum(count_msword_cn_units(t) for k, t in sent_ops if k == "del")
+    ins_u = sum(count_msword_cn_units(t) for k, t in sent_ops if k == "ins")
+    total_new_u = max(1, eq_u + ins_u)
+    change_ratio = round(max(del_u, ins_u) / total_new_u, 3)
+
+    edit_hunks = 0
+    in_hunk = False
+    for k, t in sent_ops:
+        if k in ("del", "ins") and not t.isspace():
+            if not in_hunk:
+                edit_hunks += 1
+                in_hunk = True
+        elif k == "eq" and not t.isspace():
+            in_hunk = False
+
+    max_consec_eq = 0
+    cur_consec = 0
+    leading_eq = 0
+    seen_edit = False
+    trailing_eq = 0
+    for k, t in sent_ops:
+        if k == "eq":
+            u_cnt = count_msword_cn_units(t)
+            cur_consec += u_cnt
+            if cur_consec > max_consec_eq:
+                max_consec_eq = cur_consec
+            if not seen_edit:
+                leading_eq += u_cnt
+            trailing_eq += u_cnt
+        elif not t.isspace():
+            seen_edit = True
+            cur_consec = 0
+            trailing_eq = 0
+
+    return {
+        "is_cn": True,
+        "has_edit": has_edit,
+        "old_text": old_txt.strip(),
+        "new_text": new_txt.strip(),
+        "diff_preview": preview.strip(),
+        "eq_words": eq_u,
+        "new_words": eq_u + ins_u,
+        "del_words": del_u,
+        "ins_words": ins_u,
+        "shared_content_words": eq_u,
+        "max_consec_eq_words": max_consec_eq,
+        "leading_eq_words": leading_eq,
+        "trailing_eq_words": trailing_eq,
+        "change_ratio": change_ratio,
+        "edit_hunks": edit_hunks,
+    }
+
+
+def is_strict_rv_cn_sentence(stats: dict) -> bool:
+    """
+    Chinese Sentence Cyan (`RV` 整句重翻) Criterion (1 line in Col 1 ≈ 20-22 Chinese chars):
+      - Pure standalone sentence deletion (`eq_words == 0 and ins_words == 0`) stays Yellow (`UP`) so translator deletes it!
+      - Rule 2 (> 4-5 lines continuous/heavy rewrite, `new_u >= 78` chars or `ratio >= 0.36` with `>= 10` changed chars): Cyan (`RV`)!
+    """
+    if not stats.get("has_edit"):
+        return False
+    eq_u = int(stats.get("eq_words", 0))
+    ins_u = int(stats.get("ins_words", 0))
+    del_u = int(stats.get("del_words", 0))
+    if eq_u == 0 and ins_u == 0:
+        return False  # Pure deletion -> Yellow UP
+    new_u = max(1, int(stats.get("new_words", eq_u + ins_u)))
+    changed_u = max(del_u, ins_u)
+    hunks = int(stats.get("edit_hunks", 1))
+    max_consec = int(stats.get("max_consec_eq_words", eq_u))
+    ratio = float(stats.get("change_ratio", 0.0))
+
+    if eq_u <= 5 and ins_u >= 6 and ratio >= 0.60 and max_consec < 10:
+        return True
+    if ratio >= 0.36 and changed_u >= 10 and (hunks >= 2 or new_u >= 24):
+        return True
+    if new_u >= 78:
+        if (changed_u >= 20 and hunks >= 4) or (changed_u >= 26 and ratio >= 0.25) or (hunks >= 5 and ratio >= 0.22):
+            return True
+    if new_u >= 32 and hunks >= 5 and changed_u >= 14 and ratio >= 0.25:
+        return True
+    return False
+
+
+def promote_dense_cn_sentence_runs_to_cyan(sents: list, actions: list = None) -> list:
+    """Chinese Rule 1 & Rule 3 contiguous dense multi-sentence Cyan (`RV`) promotion."""
+    n = len(sents or ())
+    if n == 0:
+        return []
+    out_actions = (
+        list(actions)
+        if (actions is not None and len(actions) == n)
+        else [s.get("suggested_action", "yellow" if s.get("has_edit") else "none") for s in sents]
+    )
+    if n < 2:
+        return out_actions
+
+    def _cu(s: dict) -> int:
+        return max(int(s.get("del_words", 0)), int(s.get("ins_words", 0)))
+
+    def _eligible(idx: int) -> bool:
+        s = sents[idx]
+        if not s.get("has_edit") or out_actions[idx] == "none":
+            return False
+        if int(s.get("eq_words", 0)) == 0 and int(s.get("ins_words", 0)) == 0:
+            return False  # pure sentence deletion stays yellow
+        cu = _cu(s)
+        rat = float(s.get("change_ratio", 0.0))
+        if out_actions[idx] != "cyan" and cu <= 4 and rat < 0.10:
+            return False
+        return True
+
+    def _gap(i_prev: int, i_cur: int) -> int:
+        return int(sents[i_prev].get("trailing_eq_words", 0)) + int(sents[i_cur].get("leading_eq_words", 0))
+
+    i = 0
+    while i < n:
+        if not _eligible(i):
+            i += 1
+            continue
+        j = i
+        while j + 1 < n and _eligible(j + 1) and _gap(j, j + 1) < 85:
+            j += 1
+        if j > i:
+            run_idxs = list(range(i, j + 1))
+            has_cyan = any(out_actions[k] == "cyan" for k in run_idxs)
+            run_cu = sum(_cu(sents[k]) for k in run_idxs)
+            run_new = max(1, sum(int(sents[k].get("new_words", 1)) for k in run_idxs))
+            run_hunks = sum(int(sents[k].get("edit_hunks", 1)) for k in run_idxs)
+            if not has_cyan and len(run_idxs) >= 3 and run_cu >= 42 and run_hunks >= 8 and (run_cu / run_new) >= 0.22:
+                for k in run_idxs:
+                    out_actions[k] = "cyan"
+            elif has_cyan:
+                changed = True
+                while changed:
+                    changed = False
+                    for pos_r, k in enumerate(run_idxs):
+                        if out_actions[k] == "cyan":
+                            continue
+                        cu_k = _cu(sents[k])
+                        rat_k = float(sents[k].get("change_ratio", 0.0))
+                        if cu_k < 7 and rat_k < 0.14:
+                            continue
+                        left_cyan = pos_r > 0 and out_actions[run_idxs[pos_r - 1]] == "cyan"
+                        right_cyan = pos_r + 1 < len(run_idxs) and out_actions[run_idxs[pos_r + 1]] == "cyan"
+                        any_l = any(out_actions[run_idxs[p]] == "cyan" for p in range(0, pos_r))
+                        any_r = any(out_actions[run_idxs[p]] == "cyan" for p in range(pos_r + 1, len(run_idxs)))
+                        if any_l and any_r:
+                            out_actions[k] = "cyan"
+                            changed = True
+                        elif left_cyan and _gap(run_idxs[pos_r - 1], k) <= 65:
+                            out_actions[k] = "cyan"
+                            changed = True
+                        elif right_cyan and _gap(k, run_idxs[pos_r + 1]) <= 65:
+                            out_actions[k] = "cyan"
+                            changed = True
+        i = j + 1
+    return out_actions
+
+
+def should_promote_cn_region_to_cyan(sents: list, actions: list = None) -> bool:
+    total_sents = len(sents or ())
+    if total_sents < 1:
+        return False
+    eff_actions = promote_dense_cn_sentence_runs_to_cyan(sents, actions)
+    if total_sents == 1:
+        return eff_actions[0] == "cyan"
+    unedited_cnt = sum(1 for idx, s in enumerate(sents) if not s.get("has_edit") or eff_actions[idx] == "none")
+    if unedited_cnt > 2 or ((total_sents - unedited_cnt) / total_sents) < 0.75:
+        return False
+    for idx_chk, s_chk in enumerate(sents):
+        if eff_actions[idx_chk] != "cyan" and int(s_chk.get("new_words", 0)) >= 36:
+            cu_chk = max(int(s_chk.get("del_words", 0)), int(s_chk.get("ins_words", 0)))
+            if not s_chk.get("has_edit") or (cu_chk <= 4 and float(s_chk.get("change_ratio", 0.0)) < 0.10):
+                return False
+    combined_ops = []
+    edited_u = 0
+    cyan_u = 0
+    for idx_c, s in enumerate(sents):
+        s_ops = s.get("ops") or []
+        combined_ops.extend(s_ops)
+        u_s = sum(count_msword_cn_units(t) for k, t in s_ops if k in ("eq", "ins"))
+        if s.get("has_edit") and eff_actions[idx_c] != "none":
+            edited_u += u_s
+        if eff_actions[idx_c] == "cyan":
+            cyan_u += u_s
+    reg_eq = sum(count_msword_cn_units(t) for k, t in combined_ops if k == "eq")
+    reg_del = sum(count_msword_cn_units(t) for k, t in combined_ops if k == "del")
+    reg_ins = sum(count_msword_cn_units(t) for k, t in combined_ops if k == "ins")
+    reg_new = max(1, reg_eq + reg_ins)
+    reg_cu = max(reg_del, reg_ins)
+    if (edited_u / reg_new) < 0.75 or reg_cu < 22:
+        return False
+    if (cyan_u / reg_new) >= 0.55 and unedited_cnt <= 1:
+        return True
+    if (cyan_u / reg_new) >= 0.65 and unedited_cnt <= 2:
+        return True
+    edit_clusters = 0
+    in_cl = False
+    for k, t in combined_ops:
+        if k in ("del", "ins") and not t.isspace():
+            if not in_cl:
+                edit_clusters += 1
+                in_cl = True
+        elif k == "eq" and not t.isspace():
+            in_cl = False
+    return bool(edit_clusters >= 6 and (reg_cu / reg_new) >= 0.25 and reg_cu >= 36)
+
+
+def compute_precision_yellow_cn(ops: list, max_gap_chars: int = 6) -> list:
+    """
+    Highlight local Chinese `UP` edits in `'yellow'`:
+      - Expands word/character edits to their enclosing Chinese clause (`， 、 ； ： 。 ？ ！`).
+      - Pure standalone sentence deletion (`del` ending with `。？！` and no `ins`) highlights ONLY the `<w:del>` sentence.
+      - Pure punctuation swap highlights a compact ~4-6 char window.
+      - Bridges two yellow spans separated by `<= max_gap_chars` CJK units.
+    """
+    n = len(ops)
+    if n == 0:
+        return []
+    hl = [False] * n
+    clusters = []
+    i = 0
+    while i < n:
+        if ops[i][0] in ("del", "ins") and not ops[i][1].isspace():
+            s = i
+            e = i
+            while e + 1 < n and ops[e + 1][0] in ("del", "ins") and not ops[e + 1][1].isspace():
+                e += 1
+            clusters.append((s, e))
+            i = e + 1
+        else:
+            i += 1
+    if not clusters:
+        return [(k, t, None) for k, t in ops]
+
+    stop_quotes = {"“", "”", "「", "」", "『", "』"}
+    for s, e in clusters:
+        del_txt = "".join(ops[k][1] for k in range(s, e + 1) if ops[k][0] == "del")
+        ins_txt = "".join(ops[k][1] for k in range(s, e + 1) if ops[k][0] == "ins")
+        del_u = count_msword_cn_units(del_txt)
+        ins_u = count_msword_cn_units(ins_txt)
+        del_trim = del_txt.rstrip("”’」』）)\"' ")
+
+        # Pure standalone sentence deletion -> highlight only the deleted sentence itself
+        if ins_u == 0 and del_u > 0 and del_trim and del_trim[-1] in CN_SENT_END_CHARS:
+            prev_non_ws = s - 1
+            while prev_non_ws >= 0 and ops[prev_non_ws][1].isspace():
+                prev_non_ws -= 1
+            at_sent_start = (
+                prev_non_ws < 0
+                or ops[prev_non_ws][1] in CN_SENT_END_CHARS
+                or ops[prev_non_ws][1] in ("”", "」", "』", "\n")
+            )
+            if at_sent_start:
+                for k_idx in range(s, e + 1):
+                    hl[k_idx] = True
+                continue
+
+        # Pure punctuation edit -> ~5 char context window
+        if del_u == 0 and ins_u == 0:
+            L, R = s, e
+            need_l = 2
+            while L > 0 and need_l > 0 and "\n" not in ops[L - 1][1]:
+                L -= 1
+                if ops[L][0] != "del":
+                    need_l -= count_msword_cn_units(ops[L][1])
+            need_r = 3
+            while R + 1 < n and need_r > 0 and "\n" not in ops[R + 1][1]:
+                R += 1
+                if ops[R][0] != "del":
+                    need_r -= count_msword_cn_units(ops[R][1])
+            for k_idx in range(L, R + 1):
+                hl[k_idx] = True
+            continue
+
+        # Clause expansion for Chinese character/phrase edits
+        L = s
+        while L > 0:
+            pk, pt = ops[L - 1]
+            if pk == "eq" and ("\n" in pt or pt in CN_CLAUSE_DELIMS or pt in stop_quotes):
+                break
+            if pk in ("del", "ins") and any(ch in pt for ch in "。？！\n；："):
+                break
+            L -= 1
+
+        R = e
+        eff_new_tail = "".join(ops[k][1] for k in range(s, e + 1) if ops[k][0] in ("eq", "ins")).rstrip()
+        if not (eff_new_tail and eff_new_tail[-1] in CN_CLAUSE_DELIMS):
+            while R + 1 < n:
+                nk, nt = ops[R + 1]
+                if nk == "eq":
+                    if "\n" in nt:
+                        break
+                    if nt in CN_CLAUSE_DELIMS:
+                        R += 1
+                        while R + 1 < n and ops[R + 1][0] == "eq" and ops[R + 1][1] in ("”", "’", "」", "』", "）", ")"):
+                            R += 1
+                        break
+                R += 1
+
+        while L < s and ops[L][0] == "eq" and ops[L][1].isspace():
+            L += 1
+        while R > e and ops[R][0] == "eq" and ops[R][1].isspace():
+            R -= 1
+        for k_idx in range(L, R + 1):
+            hl[k_idx] = True
+
+    if max_gap_chars > 0:
+        spans = []
+        cur_v = hl[0]
+        st = 0
+        for k_idx in range(1, n):
+            if hl[k_idx] != cur_v:
+                g_txt = "".join(t for k, t in ops[st:k_idx] if k in ("eq", "ins"))
+                spans.append((cur_v, st, k_idx - 1, count_msword_cn_units(g_txt), "\n" in g_txt))
+                cur_v = hl[k_idx]
+                st = k_idx
+        g_txt = "".join(t for k, t in ops[st:n] if k in ("eq", "ins"))
+        spans.append((cur_v, st, n - 1, count_msword_cn_units(g_txt), "\n" in g_txt))
+        for sp_i in range(1, len(spans) - 1):
+            is_h, gs, ge, gu, has_nl = spans[sp_i]
+            if not is_h and not has_nl and gu <= max_gap_chars:
+                for k_idx in range(gs, ge + 1):
+                    hl[k_idx] = True
+
+    return [(ops[k][0], ops[k][1], "yellow" if hl[k] else None) for k in range(n)]
+
+
 RV_HIGHLIGHT_ALIASES = frozenset({"cyan", "blue", "darkCyan"})
 _WORD_COUNT_SKIP_TAGS = frozenset({
     "del", "moveFrom", "rPrChange", "pPrChange", "tblPrChange", "trPrChange", "tcPrChange"
@@ -4065,21 +4844,28 @@ _WORD_COUNT_SKIP_TAGS = frozenset({
 
 def compute_col2_up_rv_words(root: ET.Element, up_color: str = "yellow", rv_color: str = "cyan") -> tuple[int, int]:
     """
-    Count English words (punctuation excluded; words, not characters) in Column 2 (index 1)
-    across all tables in `root` (excluding skipped rows marked in Column 3):
-      - UP = yellow highlight (`up_color`)
-      - RV = cyan highlight (`rv_color` / cyan / blue / darkCyan)
-    Deleted track-change runs (<w:del>) are strictly ignored.
+    Count UP & RV units across all tables in `root`:
+      - Standard 3-column tables (`[中文 | 英文 | 外文]`): counts English words in Column 2 (`tcs[1]`),
+        skipping rows marked `SKIPPED_ROW_MARKER` in Column 3 (`tcs[2]`).
+      - Korean 2-column tables (`[中文 | 韩文]`): counts Chinese characters/words in Column 1 (`tcs[0]`),
+        skipping rows marked `SKIPPED_ROW_MARKER` in Column 2 (`tcs[1]`).
+      - Deleted track-change runs (`<w:del>`) and pure `(s)`/`(pl)` tags are strictly excluded.
     """
     rv_vals = {rv_color} | RV_HIGHLIGHT_ALIASES
-    up_chunks: list[str] = []
-    rv_chunks: list[str] = []
+    up_en_chunks: list[str] = []
+    rv_en_chunks: list[str] = []
+    up_cn_chunks: list[str] = []
+    rv_cn_chunks: list[str] = []
 
     def _walk_runs(node: ET.Element, u_buf: list[str], r_buf: list[str]) -> None:
         for ch in node:
             local = ch.tag.split("}")[-1]
             if local in _WORD_COUNT_SKIP_TAGS:
                 continue
+            if local == "ins":
+                ins_txt = "".join(t.text or "" for t in ch.findall(".//w:t", NS))
+                if is_pure_pronoun_tag_op("ins", ins_txt):
+                    continue
             if local == "r":
                 hl = ch.find("./w:rPr/w:highlight", NS)
                 hval = hl.attrib.get(f"{W}val") if hl is not None else None
@@ -4109,19 +4895,28 @@ def compute_col2_up_rv_words(root: ET.Element, up_color: str = "yellow", rv_colo
             tcs = tr.findall("w:tc", NS)
             if len(tcs) < 2:
                 continue
-            if len(tcs) >= 3 and get_cell_plain_text(tcs[2]).strip() == SKIPPED_ROW_MARKER:
-                continue
-            tc2 = tcs[1]
-            for p in tc2.findall("w:p", NS):
+            if len(tcs) == 2:
+                if get_cell_plain_text(tcs[1]).strip() == SKIPPED_ROW_MARKER:
+                    continue
+                tc_src = tcs[0]
+                u_target, r_target = up_cn_chunks, rv_cn_chunks
+            else:
+                if get_cell_plain_text(tcs[2]).strip() == SKIPPED_ROW_MARKER:
+                    continue
+                tc_src = tcs[1]
+                u_target, r_target = up_en_chunks, rv_en_chunks
+            for p in tc_src.findall("w:p", NS):
                 u_buf: list[str] = []
                 r_buf: list[str] = []
                 _walk_runs(p, u_buf, r_buf)
                 if u_buf:
-                    up_chunks.append("".join(u_buf))
+                    u_target.append("".join(u_buf))
                 if r_buf:
-                    rv_chunks.append("".join(r_buf))
+                    r_target.append("".join(r_buf))
 
-    return count_msword_en_words(" ".join(up_chunks)), count_msword_en_words(" ".join(rv_chunks))
+    up_total = count_msword_en_words(" ".join(up_en_chunks)) + count_msword_cn_units(" ".join(up_cn_chunks))
+    rv_total = count_msword_en_words(" ".join(rv_en_chunks)) + count_msword_cn_units(" ".join(rv_cn_chunks))
+    return up_total, rv_total
 
 
 def find_fuzzy_substring_span(haystack: str, needle: str, search_from: int = 0):
@@ -4473,6 +5268,90 @@ def ensure_three_column_tables_and_landscape(root: ET.Element) -> int:
         expanded_tables += 1
 
     return expanded_tables
+
+
+def ensure_two_column_tables_and_landscape(root: ET.Element) -> int:
+    """
+    Normalize tables in `root` to 2 columns (`[中文 | 韩文]`) + Landscape A4 for Korean (`KO`/`KR`):
+      - Strips stray gridSpan / gridBefore / wBefore;
+      - If a row has >= 3 cells (e.g. `[CN | EN | empty]` from CN-EN master extraction), keeps `tcs[0]` (CN)
+        and `tcs[2]` (if non-empty) or an empty target `tcs[1]`, dropping the English column;
+      - If a row has 1 cell, appends an empty 2nd cell.
+    Returns count of normalized tables.
+    """
+    _ensure_landscape_a4_on_root(root)
+    adjusted = 0
+    for tbl in root.findall(f".//{W}tbl"):
+        trs = tbl.findall(f"{W}tr")
+        if not trs:
+            continue
+        tbl_changed = False
+        for tr in trs:
+            _strip_stray_grid_spans_on_row(tr)
+            tcs = tr.findall(f"{W}tc")
+            if len(tcs) >= 3:
+                # Keep tcs[0] (CN) and target cell (tcs[2] if populated, else empty cell based on tcs[-1])
+                has_c3 = bool(get_cell_plain_text(tcs[2]).strip())
+                if has_c3:
+                    tr.remove(tcs[1])
+                    for extra in tcs[3:]:
+                        tr.remove(extra)
+                else:
+                    for extra in tcs[2:]:
+                        tr.remove(extra)
+                    tc1_pr = tcs[1].find(f"{W}tcPr")
+                    for ch_c in list(tcs[1]):
+                        if ch_c is not tc1_pr:
+                            tcs[1].remove(ch_c)
+                    tcs[1].append(ET.Element(f"{W}p"))
+                tbl_changed = True
+            elif len(tcs) == 1:
+                tc0_pr = tcs[0].find(f"{W}tcPr")
+                new_tc = ET.Element(f"{W}tc")
+                new_tcPr = ET.Element(f"{W}tcPr")
+                insert_tcpr_child_ordered(new_tcPr, ET.Element(f"{W}tcW", {f"{W}w": "9091", f"{W}type": "dxa"}))
+                if tc0_pr is not None:
+                    for copy_tag in ("tcBorders", "tcMar", "vAlign"):
+                        sub_el = tc0_pr.find(f"{W}{copy_tag}")
+                        if sub_el is not None:
+                            cp_sub = copy.deepcopy(sub_el)
+                            _strip_unsafe_attrs_recursive(cp_sub)
+                            insert_tcpr_child_ordered(new_tcPr, cp_sub)
+                new_tc.append(new_tcPr)
+                new_tc.append(ET.Element(f"{W}p"))
+                tr.append(new_tc)
+                tbl_changed = True
+
+        old_grid = tbl.find(f"{W}tblGrid")
+        grid_cols = old_grid.findall(f"{W}gridCol") if old_grid is not None else []
+        if tbl_changed or len(grid_cols) != 2:
+            tblPr = tbl.find(f"{W}tblPr")
+            if tblPr is None:
+                tblPr = ET.Element(f"{W}tblPr")
+                tbl.insert(0, tblPr)
+            insert_tblpr_child_ordered(tblPr, ET.Element(f"{W}tblW", {f"{W}w": "14560", f"{W}type": "dxa"}))
+            new_grid = ET.Element(f"{W}tblGrid")
+            for gw in ("5469", "9091"):
+                ET.SubElement(new_grid, f"{W}gridCol", {f"{W}w": gw})
+            if old_grid is not None:
+                idx_g = list(tbl).index(old_grid)
+                tbl.remove(old_grid)
+                tbl.insert(idx_g, new_grid)
+            else:
+                idx_pr = list(tbl).index(tblPr)
+                tbl.insert(idx_pr + 1, new_grid)
+            for tr in trs:
+                tcs2 = tr.findall(f"{W}tc")
+                if len(tcs2) == 2:
+                    for col_i, dw in enumerate(("5469", "9091")):
+                        tcPr_i = tcs2[col_i].find(f"{W}tcPr")
+                        if tcPr_i is None:
+                            tcPr_i = ET.Element(f"{W}tcPr")
+                            tcs2[col_i].insert(0, tcPr_i)
+                        insert_tcpr_child_ordered(tcPr_i, ET.Element(f"{W}tcW", {f"{W}w": dw, f"{W}type": "dxa"}))
+            if tbl_changed:
+                adjusted += 1
+    return adjusted
 
 
 def _normalize_shd_fill_val(shd_el: ET.Element = None):
@@ -5301,6 +6180,69 @@ def balance_trilingual_table_widths(root: ET.Element) -> int:
         trs = tbl.findall(f"{W}tr")
         rows_3 = [tr for tr in trs if len(tr.findall(f"{W}tc")) == 3]
         if not rows_3:
+            rows_2 = [tr for tr in trs if len(tr.findall(f"{W}tc")) == 2]
+            if not rows_2:
+                continue
+            sz0 = _detect_col_dominant_half_pt_sz(rows_2, 0, default_sz=24)
+            sz1 = _detect_col_dominant_half_pt_sz(rows_2, 1, default_sz=24)
+            row_para_2 = []
+            for tr in rows_2:
+                _strip_stray_grid_spans_on_row(tr)
+                tcs = tr.findall(f"{W}tc")
+                if get_cell_plain_text(tcs[1]).strip() == SKIPPED_ROW_MARKER:
+                    continue
+                p0 = [_estimate_visual_dxa_length(_get_visible_para_text_for_wrap(p), half_pt_sz=sz0) for p in tcs[0].findall(f"{W}p")]
+                p1 = [_estimate_visual_dxa_length(_get_visible_para_text_for_wrap(p), half_pt_sz=sz1) for p in tcs[1].findall(f"{W}p")]
+                if any(x > 1.0 for x in p0) or any(x > 1.0 for x in p1):
+                    row_para_2.append((p0, p1))
+            best_r0 = 0.375
+            if row_para_2:
+                best_sc2 = float("inf")
+                for i0 in range(32, 49):
+                    r0 = i0 / 100.0
+                    u0 = max(2000.0, printable_dxa * r0 - 216.0)
+                    u1 = max(2400.0, printable_dxa * (1.0 - r0) - 216.0)
+                    sc2 = 0.0
+                    for p0, p1 in row_para_2:
+                        l0 = sum(1 if x <= 1.0 else max(1, int((x + u0 - 1.0) // u0)) for x in p0)
+                        l1 = sum(1 if x <= 1.0 else max(1, int((x + u1 - 1.0) // u1)) for x in p1)
+                        sc2 += (l0 - l1) * (l0 - l1)
+                    if sc2 < best_sc2:
+                        best_sc2 = sc2
+                        best_r0 = r0
+            w0_2 = int(round(printable_dxa * best_r0))
+            dxa_widths_2 = (w0_2, printable_dxa - w0_2)
+            tblPr = tbl.find(f"{W}tblPr")
+            if tblPr is None:
+                tblPr = ET.Element(f"{W}tblPr")
+                tbl.insert(0, tblPr)
+            insert_tblpr_child_ordered(tblPr, ET.Element(f"{W}tblW", {f"{W}w": str(printable_dxa), f"{W}type": "dxa"}))
+            insert_tblpr_child_ordered(tblPr, ET.Element(f"{W}tblLayout", {f"{W}type": "fixed"}))
+            old_grid = tbl.find(f"{W}tblGrid")
+            new_grid = ET.Element(f"{W}tblGrid")
+            for gw in dxa_widths_2:
+                ET.SubElement(new_grid, f"{W}gridCol", {f"{W}w": str(gw)})
+            if old_grid is not None:
+                idx_g = list(tbl).index(old_grid)
+                tbl.remove(old_grid)
+                tbl.insert(idx_g, new_grid)
+            else:
+                idx_pr = list(tbl).index(tblPr)
+                tbl.insert(idx_pr + 1, new_grid)
+            for tr in rows_2:
+                tcs = tr.findall(f"{W}tc")
+                for col_i in range(2):
+                    tcPr = tcs[col_i].find(f"{W}tcPr")
+                    if tcPr is None:
+                        tcPr = ET.Element(f"{W}tcPr")
+                        tcs[col_i].insert(0, tcPr)
+                    for nw in list(tcPr.findall(f"{W}noWrap")):
+                        tcPr.remove(nw)
+                    insert_tcpr_child_ordered(
+                        tcPr,
+                        ET.Element(f"{W}tcW", {f"{W}w": str(dxa_widths_2[col_i]), f"{W}type": "dxa"}),
+                    )
+            balanced_count += 1
             continue
 
         sz0 = _detect_col_dominant_half_pt_sz(rows_3, 0, default_sz=24)

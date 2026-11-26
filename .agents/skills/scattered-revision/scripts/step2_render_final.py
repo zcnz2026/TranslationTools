@@ -14,6 +14,7 @@ from docx_xml_utils import (
     accept_all_revisions_in_cell,
     apply_highlights_to_col3_cell,
     balance_trilingual_table_widths,
+    cell_has_substantive_revisions,
     compute_col2_up_rv_words,
     count_msword_en_words,
     find_fuzzy_substring_span,
@@ -38,6 +39,8 @@ _CN_CLAUSE_END_RE = re.compile(r"[，,、：:；;。？！!?\n]+(?:[”’\"'」
 
 def is_skipped_row(tr: ET.Element) -> bool:
     tcs = tr.findall("w:tc", NS)
+    if len(tcs) == 2:
+        return get_cell_plain_text(tcs[1]).strip() == SKIPPED_ROW_MARKER
     if len(tcs) < 3:
         return False
     return get_cell_plain_text(tcs[2]).strip() == SKIPPED_ROW_MARKER
@@ -143,17 +146,21 @@ def accept_rv_revisions_in_col2(tc2: ET.Element, target_rv_color: str = "cyan"):
 
 
 def row_has_col2_changes(tr: ET.Element, active_hl_vals: set = None) -> bool:
-    """Return True if table row `tr` is non-skipped and has Col 2 track changes (`<w:ins>`/`<w:del>`) or active highlights."""
+    """
+    Return True if table row `tr` is non-skipped and has substantive track changes (`<w:ins>`/`<w:del>`,
+    excluding standalone pure `(s)`/`(pl)` tags) or active UP/RV highlights in the diff column
+    (`tcs[0]` for 2-column Korean tables, `tcs[1]` for 3-column tables).
+    """
     if is_skipped_row(tr):
         return False
     tcs = tr.findall("w:tc", NS)
     if len(tcs) < 2:
         return False
-    tc2 = tcs[1]
-    if tc2.find(".//w:del", NS) is not None or tc2.find(".//w:ins", NS) is not None:
+    tc_diff = tcs[0] if len(tcs) == 2 else tcs[1]
+    if cell_has_substantive_revisions(tc_diff):
         return True
     if active_hl_vals:
-        for hl in tc2.findall(".//w:rPr/w:highlight", NS):
+        for hl in tc_diff.findall(".//w:rPr/w:highlight", NS):
             if hl.attrib.get(f"{W}val") in active_hl_vals:
                 return True
     return False
@@ -428,12 +435,13 @@ def main():
     root, _, ns_pairs = load_docx_xml(draft_path)
     body = root.find("w:body", NS)
 
-    # 1. Accept any unaccepted Col 1 Chinese track changes; normalize/accept Col 2 RV highlights (or strip highlights when --no-highlight-colors)
+    # 1. Accept any unaccepted Col 1 Chinese track changes (3-col mode); normalize/accept RV highlights
     accept_rv = cfg.get("accept_col2_rv_revisions", False)
     for tbl in body.findall("w:tbl", NS):
         for tr in tbl.findall("w:tr", NS):
             tcs = tr.findall("w:tc", NS)
-            if tcs:
+            is_2col_tr = len(tcs) == 2
+            if tcs and not is_2col_tr:
                 accept_all_revisions_in_cell(tcs[0])
                 strip_all_highlights_in_cell(tcs[0])
             if not use_hl:
@@ -443,12 +451,13 @@ def main():
             if is_skipped_row(tr):
                 continue
             if len(tcs) >= 2:
+                tc_diff = tcs[0] if is_2col_tr else tcs[1]
                 if accept_rv:
-                    accept_rv_revisions_in_col2(tcs[1], target_rv_color=col2_rv)
+                    accept_rv_revisions_in_col2(tc_diff, target_rv_color=col2_rv)
                 else:
-                    normalize_rv_highlights_in_col2(tcs[1], target_rv_color=col2_rv)
+                    normalize_rv_highlights_in_col2(tc_diff, target_rv_color=col2_rv)
 
-    # 2. Apply Col 1 Chinese single underline (`u:single`) & Col 3 Foreign (`shd:D9EEF7` for UP, `lightGray` for RV)
+    # 2. Apply Col 1 Chinese single underline (`u:single`, 3-col mode only) & target Foreign (`shd:D9EEF7` for UP, `lightGray` for RV)
     unmatched = []
     matched_count = 0
     if use_hl:
@@ -458,12 +467,15 @@ def main():
             if is_skipped_row(tr):
                 continue
             tcs = tr.findall("w:tc", NS)
-            tc1, tc3 = tcs[0], tcs[2]
+            is_row_2col = bool(rt.get("bilingual_2col") or len(tcs) == 2)
+            tc1 = tcs[0]
+            tc3 = tcs[1] if is_row_2col else tcs[2]
+            highlight_col1_row = highlight_col1 and not is_row_2col
             col1_text = get_cell_plain_text(tc1)
             col3_text = get_cell_plain_text(tc3)
 
             if rt.get("is_full_cell_rv"):
-                if highlight_col1:
+                if highlight_col1_row:
                     c1_full = _full_nonws_char_spans(col1_text, "u:single")
                     apply_highlights_to_col3_cell(tc1, c1_full)
                 c3_full = _full_nonws_char_spans(col3_text, col3_rv)
@@ -487,8 +499,8 @@ def main():
                     col1_target = ""
                     col3_target = str(entry or "")
 
-                # Synchronous Col 1 Chinese single underline (never yellow/cyan highlight) when highlight_col1 is enabled
-                if highlight_col1 and col1_text.strip():
+                # Synchronous Col 1 Chinese single underline (never yellow/cyan highlight) when highlight_col1_row is enabled
+                if highlight_col1_row and col1_text.strip():
                     hl_c1 = "u:single"
                     loc1 = (
                         find_fuzzy_substring_span(col1_text, col1_target, search_from=col1_cursor)
@@ -524,7 +536,7 @@ def main():
                 col3_cursor = e3
                 matched_count += 1
 
-            if highlight_col1:
+            if highlight_col1_row:
                 apply_highlights_to_col3_cell(tc1, col1_char_spans)
             apply_highlights_to_col3_cell(tc3, col3_char_spans)
 

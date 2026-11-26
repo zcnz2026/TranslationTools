@@ -44,6 +44,9 @@ from ai_client import (
     test_all_api_keys,
     test_api_connection,
 )
+import ai_client as _ai_client_mod
+
+fetch_available_models = getattr(_ai_client_mod, "fetch_available_models", None)
 
 try:
     from ai_client import format_friendly_api_error
@@ -126,7 +129,7 @@ try:
 except ImportError:
     _updater_mod = None
 
-RAW_APP_VERSION = "1.9.5"
+RAW_APP_VERSION = "1.9.6"
 APP_VERSION = f"v{RAW_APP_VERSION}"
 check_for_updates = getattr(_updater_mod, "check_for_updates", None)
 download_and_apply_update = getattr(_updater_mod, "download_and_apply_update", None)
@@ -1989,6 +1992,7 @@ class ScatteredRevisionApp:
         self.fav_summary_var = tk.StringVar(value="")
         self.show_key_var = tk.BooleanVar(value=False)
         self.remember_key_var = tk.BooleanVar(value=True)
+        self.dynamic_models: list[tuple[str, str]] = list(SUPPORTED_MODELS)
         self.model_label = tk.StringVar(value=SUPPORTED_MODELS[0][0])
         self.yellow_gap_words_var = tk.StringVar(
             value=str(self._sanitize_yellow_gap(self.settings.get("yellow_gap_words", 3)))
@@ -2217,9 +2221,12 @@ class ScatteredRevisionApp:
 
     def _get_model_id(self) -> str:
         lbl = self.model_label.get().strip()
-        for disp, mid in SUPPORTED_MODELS:
+        for disp, mid in list(getattr(self, "dynamic_models", ())) + list(SUPPORTED_MODELS):
             if lbl == disp or lbl == mid:
                 return mid
+        m_br = re.search(r"\[([A-Za-z0-9][A-Za-z0-9._-]{0,63})\]\s*$", lbl)
+        if m_br:
+            return m_br.group(1)
         return lbl or "gemini-3.5-flash-lite"
 
     def _get_selected_lang_code(self) -> str:
@@ -2275,12 +2282,40 @@ class ScatteredRevisionApp:
                 saved_mode = cfg.get("api_mode_label", "")
                 if saved_mode in {m[0] for m in API_MODES}:
                     self.api_mode_label.set(saved_mode)
+                elif "Vertex" in str(saved_mode):
+                    self.api_mode_label.set(API_MODES[1][0])
+                elif "Gemini" in str(saved_mode):
+                    self.api_mode_label.set(API_MODES[2][0])
                 saved_rot = cfg.get("rotation_label", "")
                 if saved_rot in {m[0] for m in ROTATION_MODES}:
                     self.rotation_label.set(saved_rot)
-                saved_model = cfg.get("model_label", "")
+                raw_cached_models = cfg.get("cached_models", [])
+                if isinstance(raw_cached_models, list) and raw_cached_models:
+                    restored_m: list[tuple[str, str]] = []
+                    seen_m: set[str] = set()
+                    for pair in raw_cached_models:
+                        if isinstance(pair, (list, tuple)) and len(pair) == 2:
+                            d_s, m_s = str(pair[0]).strip(), str(pair[1]).strip()
+                            if d_s and m_s and m_s not in seen_m:
+                                restored_m.append((d_s, m_s))
+                                seen_m.add(m_s)
+                    for d_b, m_b in SUPPORTED_MODELS:
+                        if m_b not in seen_m:
+                            restored_m.append((d_b, m_b))
+                            seen_m.add(m_b)
+                    if restored_m:
+                        self.dynamic_models = restored_m
+                saved_model = str(cfg.get("model_label", "")).strip()
                 if saved_model:
-                    self.model_label.set(saved_model)
+                    # Map legacy label (e.g. 'Gemini 3.5 Flash Lite (推荐·均衡快速)') cleanly to updated label
+                    mapped_lbl = saved_model
+                    for d_cur, m_cur in self.dynamic_models:
+                        if saved_model == m_cur or saved_model == d_cur or (
+                            "3.5 Flash Lite" in saved_model and m_cur == "gemini-3.5-flash-lite"
+                        ) or ("3.1 Flash Lite" in saved_model and m_cur == "gemini-3.1-flash-lite"):
+                            mapped_lbl = d_cur
+                            break
+                    self.model_label.set(mapped_lbl)
                 self.yellow_gap_words_var.set(str(self._sanitize_yellow_gap(cfg.get("yellow_gap_words", 3))))
 
                 # Favorite & Recent Languages (Item #5)
@@ -2387,6 +2422,7 @@ class ScatteredRevisionApp:
             "api_mode_label": self.api_mode_label.get(),
             "rotation_label": self.rotation_label.get(),
             "model_label": self.model_label.get(),
+            "cached_models": [[d, m] for d, m in getattr(self, "dynamic_models", SUPPORTED_MODELS)],
             "yellow_gap_words": gap_val,
             "favorite_langs": list(self.favorite_langs),
             "recent_langs": list(self.recent_langs),
@@ -4039,15 +4075,27 @@ class ScatteredRevisionApp:
         combo_grid.columnconfigure(3, weight=1)
 
         ttk.Label(combo_grid, text="选择模型：").grid(row=0, column=0, sticky=tk.W, pady=3)
+        model_row_box = ttk.Frame(combo_grid)
+        model_row_box.grid(row=0, column=1, sticky=tk.EW, pady=3, padx=(4, 16))
+        model_row_box.columnconfigure(0, weight=1)
         self.settings_model_cb = ttk.Combobox(
-            combo_grid,
+            model_row_box,
             textvariable=self.model_label,
-            values=[m[0] for m in SUPPORTED_MODELS],
-            state="readonly",
-            width=28,
+            values=[m[0] for m in self.dynamic_models],
+            state="normal",
+            width=26,
         )
-        self.settings_model_cb.grid(row=0, column=1, sticky=tk.EW, pady=3, padx=(4, 16))
+        self.settings_model_cb.grid(row=0, column=0, sticky=tk.EW)
         self.settings_model_cb.bind("<<ComboboxSelected>>", lambda _e: self._save_settings())
+        self.settings_model_cb.bind("<FocusOut>", lambda _e: self._save_settings())
+        self.settings_model_cb.bind("<Return>", lambda _e: self._save_settings())
+        self.btn_refresh_models = ttk.Button(
+            model_row_box,
+            text="🔄 加载最新模型",
+            style="Compact.TButton",
+            command=self._on_refresh_models_clicked,
+        )
+        self.btn_refresh_models.grid(row=0, column=1, padx=(4, 0))
 
         ttk.Label(combo_grid, text="接口通道：").grid(row=0, column=2, sticky=tk.W, pady=3)
         self.settings_api_mode_cb = ttk.Combobox(
@@ -6312,6 +6360,21 @@ class ScatteredRevisionApp:
                         self.settings_save_status_var.set(str(st_txt))
                         if hasattr(self, "settings_status_lbl"):
                             self.settings_status_lbl.configure(foreground=str(st_color))
+                    elif kind == "models_refreshed":
+                        new_models, status_msg = payload
+                        self.dynamic_models = list(new_models)
+                        if hasattr(self, "settings_model_cb") and self.settings_model_cb is not None:
+                            self.settings_model_cb.configure(values=[m[0] for m in self.dynamic_models])
+                        cur_mid = self._get_model_id()
+                        matched_disp = next((d for d, m in self.dynamic_models if m == cur_mid), "")
+                        if matched_disp:
+                            self.model_label.set(matched_disp)
+                        elif self.dynamic_models:
+                            self.model_label.set(self.dynamic_models[0][0])
+                        self._save_settings()
+                        self.settings_save_status_var.set(f"✅ {status_msg}")
+                        if hasattr(self, "settings_status_lbl"):
+                            self.settings_status_lbl.configure(foreground="#15803d")
                     elif kind == "update_available":
                         if isinstance(payload, dict) and payload.get("has_update"):
                             self._show_update_banner(payload)
@@ -6377,6 +6440,45 @@ class ScatteredRevisionApp:
                 if final_stage:
                     svar.set(f"❌ {final_stage}")
             tvar.set(self._format_pct_timer())
+
+    def _on_refresh_models_clicked(self):
+        if self.settings_key_editor is not None and self.settings_key_editor.winfo_exists():
+            self._on_settings_key_editor_modified()
+        self._save_settings()
+        keys = self._get_all_keys_list()
+        mode = self._get_api_mode_code()
+        if not keys:
+            messagebox.showwarning("提示", "请先在下方 API Key 池列表中粘贴至少 1 个 Gemini 或 Vertex 收费版 API Key，再加载最新模型列表。")
+            return
+        if not callable(fetch_available_models):
+            messagebox.showerror("组件未就绪", "未找到 fetch_available_models 函数。")
+            return
+
+        if hasattr(self, "btn_refresh_models") and self.btn_refresh_models is not None:
+            self.btn_refresh_models.configure(state=tk.DISABLED)
+        self.settings_save_status_var.set("⏳ 正在从官方接口拉取最新可用模型列表...")
+        if hasattr(self, "settings_status_lbl"):
+            self.settings_status_lbl.configure(foreground="#1d4ed8")
+
+        def _worker():
+            try:
+                models_list, msg = fetch_available_models(keys, api_mode=mode)
+                self.log_queue.put(("models_refreshed", (models_list, msg)))
+                self.log_queue.put(("popup_info", ("模型列表已更新", msg + "\n\n现可在「选择模型」下拉框中自由选择最新模型。")))
+            except Exception as ex:
+                friendly = _format_exception_concise(ex, keys=keys, api_related=True)
+                self.log_queue.put(("settings_status", (f"❌ 加载模型列表失败：{friendly}", "#b91c1c")))
+                self.log_queue.put(("popup_error", ("加载模型列表失败", friendly)))
+            finally:
+                if not self._closing and self.root.winfo_exists():
+                    self.root.after(
+                        0,
+                        lambda: self.btn_refresh_models.configure(state=tk.NORMAL)
+                        if getattr(self, "btn_refresh_models", None) is not None
+                        else None,
+                    )
+
+        threading.Thread(target=_worker, daemon=True).start()
 
     def _on_test_api(self):
         if self.settings_key_editor is not None and self.settings_key_editor.winfo_exists():
@@ -6675,8 +6777,8 @@ def _run_frozen_self_test() -> int:
     from ai_client import format_friendly_api_error as _ai_friendly_err
     from ai_client import local_align_col3_spans
 
-    if RAW_APP_VERSION != "1.9.5":
-        raise RuntimeError(f"RAW_APP_VERSION expected '1.9.5', got {RAW_APP_VERSION!r}")
+    if RAW_APP_VERSION != "1.9.6":
+        raise RuntimeError(f"RAW_APP_VERSION expected '1.9.6', got {RAW_APP_VERSION!r}")
 
     is_frozen = bool(getattr(sys, "frozen", False))
     if is_frozen and hasattr(sys, "_MEIPASS"):
@@ -6844,7 +6946,7 @@ def _run_frozen_self_test() -> int:
             raise RuntimeError("pipeline.resolve_sc1_input_docx_list missing in self-test")
 
         upd_ver = str(getattr(_upd_test, "APP_VERSION", "")).lstrip("vV")
-        expected_vers = ("1.9.5",) if require_v18_siblings else ("1.7.0", "1.8.0", "1.8.1", "1.9.0", "1.9.1", "1.9.2", "1.9.3", "1.9.4", "1.9.5")
+        expected_vers = ("1.9.6",) if require_v18_siblings else ("1.7.0", "1.8.0", "1.8.1", "1.9.0", "1.9.1", "1.9.2", "1.9.3", "1.9.4", "1.9.5", "1.9.6")
         if upd_ver not in expected_vers:
             raise RuntimeError(f"updater.APP_VERSION mismatch: {getattr(_upd_test, 'APP_VERSION', None)!r}")
         if not callable(getattr(_upd_test, "check_for_updates", None)) or not callable(

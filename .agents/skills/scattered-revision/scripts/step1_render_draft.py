@@ -19,6 +19,8 @@ from docx_xml_utils import (
     clean_and_migrate_col3_paragraphs,
     clean_col2_ppr,
     compute_precision_yellow,
+    compute_precision_yellow_cn,
+    count_msword_cn_units,
     count_msword_en_words,
     extract_cell_comment_anchors,
     get_cell_template_ppr,
@@ -26,6 +28,7 @@ from docx_xml_utils import (
     get_first_run_rpr,
     insert_rpr_child_ordered,
     insert_tcpr_child_ordered,
+    is_pure_pronoun_tag_op,
     load_config,
     load_docx_comments_map,
     load_docx_comments_xml,
@@ -34,9 +37,12 @@ from docx_xml_utils import (
     make_run,
     make_track_el,
     new_comments_root,
+    promote_dense_cn_sentence_runs_to_cyan,
+    promote_dense_sentence_runs_to_cyan,
     reanchor_comments_to_cell,
     remove_rpr_child,
     save_docx_xml,
+    should_promote_cn_region_to_cyan,
     should_promote_region_to_cyan,
     split_text_by_style_spans,
     strip_all_highlights_in_cell,
@@ -186,6 +192,8 @@ def export_raw_trilingual_docx(
       - Col 3 = matched library Foreign (`s_tcs[2]` with preserved formatting & comments)
       - Adaptive balanced 3-column widths & Landscape A4.
     """
+    bilingual_2col = bool(manifest.get("bilingual_2col"))
+    min_cols = 2 if bilingual_2col else 3
     raw_root, _, raw_ns_pairs = load_docx_xml(inp_path)
     raw_comments_root = new_comments_root()
     raw_id_alloc = CommentIdAllocator(doc_root=raw_root, comments_root=raw_comments_root)
@@ -197,7 +205,7 @@ def export_raw_trilingual_docx(
         body_el = raw_body[rm["body_idx"]]
         tr = body_el.findall("w:tr", NS)[rm["row_idx"]]
         r_tcs = tr.findall("w:tc", NS)
-        if len(r_tcs) < 3:
+        if len(r_tcs) < min_cols:
             continue
 
         src_file = Path(rm["source_file"])
@@ -222,34 +230,38 @@ def export_raw_trilingual_docx(
         _populate_clean_library_cell(
             src_tc=s_tcs[1],
             target_tc=r_tcs[1],
-            fallback_tc=r_tcs[1],
+            fallback_tc=r_tcs[0] if bilingual_2col else r_tcs[1],
             src_comments_map=s_cmap,
             target_comments_root=raw_comments_root,
             id_allocator=raw_id_alloc,
             src_styles_root=s_styles,
             ensure_cjk_songti=False,
         )
-        _populate_clean_library_cell(
-            src_tc=s_tcs[2],
-            target_tc=r_tcs[2],
-            fallback_tc=r_tcs[1],
-            src_comments_map=s_cmap,
-            target_comments_root=raw_comments_root,
-            id_allocator=raw_id_alloc,
-            src_styles_root=s_styles,
-            ensure_cjk_songti=False,
-        )
+        if not bilingual_2col and len(r_tcs) >= 3 and len(s_tcs) >= 3:
+            _populate_clean_library_cell(
+                src_tc=s_tcs[2],
+                target_tc=r_tcs[2],
+                fallback_tc=r_tcs[1],
+                src_comments_map=s_cmap,
+                target_comments_root=raw_comments_root,
+                id_allocator=raw_id_alloc,
+                src_styles_root=s_styles,
+                ensure_cjk_songti=False,
+            )
 
     for sr in manifest.get("skipped_rows", []):
         body_el = raw_body[sr["body_idx"]]
         trs = body_el.findall("w:tr", NS)
         if 0 <= sr["row_idx"] < len(trs):
             r_tcs = trs[sr["row_idx"]].findall("w:tc", NS)
-            if len(r_tcs) >= 3:
+            if len(r_tcs) >= min_cols:
                 accept_all_revisions_in_cell(r_tcs[0])
                 strip_all_highlights_in_cell(r_tcs[0])
-                strip_all_highlights_in_cell(r_tcs[1])
-                populate_skipped_col3_cell(r_tcs[2], fallback_tc=r_tcs[1])
+                if bilingual_2col:
+                    populate_skipped_col3_cell(r_tcs[1], fallback_tc=r_tcs[0])
+                else:
+                    strip_all_highlights_in_cell(r_tcs[1])
+                    populate_skipped_col3_cell(r_tcs[2], fallback_tc=r_tcs[1])
 
     balance_trilingual_table_widths(raw_root)
 
@@ -379,6 +391,7 @@ def main():
             for rpr_top in p_top.findall(f".//{W}rPr"):
                 remove_rpr_child(rpr_top, "highlight")
 
+    bilingual_2col = bool(manifest.get("bilingual_2col"))
     src_cache = {}  # Path -> (list_of_trs, comments_map_dict, styles_root)
     up_texts = []
     rv_texts = []
@@ -387,7 +400,8 @@ def main():
         body_el = body[rm["body_idx"]]
         tr = body_el.findall("w:tr", NS)[rm["row_idx"]]
         tcs = tr.findall("w:tc", NS)
-        tc2, tc3 = tcs[1], tcs[2]
+        tc_diff = tcs[0] if bilingual_2col else tcs[1]
+        tc_target = tcs[1] if bilingual_2col else tcs[2]
 
         src_file = Path(rm["source_file"])
         if src_file not in src_cache:
@@ -398,32 +412,40 @@ def main():
         s_trs, s_cmap, s_styles = src_cache[src_file]
         s_tr = s_trs[rm["source_row_idx"]]
         s_tcs = s_tr.findall("w:tc", NS)
+        s_tc_target = s_tcs[1] if bilingual_2col else s_tcs[2]
 
-        # 1. Populate Col 3 from library Col 3 while preserving src_tc3's own formatting AND migrating Word comments
+        # 1. Populate target Foreign column (Col 2 Korean in 2-col mode; Col 3 Foreign in 3-col mode)
         col3_paras = clean_col3_paragraphs(
-            src_tc3=s_tcs[2],
-            target_tc3=tc3,
-            target_tc2=tc2,
+            src_tc3=s_tc_target,
+            target_tc3=tc_target,
+            target_tc2=tc_diff,
             src_comments_map=s_cmap,
             target_comments_root=working_comments_root,
             id_allocator=id_allocator,
             src_styles_root=s_styles,
         )
-        tc3_Pr = tc3.find("w:tcPr", NS)
-        for ch in list(tc3):
+        tc3_Pr = tc_target.find("w:tcPr", NS)
+        for ch in list(tc_target):
             if ch is not tc3_Pr:
-                tc3.remove(ch)
+                tc_target.remove(ch)
         for cp in col3_paras:
-            tc3.append(cp)
+            tc_target.append(cp)
 
-        # 2. Extract any input Col 2 comments BEFORE clearing tc2 so they can be re-anchored onto rebuilt tc2!
-        tc2_comment_anchors = extract_cell_comment_anchors(tc2, working_comments_root)
+        # 2. Extract any input diff-cell comments BEFORE clearing tc_diff so they can be re-anchored onto rebuilt tc_diff!
+        tc2_comment_anchors = extract_cell_comment_anchors(tc_diff, working_comments_root)
 
-        # 3. Rebuild Col 2 with clean black unbolded base_rPr + exact per-char inline styles + yellow/cyan & track changes
-        base_rPr = get_clean_col2_base_rpr(tc2, fallback_tc=tcs[0])
+        # 3. Rebuild diff cell (Col 1 Chinese in 2-col mode; Col 2 English in 3-col mode)
+        base_rPr = get_clean_col2_base_rpr(tc_diff, fallback_tc=s_tcs[0] if bilingual_2col else tcs[0])
+        if bilingual_2col:
+            rf_el = base_rPr.find("w:rFonts", NS)
+            if rf_el is None:
+                rf_el = ET.Element(f"{W}rFonts", {f"{W}ascii": "Georgia", f"{W}eastAsia": "宋体", f"{W}hAnsi": "Georgia"})
+                insert_rpr_child_ordered(base_rPr, rf_el)
+            else:
+                rf_el.set(f"{W}eastAsia", "宋体")
         orig_pPrs = [
             clean_col2_ppr(p_item.find("w:pPr", NS))
-            for p_item in tc2.findall("w:p", NS)
+            for p_item in tc_diff.findall("w:p", NS)
         ]
 
         styled_stream = []  # (kind, text, hl, shd, inline_style)
@@ -439,19 +461,41 @@ def main():
                     act = decisions.get(s["sent_id"], s["suggested_action"])
                     if s.get("has_edit"):
                         s_ratio = float(s.get("change_ratio", 0.0))
-                        s_consec = int(s.get("max_consec_eq_words", 99))
+                        s_cw = max(int(s.get("del_words", 0)), int(s.get("ins_words", 0)))
                         s_hunks = int(s.get("edit_hunks", 1))
-                        # Hard guard 1: heavily shattered/rewritten sentence MUST be 'cyan' (RV)
-                        if (s_ratio >= 0.62 and s_consec <= 5) or (s_ratio >= 0.55 and s_hunks >= 5 and s_consec <= 4):
-                            act = "cyan"
-                        # Hard guard 2: light local edits (< 35% changed with intact >= 6-word clause) MUST stay 'yellow' (UP)
-                        elif s_ratio < 0.35 and s_consec >= 6 and act == "cyan":
-                            act = "yellow"
+                        s_new_w = int(s.get("new_words", 1))
+                        if bilingual_2col or s.get("is_cn"):
+                            if int(s.get("eq_words", 0)) == 0 and int(s.get("ins_words", 0)) == 0:
+                                act = "yellow"
+                            elif (
+                                (s_ratio >= 0.36 and s_cw >= 10 and (s_hunks >= 2 or s_new_w >= 24))
+                                or (s_new_w >= 78 and ((s_cw >= 20 and s_hunks >= 4) or (s_cw >= 26 and s_ratio >= 0.25) or (s_hunks >= 5 and s_ratio >= 0.22)))
+                            ):
+                                act = "cyan"
+                            elif s_cw <= 5 and s_ratio < 0.15 and act == "cyan":
+                                act = "yellow"
+                        else:
+                            # Hard guard 1: clear structural/multi-line rewrite MUST be 'cyan' (RV)
+                            if (
+                                (s_ratio >= 0.36 and s_cw >= 6 and (s_hunks >= 2 or s_new_w >= 14))
+                                or (s_new_w >= 42 and ((s_cw >= 12 and s_hunks >= 4) or (s_cw >= 15 and s_ratio >= 0.25) or (s_hunks >= 5 and s_ratio >= 0.22)))
+                            ):
+                                act = "cyan"
+                            # Hard guard 2: tiny isolated 1-3 word tweak (< 15% changed) stays 'yellow' initially
+                            elif s_cw <= 3 and s_ratio < 0.15 and act == "cyan":
+                                act = "yellow"
                     actions.append(act)
 
-                # Item 8.4: Promote heavily fragmented whole paragraph/region to clean 'cyan' (RV)
-                if use_hl and should_promote_region_to_cyan(sents, actions, max_gap_words=max_gap_words):
-                    actions = ["cyan"] * len(sents)
+                # Promote contiguous dense multi-sentence runs (Rule 3) & whole-paragraph rewrites (Rule 4)
+                if use_hl:
+                    if bilingual_2col:
+                        actions = promote_dense_cn_sentence_runs_to_cyan(sents, actions)
+                        if should_promote_cn_region_to_cyan(sents, actions):
+                            actions = ["cyan"] * len(sents)
+                    else:
+                        actions = promote_dense_sentence_runs_to_cyan(sents, actions)
+                        if should_promote_region_to_cyan(sents, actions, max_gap_words=max_gap_words):
+                            actions = ["cyan"] * len(sents)
 
                 idx_s = 0
                 while idx_s < len(sents):
@@ -480,7 +524,10 @@ def main():
                             s_sts = s_obj.get("op_styles") or [[] for _ in s_ops]
                             if not s_obj["has_edit"] or (use_hl and act == "none"):
                                 for (k, t), op_sp in zip(s_ops, s_sts):
-                                    if k != "del":
+                                    if is_pure_pronoun_tag_op(k, t):
+                                        nc_ops.append((k, t))
+                                        nc_op_styles.append(op_sp)
+                                    elif k != "del":
                                         nc_ops.append(("eq", t))
                                         nc_op_styles.append(op_sp)
                             else:
@@ -489,7 +536,10 @@ def main():
                             idx_s += 1
 
                         if use_hl:
-                            toks = compute_precision_yellow(nc_ops, max_gap_words=max_gap_words)
+                            if bilingual_2col:
+                                toks = compute_precision_yellow_cn(nc_ops, max_gap_chars=max_gap_words * 2)
+                            else:
+                                toks = compute_precision_yellow(nc_ops, max_gap_words=max_gap_words)
                         else:
                             toks = [(k, t, None) for k, t in nc_ops]
 
@@ -500,11 +550,12 @@ def main():
                                 styled_stream.append((k, sub_t, hl_mapped, s_fill, inl_st))
 
         if use_hl:
-            _bridge_yellow_gaps_in_styled_stream(styled_stream, up_color=up_color, max_gap_words=max_gap_words)
+            if not bilingual_2col:
+                _bridge_yellow_gaps_in_styled_stream(styled_stream, up_color=up_color, max_gap_words=max_gap_words)
             u_buf = []
             r_buf = []
             for k_c, t_c, hl_c, _, _ in styled_stream:
-                if k_c in ("eq", "ins"):
+                if k_c in ("eq", "ins") and not is_pure_pronoun_tag_op(k_c, t_c):
                     if hl_c == up_color:
                         u_buf.append(t_c)
                     elif u_buf:
@@ -531,13 +582,13 @@ def main():
                     if part:
                         para_streams[-1].append((kind, part, hl, shd, inl_st))
 
-        tc2_Pr = tc2.find("w:tcPr", NS)
+        tc2_Pr = tc_diff.find("w:tcPr", NS)
         if tc2_Pr is not None:
             for shd_tc in list(tc2_Pr.findall("w:shd", NS)):
                 tc2_Pr.remove(shd_tc)
-        for ch in list(tc2):
+        for ch in list(tc_diff):
             if ch is not tc2_Pr:
-                tc2.remove(ch)
+                tc_diff.remove(ch)
 
         for p_idx, p_stream in enumerate(para_streams):
             p_el = ET.Element(f"{W}p")
@@ -558,19 +609,21 @@ def main():
                 elif kind == "ins":
                     r_el = make_run(txt, base_rPr=base_rPr, highlight=hl, shd_fill=shd, is_del=False, inline_style=eff_inl)
                     p_el.append(make_track_el("ins", id_allocator.next_id(), author, date_iso, r_el))
-            tc2.append(p_el)
+            tc_diff.append(p_el)
 
         if tc2_comment_anchors:
-            reanchor_comments_to_cell(tc2, tc2_comment_anchors, working_comments_root, id_allocator)
+            reanchor_comments_to_cell(tc_diff, tc2_comment_anchors, working_comments_root, id_allocator)
 
-    # 4. Populate skipped rows: keep Col 1 & Col 2 intact, write red `【未在总库匹配到原文，已跳过】` into Col 3
+    # 4. Populate skipped rows: write red `【未在总库匹配到原文，已跳过】` into target Foreign column
     skipped_list = manifest.get("skipped_rows", [])
     for sr in skipped_list:
         body_el = body[sr["body_idx"]]
         trs = body_el.findall("w:tr", NS)
         if 0 <= sr["row_idx"] < len(trs):
             tcs = trs[sr["row_idx"]].findall("w:tc", NS)
-            if len(tcs) >= 3:
+            if bilingual_2col and len(tcs) >= 2:
+                populate_skipped_col3_cell(tcs[1], fallback_tc=tcs[0])
+            elif len(tcs) >= 3:
                 populate_skipped_col3_cell(tcs[2], fallback_tc=tcs[1])
 
     final_comments_root = (
@@ -586,8 +639,9 @@ def main():
         raw_out_path = Path(args.raw_trilingual_output.strip()).resolve()
         export_raw_trilingual_docx(inp_path, raw_out_path, manifest, src_cache)
 
-    up_words = count_msword_en_words(" ".join(up_texts))
-    rv_words = count_msword_en_words(" ".join(rv_texts))
+    count_fn = count_msword_cn_units if bilingual_2col else count_msword_en_words
+    up_words = count_fn(" ".join(up_texts))
+    rv_words = count_fn(" ".join(rv_texts))
     print(f"Step 1 Draft saved to: {out_path}")
     print(f"Provisional counts (pending human review): UP = {up_words} words, RV = {rv_words} words")
     if skipped_list:

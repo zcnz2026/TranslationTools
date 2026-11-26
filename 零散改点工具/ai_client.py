@@ -22,14 +22,43 @@ from security_utils import (
 MAX_API_RESP_BYTES = 10 * 1024 * 1024  # 10 MB upper bound for JSON API responses
 
 SUPPORTED_MODELS = [
-    ("Gemini 3.5 Flash Lite (推荐·均衡快速)", "gemini-3.5-flash-lite"),
-    ("Gemini 3.1 Flash Lite (极速·超低成本)", "gemini-3.1-flash-lite"),
+    ("Gemini 3.5 Flash-Lite (推荐·极速高性价比) [gemini-3.5-flash-lite]", "gemini-3.5-flash-lite"),
+    ("Gemini 3.6 Flash (新一代主力·高速均衡) [gemini-3.6-flash]", "gemini-3.6-flash"),
+    ("Gemini 3.8 Flash (高阶推理·稳定版) [gemini-3.8-flash]", "gemini-3.8-flash"),
+    ("Gemini 3.5 Flash (通用均衡) [gemini-3.5-flash]", "gemini-3.5-flash"),
+    ("Gemini 3.1 Flash-Lite (超低成本) [gemini-3.1-flash-lite]", "gemini-3.1-flash-lite"),
+    ("Gemini 3.1 Pro Preview (复杂深度推理) [gemini-3.1-pro-preview]", "gemini-3.1-pro-preview"),
+    ("Gemini 4 Hydrogen (Gemini 4 极速轻量) [gemini-4-hydrogen]", "gemini-4-hydrogen"),
+    ("Gemini 4 Argon (Gemini 4 高效推理) [gemini-4-argon]", "gemini-4-argon"),
+    ("Gemini 4 Neon (Gemini 4 旗舰高速) [gemini-4-neon]", "gemini-4-neon"),
+    ("Gemini 4 Carbon (Gemini 4 最强推理) [gemini-4-carbon]", "gemini-4-carbon"),
+    ("Gemini 2.5 Flash (经典兼容版) [gemini-2.5-flash]", "gemini-2.5-flash"),
+    ("Gemini 2.5 Pro (经典深度版) [gemini-2.5-pro]", "gemini-2.5-pro"),
 ]
 
+_BUILTIN_MODEL_LABELS: Dict[str, str] = {mid: disp for disp, mid in SUPPORTED_MODELS}
+_EXCLUDED_MODEL_SUBSTRINGS = (
+    "embedding",
+    "imagen",
+    "veo",
+    "tts",
+    "transcribe",
+    "live",
+    "native-audio",
+    "aqa",
+    "nano-banana",
+    "image",
+    "chirp",
+    "lyria",
+    "robotics",
+    "computer-use",
+    "gemma",
+)
+
 API_MODES = [
-    ("自动识别 (支持混填 Vertex Key 与 Gemini Key)", "auto"),
-    ("Vertex AI API Key", "vertex"),
-    ("Gemini API Key (AI Studio)", "gemini"),
+    ("自动识别 (支持混填 Vertex 收费 Key 与 Gemini Key)", "auto"),
+    ("Vertex AI 收费版 API Key (Google Cloud 计费通道)", "vertex"),
+    ("Gemini API Key (AI Studio 通道)", "gemini"),
 ]
 
 ROTATION_MODES = [
@@ -298,6 +327,177 @@ def _http_post_json(url: str, headers: dict, payload: dict, timeout: int = 90) -
         return json.loads(raw)
 
 
+def _http_get_json(url: str, headers: dict, timeout: int = 30) -> dict:
+    validate_https_endpoint(url)
+    req = urllib.request.Request(url, headers=headers, method="GET")
+    ctx = ssl.create_default_context()
+    ctx.minimum_version = ssl.TLSVersion.TLSv1_2
+    opener = urllib.request.build_opener(
+        urllib.request.HTTPSHandler(context=ctx),
+        _SafeRedirectHandler(),
+    )
+    with opener.open(req, timeout=timeout) as resp:
+        raw_bytes = resp.read(MAX_API_RESP_BYTES + 1)
+        if len(raw_bytes) > MAX_API_RESP_BYTES:
+            raise RuntimeError("API 响应体积超过安全上限 (10 MB)，已中止解析。")
+        return json.loads(raw_bytes.decode("utf-8"))
+
+
+def _is_text_generation_gemini_model(model_id: str, supported_methods: Optional[List[str]] = None) -> bool:
+    mid = (model_id or "").strip().lower()
+    if not mid.startswith("gemini-"):
+        return False
+    if any(ex in mid for ex in _EXCLUDED_MODEL_SUBSTRINGS):
+        return False
+    if supported_methods is not None:
+        methods_low = {str(m).lower() for m in supported_methods}
+        if methods_low and "generatecontent" not in methods_low:
+            return False
+    try:
+        validate_model_id(mid)
+    except ValueError:
+        return False
+    return True
+
+
+def fetch_available_models(
+    raw_keys: Union[str, List[str]],
+    api_mode: str = "auto",
+) -> Tuple[List[Tuple[str, str]], str]:
+    """
+    Dynamically fetch the latest available text/JSON generation models using the configured
+    Gemini API Key and/or Vertex AI Paid API Key, merged cleanly with `SUPPORTED_MODELS`.
+    Returns `(model_pairs_list, human_summary_msg)`.
+    """
+    keys = parse_api_keys(raw_keys)
+    if not keys:
+        raise ValueError("请先在密钥池中粘贴至少 1 个 Gemini 或 Vertex 收费版 API Key，再加载模型列表。")
+
+    discovered: Dict[str, str] = {}  # model_id -> display_name
+    channels_ok: List[str] = []
+    last_err: Optional[Exception] = None
+
+    for k in keys:
+        clean_k = k.strip()
+        try_gemini = api_mode in ("auto", "gemini")
+        try_vertex = api_mode in ("auto", "vertex")
+
+        if try_gemini:
+            try:
+                res = _http_get_json(
+                    "https://generativelanguage.googleapis.com/v1beta/models?pageSize=200",
+                    headers={"x-goog-api-key": clean_k},
+                    timeout=20,
+                )
+                for m_obj in res.get("models") or []:
+                    raw_name = str(m_obj.get("name") or "").strip()
+                    mid = raw_name.split("/")[-1].strip()
+                    methods = m_obj.get("supportedGenerationMethods")
+                    if _is_text_generation_gemini_model(mid, methods if isinstance(methods, list) else None):
+                        disp_title = str(m_obj.get("displayName") or mid).strip()
+                        discovered.setdefault(mid, disp_title)
+                if "Gemini API" not in channels_ok:
+                    channels_ok.append("Gemini API")
+            except Exception as ex:
+                last_err = ex
+
+        if try_vertex:
+            vertex_listed = False
+            for ver_seg in ("v1beta1", "v1"):
+                try:
+                    res_v = _http_get_json(
+                        f"https://aiplatform.googleapis.com/{ver_seg}/publishers/google/models?pageSize=200",
+                        headers={"x-goog-api-key": clean_k},
+                        timeout=20,
+                    )
+                    items_v = res_v.get("models") or res_v.get("publisherModels") or []
+                    for m_obj in items_v:
+                        raw_name = str(m_obj.get("name") or "").strip()
+                        mid = raw_name.split("/")[-1].strip()
+                        if _is_text_generation_gemini_model(mid):
+                            disp_title = str(m_obj.get("displayName") or mid).strip()
+                            discovered.setdefault(mid, disp_title)
+                    vertex_listed = True
+                    if "Vertex AI 收费通道" not in channels_ok:
+                        channels_ok.append("Vertex AI 收费通道")
+                    break
+                except Exception as ex_v:
+                    last_err = ex_v
+
+            # Vertex Express / Paid API keys sometimes restrict publisher catalog GET while allowing `:generateContent` POST!
+            if not vertex_listed:
+                try:
+                    _call_single_key_once(
+                        key=clean_k,
+                        safe_model="gemini-2.5-flash",
+                        quoted_model="gemini-2.5-flash",
+                        system_instruction='Return JSON {"ok": true}.',
+                        user_prompt="ping",
+                        json_schema=None,
+                        api_mode="vertex",
+                    )
+                    if "Vertex AI 收费通道" not in channels_ok:
+                        channels_ok.append("Vertex AI 收费通道")
+                    for disp_b, mid_b in SUPPORTED_MODELS:
+                        discovered.setdefault(mid_b, disp_b)
+                except Exception as ex_probe:
+                    # Also probe gemini-3.5-flash-lite on Vertex in case 2.5-flash is disabled
+                    try:
+                        _call_single_key_once(
+                            key=clean_k,
+                            safe_model="gemini-3.5-flash-lite",
+                            quoted_model="gemini-3.5-flash-lite",
+                            system_instruction='Return JSON {"ok": true}.',
+                            user_prompt="ping",
+                            json_schema=None,
+                            api_mode="vertex",
+                        )
+                        if "Vertex AI 收费通道" not in channels_ok:
+                            channels_ok.append("Vertex AI 收费通道")
+                        for disp_b, mid_b in SUPPORTED_MODELS:
+                            discovered.setdefault(mid_b, disp_b)
+                    except Exception:
+                        last_err = last_err or ex_probe
+
+        if discovered and len(channels_ok) >= (2 if api_mode == "auto" else 1):
+            break
+
+    if not discovered and not channels_ok:
+        raise RuntimeError(format_friendly_api_error(last_err or "未能加载模型列表，请检查 API Key 与通道设置。", total_keys=len(keys)))
+
+    # Order models: curated built-in top recommendations first (if supported/merged), then newly discovered live models sorted newest-first!
+    merged_out: List[Tuple[str, str]] = []
+    seen_ids = set()
+
+    for disp_b, mid_b in SUPPORTED_MODELS:
+        if mid_b in discovered or "Vertex AI 收费通道" in channels_ok:
+            merged_out.append((disp_b, mid_b))
+            seen_ids.add(mid_b)
+
+    extra_ids = sorted(
+        (m for m in discovered.keys() if m not in seen_ids),
+        key=lambda x: x,
+        reverse=True,
+    )
+    for mid in extra_ids:
+        if mid in _BUILTIN_MODEL_LABELS:
+            merged_out.append((_BUILTIN_MODEL_LABELS[mid], mid))
+        else:
+            disp_t = discovered[mid]
+            lbl = f"{disp_t} [{mid}]" if mid.lower() not in disp_t.lower() else f"{mid}"
+            merged_out.append((lbl, mid))
+        seen_ids.add(mid)
+
+    # Always keep built-in fallbacks accessible at the bottom if not already present
+    for disp_b, mid_b in SUPPORTED_MODELS:
+        if mid_b not in seen_ids:
+            merged_out.append((disp_b, mid_b))
+            seen_ids.add(mid_b)
+
+    ch_str = " / ".join(channels_ok) if channels_ok else "默认通道"
+    return merged_out, f"已从 {ch_str} 成功加载 {len(merged_out)} 个可选模型！"
+
+
 def _call_single_key_once(
     key: str,
     safe_model: str,
@@ -307,7 +507,7 @@ def _call_single_key_once(
     json_schema: Optional[dict],
     api_mode: str,
 ) -> tuple[dict, str]:
-    """Attempt one logical call with a single key (trying alternate backend only when api_mode=='auto')."""
+    """Attempt one logical call with a single key (seamlessly supporting both Paid Vertex AI API keys and Gemini API keys)."""
     clean_k = (key or "").strip()
     primary = _resolve_backend(clean_k, api_mode)
     backends = [primary]
@@ -325,7 +525,6 @@ def _call_single_key_once(
         adapted_schema = _adapt_schema_for_backend(json_schema, backend)
         try:
             if backend == "vertex":
-                url = f"https://aiplatform.googleapis.com/v1beta1/publishers/google/models/{quoted_model}:generateContent"
                 headers = {
                     "Content-Type": "application/json; charset=utf-8",
                     "x-goog-api-key": clean_k,
@@ -341,42 +540,88 @@ def _call_single_key_once(
                     "contents": [{"role": "user", "parts": [{"text": user_prompt}]}],
                     "generationConfig": gen_cfg,
                 }
-                res = _http_post_json(url, headers, payload)
-                cands = res.get("candidates") or []
+                # Try GA paid endpoint (`v1`) first, falling back to `v1beta1` if model is preview-only (`404`)
+                res = None
+                for ver_seg in ("v1", "v1beta1"):
+                    url = f"https://aiplatform.googleapis.com/{ver_seg}/publishers/google/models/{quoted_model}:generateContent"
+                    try:
+                        res = _http_post_json(url, headers, payload)
+                        break
+                    except urllib.error.HTTPError as v_he:
+                        if v_he.code == 404 and ver_seg == "v1":
+                            try:
+                                v_he.close()
+                            except Exception:
+                                pass
+                            continue
+                        raise
+                cands = (res or {}).get("candidates") or []
                 if not cands:
-                    block_reason = res.get("promptFeedback", {}).get("blockReason", "EMPTY_CANDIDATES")
+                    block_reason = (res or {}).get("promptFeedback", {}).get("blockReason", "EMPTY_CANDIDATES")
                     raise RuntimeError(f"Vertex AI 未返回有效候选结果 ({block_reason})。")
                 parts = cands[0].get("content", {}).get("parts", [])
                 text = "".join(p.get("text", "") for p in parts if "text" in p).strip()
             else:
-                url = "https://generativelanguage.googleapis.com/v1beta/interactions"
-                headers = {
+                headers_std = {
                     "Content-Type": "application/json; charset=utf-8",
                     "x-goog-api-key": clean_k,
-                    "Api-Revision": "2026-05-20",
                 }
-                payload = {
-                    "model": safe_model,
-                    "store": False,
-                    "system_instruction": system_instruction,
-                    "input": user_prompt,
-                    "generation_config": {"temperature": 0.1},
+                gen_cfg_g = {
+                    "temperature": 0.1,
+                    "responseMimeType": "application/json",
                 }
                 if adapted_schema:
-                    payload["response_format"] = {
-                        "type": "text",
-                        "mime_type": "application/json",
-                        "schema": adapted_schema,
+                    gen_cfg_g["responseSchema"] = adapted_schema
+                payload_std = {
+                    "systemInstruction": {"parts": [{"text": system_instruction}]},
+                    "contents": [{"role": "user", "parts": [{"text": user_prompt}]}],
+                    "generationConfig": gen_cfg_g,
+                }
+                try:
+                    url_std = f"https://generativelanguage.googleapis.com/v1beta/models/{quoted_model}:generateContent"
+                    res = _http_post_json(url_std, headers_std, payload_std)
+                    cands_g = res.get("candidates") or []
+                    if not cands_g:
+                        block_reason = res.get("promptFeedback", {}).get("blockReason", "EMPTY_CANDIDATES")
+                        raise RuntimeError(f"Gemini API 未返回有效候选结果 ({block_reason})。")
+                    parts_g = cands_g[0].get("content", {}).get("parts", [])
+                    text = "".join(p.get("text", "") for p in parts_g if "text" in p).strip()
+                except urllib.error.HTTPError as g_he:
+                    if g_he.code != 404:
+                        raise
+                    try:
+                        g_he.close()
+                    except Exception:
+                        pass
+                    # Fallback to Interactions API for interaction-only preview endpoints
+                    url_int = "https://generativelanguage.googleapis.com/v1beta/interactions"
+                    headers_int = {
+                        "Content-Type": "application/json; charset=utf-8",
+                        "x-goog-api-key": clean_k,
+                        "Api-Revision": "2026-05-20",
                     }
-                res = _http_post_json(url, headers, payload)
-                steps = res.get("steps") or []
-                text_chunks = []
-                for st in steps:
-                    if st.get("type") == "model_output":
-                        for c in st.get("content") or []:
-                            if c.get("type") == "text":
-                                text_chunks.append(c.get("text", ""))
-                text = "".join(text_chunks).strip() or res.get("output_text", "").strip()
+                    payload_int = {
+                        "model": safe_model,
+                        "store": False,
+                        "system_instruction": system_instruction,
+                        "input": user_prompt,
+                        "generation_config": {"temperature": 0.1},
+                    }
+                    if adapted_schema:
+                        payload_int["response_format"] = {
+                            "type": "text",
+                            "mime_type": "application/json",
+                            "schema": adapted_schema,
+                        }
+                    res = _http_post_json(url_int, headers_int, payload_int)
+                    steps = res.get("steps") or []
+                    text_chunks = []
+                    for st in steps:
+                        if st.get("type") == "model_output":
+                            for c in st.get("content") or []:
+                                if c.get("type") == "text":
+                                    text_chunks.append(c.get("text", ""))
+                    text = "".join(text_chunks).strip() or res.get("output_text", "").strip()
 
             return _extract_json_obj(text), backend
 
@@ -402,21 +647,12 @@ def _call_single_key_once(
                 last_code = he.code
                 last_err = cur_err
 
-                # Standard AIza key rejected as outright invalid by Gemini need not probe Vertex (which returns false OAuth2 401)
-                low_msg = safe_msg.lower()
-                if (
-                    api_mode == "auto"
-                    and primary == "gemini"
-                    and clean_k.startswith("AIza")
-                    and ("api_key_invalid" in low_msg or "api key not valid" in low_msg)
-                ):
-                    break
-
+                # IMPORTANT: Paid Google Cloud Vertex AI API keys often start with `AIza...` and are restricted
+                # to `aiplatform.googleapis.com` (returning 400/403 on `generativelanguage.googleapis.com`),
+                # so ALWAYS probe the alternate backend in `auto` mode on 400/401/403/404!
                 if he.code in (400, 401, 403, 404) and api_mode == "auto" and len(backends) > 1:
                     continue
             else:
-                # Alternate backend failed: never overwrite primary's error with a misleading Vertex OAuth2/API-key auth mismatch,
-                # and keep primary's error when primary had no auth-scheme mismatch and alternate also rejected auth (400/401/403/404).
                 if is_mismatch or (not primary_mismatch and he.code in (400, 401, 403, 404)):
                     last_code = primary_code
                     last_err = primary_err
@@ -595,7 +831,7 @@ def test_all_api_keys(
                 json_schema=schema,
                 api_mode=api_mode,
             )
-            ch_label = "Vertex AI Express" if used_backend == "vertex" else "Gemini Developer API"
+            ch_label = "Vertex AI 收费通道" if used_backend == "vertex" else "Gemini API 通道"
             item = {
                 "index": idx,
                 "key": k,
@@ -1038,6 +1274,20 @@ def _word_ratio_in_box(en_text: str, box_s: int, box_e: int, c_start: int, c_end
             r1 = (hit_indices[-1] + 1) / len(box_words)
             return r0, r1, span_words, len(box_words)
 
+    cjk_units = list(re.finditer(r"[\u3400-\u4dbf\u4e00-\u9fff]|[A-Za-z0-9]+", box_slice))
+    if len(cjk_units) >= 2:
+        hit_cjk = [
+            idx for idx, m in enumerate(cjk_units)
+            if max(box_s + m.start(), rel_cs) < min(box_s + m.end(), rel_ce)
+        ]
+        sp_cjk = len(re.findall(r"[\u3400-\u4dbf\u4e00-\u9fff]|[A-Za-z0-9]+", en_text[rel_cs:rel_ce]))
+        est_sp_w = max(1, round(sp_cjk * 0.55)) if sp_cjk > 0 else 0
+        est_box_w = max(1, round(len(cjk_units) * 0.55))
+        if hit_cjk:
+            r0 = hit_cjk[0] / len(cjk_units)
+            r1 = (hit_cjk[-1] + 1) / len(cjk_units)
+            return r0, r1, est_sp_w, est_box_w
+
     box_len = max(1, box_e - box_s)
     r0 = max(0.0, min(1.0, (rel_cs - box_s) / box_len))
     r1 = max(r0, min(1.0, (rel_ce - box_s) / box_len))
@@ -1074,13 +1324,14 @@ def local_align_col3_spans(
         en_positions.append((cs, ce))
         en_cur = max(en_cur, ce)
 
-    # 2. Split `en_full` and `col3_text` into sentence ranges
-    en_sents = _split_sentences_ranges(en_full, is_english=True, include_semi_colon=False)
+    # 2. Split `en_full` and `col3_text` into sentence ranges (supporting both English and 2-col Chinese source)
+    src_is_en = not bool(re.search(r"[\u3400-\u4dbf\u4e00-\u9fff]", en_full))
+    en_sents = _split_sentences_ranges(en_full, is_english=src_is_en, include_semi_colon=False)
     for_sents = _split_sentences_ranges(col3_text, is_english=False, include_semi_colon=False)
 
     # If primary sentence counts differ by >1, check whether splitting at `;:` aligns sentence boundaries better
     if abs(len(en_sents) - len(for_sents)) > 1:
-        en_semi = _split_sentences_ranges(en_full, is_english=True, include_semi_colon=True)
+        en_semi = _split_sentences_ranges(en_full, is_english=src_is_en, include_semi_colon=True)
         for_semi = _split_sentences_ranges(col3_text, is_english=False, include_semi_colon=True)
         if abs(len(en_semi) - len(for_semi)) < abs(len(en_sents) - len(for_sents)):
             en_sents, for_sents = en_semi, for_semi
@@ -1176,7 +1427,7 @@ def local_align_col3_spans(
             en_box_s, en_box_e = en_sent_s, en_sent_e
             for_box_s, for_box_e = for_sent_s, for_sent_e
 
-            en_clauses = _split_clauses_ranges(en_full, en_sent_s, en_sent_e, is_english=True)
+            en_clauses = _split_clauses_ranges(en_full, en_sent_s, en_sent_e, is_english=src_is_en)
             for_clauses = _split_clauses_ranges(col3_text, for_sent_s, for_sent_e, is_english=False)
 
             used_whole_clause = False
@@ -1912,13 +2163,15 @@ def local_align_col1_spans(
 # ---------------- Step 1 & Step 2 Multi-Threaded Evaluators with Seamless Local Fallback ----------------
 
 STEP1_SYS_PROMPT = """你是专业的多语种文稿修订分级专家。
-对于给定的每个英文修订句（包含 sent_id、heuristic_suggested、change_ratio、edit_hunks、new_words、diff_preview），请严格判定它属于：
-- "yellow"（UP 局部改点）：局部词汇替换、短语/习语改写、局部增删词句、标点/引号微调，或半句话改动而另一半句完整未变（连续 6 词以上未改动），译者可在原句上直接局部修改；
-- "cyan"（RV 整句重翻）：句子主干与结构被大幅推倒改写、全句被打得零碎（例如改动词数占比 change_ratio >= 0.58 且没有完整的长分句保留），译者已无法在原句局部修补，需要整句重翻。
+对于给定的每个修订句（包含 sent_id、heuristic_suggested、change_ratio、edit_hunks、new_words、diff_preview），请严格按以下业务规则判定它属于 "yellow"（UP 局部改点）还是 "cyan"（RV 整句重翻）：
 
-【核心硬性边界规则（务必严格遵守）】：
-1. 若整句改动量很大（例如 `change_ratio >= 0.58` 且全句被打断成多处增删、没有连续 6 词以上未改动的完整分句，即使仍散落保留了 `go through`、`things`、`written` 等少量零星旧词），**必须判为 "cyan"（RV 整句重翻），绝不能再标为 "yellow"**！
-2. 若只是零星替换个别词汇/短语（例如 `change_ratio < 0.35`），或**仅半句话改动较大、另一半句完整保留未变**（例如 `as far as man is concerned` -> `when it comes to man`，后半句连续多词完全未变），**一律判为 "yellow"（UP 局部改点），绝不能因为整段里零星小改点数量多就把轻度修改句判为 "cyan"**！
+【三大核心量化准则（务必严格遵守）】：
+1. **远距局部小改 -> 判为 "yellow"（UP 局部改点）**：
+   - 同一段落中各处改点彼此相隔较远（如相隔五六行以上），且每处修改内容较少（仅涉及两三行以内，如替换个别词汇/同义短语、微调连词或句尾单个短语，例如 `The`->`This`、`represent`->`are`、`comes from having experienced it`->`is always gained in experience`），句子整体骨架清晰完整，译者可直接局部修改，无须重翻整句！
+2. **长句连续改写 / 句式重构 -> 判为 "cyan"（RV 整句重翻）**：
+   - 若修改内容涉及连续较长的句子（超过四五行，如 `new_words >= 42` 且有多处结构改写或增删 >= 12 词），或单句内句式骨架被重构（如改动比例 `change_ratio >= 0.36` 且改动 >= 6 词、或分号 `;` 后半句/前半句整套句型推倒重写），**必须将改点所在的整个完整句子判为 "cyan"**（重翻必须是完整的一整句话，绝不能从逗号或分号开始）！
+3. **同段高频近距改点 -> 集中区段判为 "cyan"（RV 整句重翻）**：
+   - 若同一段落中需要修改的内容出现频繁、各处改点间隔很短（仅一两行），导致连续多句话句式都在调整（`heuristic_suggested` 已提示 `"cyan"`），请将该集中区段的完整句子统一判为 `"cyan"`，避免黄青交错或满屏散乱碎片。
 
 请严格输出 JSON：{"items": [{"sent_id": "...", "decision": "yellow" 或 "cyan"}]}。"""
 
@@ -2273,21 +2526,24 @@ def align_step2_spans(
 
     pool = _build_optional_pool(api_key, rotation_mode=rotation_mode) if enable_ai else None
     total_rows = len(row_tasks)
-    any_col1 = any(bool((rt.get("col1_text") or "").strip()) for rt in row_tasks)
+    any_col1 = any(
+        bool((rt.get("col1_text") or "").strip()) and not bool(rt.get("bilingual_2col"))
+        for rt in row_tasks
+    )
 
     if not enable_ai or pool is None:
         stats["used_local_fallback"] = True
         if enable_ai and pool is None:
             stats["fallback_reason"] = "未填写 API Key"
         if log_fn:
-            col_desc = "第 1 列中文与第 3 列外文" if any_col1 else "第 3 列外文"
+            col_desc = "第 1 列中文与第 3 列外文" if any_col1 else "外文列"
             log_fn(f"  ℹ️ 同步标色：使用「本地位置估算模式」对齐共 {total_rows} 行{col_desc}高亮...")
         for r_i, rt in enumerate(row_tasks):
             col1_text = rt.get("col1_text", "")
             col3_text = rt.get("col3_text", "")
             old_en_full = rt.get("old_en_full", "")
             spans = rt.get("spans", [])
-            has_col1 = bool(col1_text and col1_text.strip())
+            has_col1 = bool(col1_text and col1_text.strip()) and not bool(rt.get("bilingual_2col"))
 
             col3_map = local_align_col3_spans(
                 col3_text=col3_text,
@@ -2387,7 +2643,7 @@ def align_step2_spans(
         col3_text = rt.get("col3_text", "")
         old_en_full = rt.get("old_en_full", "")
         spans = rt.get("spans", [])
-        has_col1 = bool(col1_text and col1_text.strip())
+        has_col1 = bool(col1_text and col1_text.strip()) and not bool(rt.get("bilingual_2col"))
         has_col3 = bool(col3_text and col3_text.strip())
         row_align: Dict[str, Union[str, Dict[str, str]]] = {}
 
