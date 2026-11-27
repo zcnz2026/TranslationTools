@@ -129,7 +129,7 @@ try:
 except ImportError:
     _updater_mod = None
 
-RAW_APP_VERSION = "1.9.7"
+RAW_APP_VERSION = "1.9.8"
 APP_VERSION = f"v{RAW_APP_VERSION}"
 check_for_updates = getattr(_updater_mod, "check_for_updates", None)
 download_and_apply_update = getattr(_updater_mod, "download_and_apply_update", None)
@@ -6952,8 +6952,8 @@ def _run_frozen_self_test() -> int:
     from ai_client import format_friendly_api_error as _ai_friendly_err
     from ai_client import local_align_col3_spans
 
-    if RAW_APP_VERSION != "1.9.7":
-        raise RuntimeError(f"RAW_APP_VERSION expected '1.9.7', got {RAW_APP_VERSION!r}")
+    if RAW_APP_VERSION != "1.9.8":
+        raise RuntimeError(f"RAW_APP_VERSION expected '1.9.8', got {RAW_APP_VERSION!r}")
 
     is_frozen = bool(getattr(sys, "frozen", False))
     if is_frozen and hasattr(sys, "_MEIPASS"):
@@ -6963,6 +6963,7 @@ def _run_frozen_self_test() -> int:
 
     if not callable(getattr(library_index, "ensure_library_index", None)):
         raise RuntimeError("library_index.ensure_library_index missing in self-test")
+    _ = library_index._resolve_cache_path(Path.cwd())
 
     cfg = docx_xml_utils.load_config()
     if cfg.get("col2_up_highlight") != "yellow" or not cfg.get("language_code_map"):
@@ -7121,9 +7122,10 @@ def _run_frozen_self_test() -> int:
             raise RuntimeError("pipeline.resolve_sc1_input_docx_list missing in self-test")
 
         upd_ver = str(getattr(_upd_test, "APP_VERSION", "")).lstrip("vV")
-        expected_vers = ("1.9.7",) if require_v18_siblings else ("1.7.0", "1.8.0", "1.8.1", "1.9.0", "1.9.1", "1.9.2", "1.9.3", "1.9.4", "1.9.5", "1.9.6", "1.9.7")
+        expected_vers = ("1.9.8",) if require_v18_siblings else ("1.7.0", "1.8.0", "1.8.1", "1.9.0", "1.9.1", "1.9.2", "1.9.3", "1.9.4", "1.9.5", "1.9.6", "1.9.7", "1.9.8")
         if upd_ver not in expected_vers:
             raise RuntimeError(f"updater.APP_VERSION mismatch: {getattr(_upd_test, 'APP_VERSION', None)!r}")
+        _ = _fap_test._resolve_master_cache_path(Path.cwd())
         plat_fn = getattr(_upd_test, "get_platform_zip_asset_name", None)
         if not callable(plat_fn):
             raise RuntimeError("updater.get_platform_zip_asset_name missing in self-test")

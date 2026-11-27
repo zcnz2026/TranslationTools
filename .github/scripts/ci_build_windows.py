@@ -48,7 +48,11 @@ def main() -> None:
         if SECRET_RX.search(txt):
             raise RuntimeError(f"Hardcoded secret pattern detected in {pf.name}!")
     # Verify all module imports & type annotations resolve cleanly (prevents Python 3.13 vs 3.14+ PEP 649 drift)
+    import builtins
     import inspect
+    import symtable
+
+    builtin_set = set(dir(builtins))
     sys.path.insert(0, str(tool_dir))
     sys.path.insert(0, str(skill_scripts_dir))
     ann_lib = None
@@ -59,6 +63,27 @@ def main() -> None:
         pass
     for pf in py_files:
         mod = __import__(pf.stem)
+        mod_globals = set(mod.__dict__.keys()) | builtin_set
+        st_top = symtable.symtable(pf.read_text(encoding="utf-8"), str(pf), "exec")
+
+        def _check_symtable(tbl, enclosing_defs):
+            local_defs = set(enclosing_defs)
+            for sym in tbl.get_symbols():
+                if sym.is_local() or sym.is_parameter() or sym.is_imported() or sym.is_declared_global():
+                    if not sym.is_declared_global():
+                        local_defs.add(sym.get_name())
+            if tbl.get_type() == "function":
+                for sym in tbl.get_symbols():
+                    nm = sym.get_name()
+                    if sym.is_global() and sym.is_referenced() and nm not in mod_globals and nm not in local_defs:
+                        raise RuntimeError(
+                            f"Undefined global symbol {nm!r} in {pf.name}:{tbl.get_name()} (line {tbl.get_lineno()})"
+                        )
+            next_defs = local_defs if tbl.get_type() == "function" else enclosing_defs
+            for child in tbl.get_children():
+                _check_symtable(child, next_defs)
+
+        _check_symtable(st_top, set())
         if ann_lib is not None:
             for _, obj in inspect.getmembers(mod):
                 if inspect.isfunction(obj) or inspect.isclass(obj):
@@ -199,13 +224,15 @@ def main() -> None:
     (art_dir / "SHA256SUMS.txt").write_text(sums_txt, encoding="utf-8")
 
     notes_md = (
-        "## 多语种改点与分part稿自动整理工具 v1.9.7 (Windows & macOS 双平台免安装版)\n\n"
+        "## 多语种改点与分part稿自动整理工具 v1.9.8 (Windows & macOS 双平台免安装版)\n\n"
         "### 📥 下载与运行指引（按电脑系统选择对应压缩包）\n"
         "- **Windows 电脑 (`x64`)**：下载 `ScatteredRevisionTool-Windows-x64.zip`，解压后直接双击 `零散改点整理工具.exe` 即可运行。\n"
         "- **Mac 电脑 — Apple M1 / M2 / M3 / M4 芯片 (`arm64`)**：下载 `ScatteredRevisionTool-macOS-arm64.zip`，解压后打开 `零散改点整理工具.app`（建议拖入「应用程序 / Applications」文件夹使用）。\n"
         "- **Mac 电脑 — Intel 芯片旧款机型 (`x64`)**：下载 `ScatteredRevisionTool-macOS-x64.zip`，解压后打开 `零散改点整理工具.app`。\n"
         "- **💡 Mac 首次打开提示**：由于未绑定付费 Apple 企业公证证书，首次在 Mac 打开若弹出「无法验证开发者 / 未打开」提示，请**按住 `Control` 右键点击 `零散改点整理工具.app` → 选择「打开」**（或在 `系统设置 → 隐私与安全性` 底部点击「仍要打开」，亦可在终端执行一次 `xattr -cr \"零散改点整理工具.app\"`），之后即可正常双击启动与在线自动更新。\n"
-        "- **⚠️ 升级说明**：Windows 端已在 `v1.9.1`～`v1.9.6` 的用户，直接在软件内点击「立即更新」即可一键自动升级重启至 `v1.9.7`！Mac 端从 `v1.9.7` 起同样内置一键 SHA-256 校验自动更新。\n\n"
+        "- **⚠️ 升级说明**：Windows 端与 Mac 端用户直接在软件左下角点击「检查软件更新 → 立即更新」即可一键自动升级重启至 `v1.9.8`！\n\n"
+        "- **v1.9.8 紧急修复内容**：\n"
+        "  - **修复总库索引缓存路径解析 `name 'sys' is not defined` 报错**：补齐 `library_index.py` 的 `import sys`（修复 v1.9.7 执行零散改点/全篇改点扫描总库时的异常），并在 CI 打包流水线中新增全函数级 `symtable` 未定义全局变量静态阻断检查。\n"
         "- **v1.9.7 新增内容（正式新增原生 macOS 双架构版本）**：\n"
         "  - **新增原生 macOS 桌面客户端（同时提供 Apple Silicon `arm64` 与 Intel `x64` 独立应用包）**：完整支持全部六大核心工作台（零散改点整理、全篇改点整理、改点稿查重、3A/3B 改点入库与通读定稿、英文字数统计、分part稿整理/合并）及系统设置；\n"
         "  - **针对 macOS Aqua 深度适配字体、按钮渲染、拖拽与安全密钥存储**：自动采用苹方（`PingFang SC`）/ `Menlo` 高清字体比例，修复 macOS 原生按钮白底白字不可见问题，支持 Finder 文件/文件夹拖入，个人配置与加密 API 密钥安全独立存放于 `~/Library/Application Support/ScatteredRevisionTool/`（保持 `.app` 签名完整且升级绝不丢失配置），并支持 Mac 端一键自动更新替换 `.app`。\n"

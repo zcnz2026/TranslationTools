@@ -207,6 +207,10 @@ def load_config():
     if env_lp:
         lang_json_candidates.append(Path(env_lp))
     if getattr(sys, "frozen", False):
+        if sys.platform == "darwin":
+            lang_json_candidates.append(
+                Path.home() / "Library" / "Application Support" / "ScatteredRevisionTool" / "languages.json"
+            )
         lang_json_candidates.append(Path(sys.executable).resolve().parent / "languages.json")
     lang_json_candidates.append(Path(__file__).resolve().parent.parent.parent.parent.parent / "零散改点工具" / "languages.json")
     lang_json_candidates.append(Path(__file__).resolve().parent.parent / "resources" / "languages.json")

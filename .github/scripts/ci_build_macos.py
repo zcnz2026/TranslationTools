@@ -10,7 +10,7 @@ import shutil
 import subprocess
 import sys
 
-APP_VERSION = "1.9.7"
+APP_VERSION = "1.9.8"
 TOOL_DIR_NAME = "\u96f6\u6563\u6539\u70b9\u5de5\u5177"  # 零散改点工具
 APP_BUNDLE_FINAL_NAME = "\u96f6\u6563\u6539\u70b9\u6574\u7406\u5de5\u5177.app"  # 零散改点整理工具.app
 DOC_MANUAL_NAME = "\u4f7f\u7528\u8bf4\u660e.md"  # 使用说明.md
@@ -78,8 +78,11 @@ def main() -> None:
         if SECRET_RX.search(txt):
             raise RuntimeError(f"Hardcoded secret pattern detected in {pf.name}!")
 
+    import builtins
     import inspect
+    import symtable
 
+    builtin_set = set(dir(builtins))
     sys.path.insert(0, str(tool_dir))
     sys.path.insert(0, str(skill_scripts_dir))
     ann_lib = None
@@ -91,6 +94,27 @@ def main() -> None:
         pass
     for pf in py_files:
         mod = __import__(pf.stem)
+        mod_globals = set(mod.__dict__.keys()) | builtin_set
+        st_top = symtable.symtable(pf.read_text(encoding="utf-8"), str(pf), "exec")
+
+        def _check_symtable(tbl, enclosing_defs):
+            local_defs = set(enclosing_defs)
+            for sym in tbl.get_symbols():
+                if sym.is_local() or sym.is_parameter() or sym.is_imported() or sym.is_declared_global():
+                    if not sym.is_declared_global():
+                        local_defs.add(sym.get_name())
+            if tbl.get_type() == "function":
+                for sym in tbl.get_symbols():
+                    nm = sym.get_name()
+                    if sym.is_global() and sym.is_referenced() and nm not in mod_globals and nm not in local_defs:
+                        raise RuntimeError(
+                            f"Undefined global symbol {nm!r} in {pf.name}:{tbl.get_name()} (line {tbl.get_lineno()})"
+                        )
+            next_defs = local_defs if tbl.get_type() == "function" else enclosing_defs
+            for child in tbl.get_children():
+                _check_symtable(child, next_defs)
+
+        _check_symtable(st_top, set())
         if ann_lib is not None:
             for _, obj in inspect.getmembers(mod):
                 if inspect.isfunction(obj) or inspect.isclass(obj):
