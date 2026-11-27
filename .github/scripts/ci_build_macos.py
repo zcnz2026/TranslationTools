@@ -94,8 +94,9 @@ def main() -> None:
         pass
     for pf in py_files:
         mod = __import__(pf.stem)
-        mod_globals = set(mod.__dict__.keys()) | builtin_set
         st_top = symtable.symtable(pf.read_text(encoding="utf-8"), str(pf), "exec")
+        top_defined = {s.get_name() for s in st_top.get_symbols() if s.is_local() or s.is_imported()}
+        mod_globals = set(mod.__dict__.keys()) | top_defined | builtin_set
 
         def _check_symtable(tbl, enclosing_defs):
             local_defs = set(enclosing_defs)
