@@ -267,8 +267,11 @@ def _resolve_master_cache_path(resolved_master_dir: Path) -> Path:
     norm_key = os.path.normcase(str(resolved_master_dir))
     sha1_hex = hashlib.sha1(norm_key.encode("utf-8")).hexdigest()
     fname = f"master_articles_{sha1_hex}.json"
-    local_app = os.environ.get("LOCALAPPDATA", "").strip()
-    base = (Path(local_app) / "ScatteredRevisionTool") if local_app else (Path(tempfile.gettempdir()) / "ScatteredRevisionTool")
+    if sys.platform == "darwin":
+        base = Path.home() / "Library" / "Application Support" / "ScatteredRevisionTool"
+    else:
+        local_app = os.environ.get("LOCALAPPDATA", "").strip()
+        base = (Path(local_app) / "ScatteredRevisionTool") if local_app else (Path(tempfile.gettempdir()) / "ScatteredRevisionTool")
     try:
         base.mkdir(parents=True, exist_ok=True)
         return base / fname

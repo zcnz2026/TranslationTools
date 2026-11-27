@@ -7,12 +7,28 @@ calls inside the raw Win32 WndProc callback, which would corrupt _tkinter's GIL 
 """
 
 import ctypes
-from ctypes import wintypes
 from pathlib import Path
 import queue
 import sys
 import tkinter as tk
 from typing import Callable, List, Optional, Tuple
+
+if sys.platform == "win32":
+    from ctypes import wintypes
+else:
+    wintypes = None  # type: ignore[assignment]
+
+
+def create_tk_root() -> tk.Tk:
+    """Create a Tk root window, enabling native Finder/X11 drag-and-drop via tkinterdnd2 when available."""
+    if sys.platform != "win32":
+        try:
+            from tkinterdnd2 import TkinterDnD  # type: ignore[import-not-found]
+
+            return TkinterDnD.Tk()
+        except Exception:
+            pass
+    return tk.Tk()
 
 
 WM_DROPFILES = 0x0233
@@ -126,9 +142,19 @@ class WinFileDropManager:
         self._targets.append((widget, callback))
 
     def install(self) -> bool:
-        """Install WM_DROPFILES hook on the top-level window. Call before root.mainloop()."""
-        if sys.platform != "win32" or self._hooked:
-            return self._hooked
+        """Install native file drop hook on the top-level window. Call before root.mainloop()."""
+        if self._hooked:
+            return True
+        if sys.platform != "win32":
+            if hasattr(self.root, "drop_target_register") and hasattr(self.root, "dnd_bind"):
+                try:
+                    self.root.drop_target_register("DND_Files")  # type: ignore[attr-defined]
+                    self.root.dnd_bind("<<Drop>>", self._on_tkdnd_drop)  # type: ignore[attr-defined]
+                    self._hooked = True
+                    return True
+                except Exception:
+                    return False
+            return False
 
         self.root.update_idletasks()
         child_hwnd = self.root.winfo_id()
@@ -206,7 +232,10 @@ class WinFileDropManager:
 
     def unhook(self):
         """Restore original WndProc cleanly before window destruction."""
-        if not self._hooked or sys.platform != "win32":
+        if not self._hooked:
+            return
+        if sys.platform != "win32":
+            self._hooked = False
             return
         self._hooked = False
         if self._after_id is not None:
@@ -248,6 +277,18 @@ class WinFileDropManager:
 
         if paths:
             self._drop_queue.put((paths, int(pt.x), int(pt.y)))
+
+    def _on_tkdnd_drop(self, event):
+        try:
+            raw_data = getattr(event, "data", "") or ""
+            if not raw_data:
+                return
+            raw_paths = [str(x) for x in self.root.tk.splitlist(raw_data) if str(x).strip()]
+            sx = int(getattr(event, "x_root", 0) or 0)
+            sy = int(getattr(event, "y_root", 0) or 0)
+            self.dispatch_drop(raw_paths, sx, sy)
+        except Exception:
+            pass
 
     def resolve_callback_for_widget(
         self, widget: Optional[tk.Misc]

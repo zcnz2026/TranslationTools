@@ -107,14 +107,40 @@ def _clone_default_languages() -> List[Dict]:
     return out
 
 
+def _find_macos_app_bundle_parent(exe_path: Path) -> Optional[Path]:
+    """If `exe_path` is inside `.../Foo.app/Contents/MacOS/Bar`, return the folder containing `Foo.app`."""
+    for anc in exe_path.parents:
+        if anc.suffix.lower() == ".app":
+            return anc.parent
+    return None
+
+
 def get_app_base_dir() -> Path:
     if getattr(sys, "frozen", False):
-        return Path(sys.executable).resolve().parent
+        exe_p = Path(sys.executable).resolve()
+        if sys.platform == "darwin":
+            # Never write inside `.app/Contents/` (would invalidate macOS code signature!);
+            # store mutable user config in `~/Library/Application Support/ScatteredRevisionTool/`.
+            app_supp = Path.home() / "Library" / "Application Support" / "ScatteredRevisionTool"
+            try:
+                app_supp.mkdir(parents=True, exist_ok=True)
+                return app_supp
+            except OSError:
+                pass
+        return exe_p.parent
     return Path(__file__).resolve().parent
 
 
 def get_languages_file() -> Path:
-    p = get_app_base_dir() / "languages.json"
+    base_dir = get_app_base_dir()
+    p = base_dir / "languages.json"
+    if not p.exists() and getattr(sys, "frozen", False) and sys.platform == "darwin":
+        outer = _find_macos_app_bundle_parent(Path(sys.executable).resolve())
+        if outer is not None and (outer / "languages.json").is_file():
+            try:
+                p.write_bytes((outer / "languages.json").read_bytes())
+            except OSError:
+                pass
     os.environ["SCATTERED_REV_LANGUAGES_JSON"] = str(p)
     return p
 

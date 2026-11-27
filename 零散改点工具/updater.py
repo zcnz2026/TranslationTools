@@ -2,6 +2,7 @@ import hashlib
 import json
 import os
 from pathlib import Path
+import platform
 import re
 import shutil
 import ssl
@@ -21,13 +22,30 @@ try:
 except ImportError:
     create_secure_update_stagedir = None
 
-APP_VERSION = "1.9.6"
+APP_VERSION = "1.9.7"
 GITHUB_REPO = "zcnz2026/TranslationTools"
 
 ZIP_ASSET_NAME = "ScatteredRevisionTool-Windows-x64.zip"
+MAC_ARM64_ZIP_ASSET_NAME = "ScatteredRevisionTool-macOS-arm64.zip"
+MAC_X64_ZIP_ASSET_NAME = "ScatteredRevisionTool-macOS-x64.zip"
+MAC_APP_BUNDLE_NAME = "零散改点整理工具.app"
 SHA256_ASSET_NAME = "SHA256SUMS.txt"
 EXE_ENTRY_NAME = "零散改点整理工具.exe"
 HELPER_EXE_SUFFIX = "_update_helper.exe"
+
+
+def get_platform_zip_asset_name(
+    sys_platform: Optional[str] = None,
+    machine: Optional[str] = None,
+) -> str:
+    """Return the GitHub Release ZIP asset filename matching the current OS and CPU architecture."""
+    plat = (sys_platform or sys.platform).lower()
+    if plat == "darwin":
+        arch = (machine or platform.machine() or "").strip().lower()
+        if arch in ("arm64", "aarch64"):
+            return MAC_ARM64_ZIP_ASSET_NAME
+        return MAC_X64_ZIP_ASSET_NAME
+    return ZIP_ASSET_NAME
 
 MAX_RELEASE_JSON_BYTES = 2 * 1024 * 1024     # 2 MB upper bound for GitHub release metadata
 MAX_UPDATE_ZIP_BYTES = 250 * 1024 * 1024     # 250 MB upper bound for portable ZIP download
@@ -206,6 +224,7 @@ def check_for_updates(current_version: str = APP_VERSION, timeout: float = 8.0) 
     if html_url:
         validate_github_https_url(html_url)
 
+    target_zip_name = get_platform_zip_asset_name()
     zip_url = ""
     sha256_url = ""
     for asset in data.get("assets") or []:
@@ -219,7 +238,7 @@ def check_for_updates(current_version: str = APP_VERSION, timeout: float = 8.0) 
             validate_github_https_url(dl_url)
         except ValueError:
             continue
-        if aname.lower() == ZIP_ASSET_NAME.lower():
+        if aname.lower() == target_zip_name.lower():
             zip_url = dl_url
         elif aname.lower() == SHA256_ASSET_NAME.lower():
             sha256_url = dl_url
@@ -231,6 +250,7 @@ def check_for_updates(current_version: str = APP_VERSION, timeout: float = 8.0) 
         "latest_version": latest_clean,
         "release_notes": release_notes,
         "html_url": html_url,
+        "asset_name": target_zip_name,
         "zip_url": zip_url,
         "sha256_url": sha256_url,
     }
@@ -406,6 +426,69 @@ def run_finish_update_mode(target_exe_arg: str) -> int:
     return 0
 
 
+def _find_running_macos_app_bundle(exe_path: Path) -> Optional[Path]:
+    """Locate the enclosing `.app` bundle path when running frozen on macOS."""
+    try:
+        resolved = exe_path.resolve()
+    except Exception:
+        resolved = exe_path
+    for p in (resolved, *resolved.parents):
+        if p.name.lower().endswith(".app"):
+            return p
+    return None
+
+
+def _check_macos_app_writable(app_bundle: Path) -> None:
+    s = str(app_bundle)
+    if s.startswith("/Volumes/") or "/AppTranslocation/" in s:
+        raise ValueError(
+            "检测到程序当前在只读磁盘镜像或 macOS 系统隔离临时目录中运行！\n"
+            f"请先将「{MAC_APP_BUNDLE_NAME}」拖入「应用程序 (Applications)」或桌面文件夹后再执行自动更新。"
+        )
+
+
+def _validate_and_extract_macos_app_from_zip(zip_path: Path, stage_dir: Path) -> Path:
+    """Validate macOS ZIP archive safety and extract `零散改点整理工具.app` preserving Mach-O permissions & symlinks."""
+    total_uncompressed = 0
+    max_bundle_bytes = MAX_EXTRACTED_EXE_BYTES * 3
+    with zipfile.ZipFile(zip_path, "r") as zf:
+        for info in zf.infolist():
+            fname = info.filename
+            if "\x00" in fname or fname.startswith(("/", "\\")):
+                raise ValueError(f"更新压缩包含有不安全的路径条目：{fname!r}")
+            parts = fname.replace("\\", "/").split("/")
+            if ".." in parts:
+                raise ValueError(f"检测到 Zip Slip 路径穿越风险，已拦截更新包条目：{fname!r}")
+            if info.file_size < 0 or info.file_size > MAX_EXTRACTED_EXE_BYTES:
+                raise ValueError(f"更新压缩包内文件体积异常：{fname!r}")
+            total_uncompressed += info.file_size
+            if total_uncompressed > max_bundle_bytes:
+                raise ValueError("更新压缩包解压总大小超出安全上限。")
+
+    extract_dir = stage_dir / "mac_extract"
+    extract_dir.mkdir(parents=True, exist_ok=True)
+    subprocess.run(
+        ["/usr/bin/ditto", "-x", "-k", str(zip_path), str(extract_dir)],
+        check=True,
+        timeout=120,
+    )
+
+    staged_app = extract_dir / MAC_APP_BUNDLE_NAME
+    if not staged_app.is_dir():
+        found_apps = list(extract_dir.glob(f"*/{MAC_APP_BUNDLE_NAME}")) + list(extract_dir.glob("*.app"))
+        if found_apps:
+            staged_app = found_apps[0]
+    macos_bin_dir = staged_app / "Contents" / "MacOS"
+    if not staged_app.is_dir() or not macos_bin_dir.is_dir():
+        raise ValueError(f"macOS 更新包中未找到合法的应用程序包：{MAC_APP_BUNDLE_NAME}")
+
+    try:
+        subprocess.run(["/usr/bin/xattr", "-cr", str(staged_app)], check=False, timeout=30)
+    except Exception:
+        pass
+    return staged_app
+
+
 def download_and_apply_update(
     update_info: dict,
     progress_fn: Optional[Callable[[float, str], None]] = None,
@@ -413,23 +496,30 @@ def download_and_apply_update(
 ) -> dict:
     """
     Download release ZIP, strictly enforce SHA-256 verification against `SHA256SUMS.txt`
-    (both archive and extracted executable, fail-closed), stage `<stem>_update_helper.exe`
-    in the application folder, and launch pure-Python `--finish-update` auto-restart.
+    (fail-closed), and apply native platform self-update (Windows `.exe` helper or macOS `.app` bundle).
     """
     if not isinstance(update_info, dict):
         raise ValueError("更新信息格式无效。")
 
+    is_macos = sys.platform == "darwin"
     is_frozen = bool(getattr(sys, "frozen", False))
     if is_frozen:
-        _check_not_running_inside_archive_temp(Path(sys.executable))
+        if is_macos:
+            cur_app_chk = _find_running_macos_app_bundle(Path(sys.executable))
+            if cur_app_chk is not None:
+                _check_macos_app_writable(cur_app_chk)
+        else:
+            _check_not_running_inside_archive_temp(Path(sys.executable))
 
+    target_zip_name = str(update_info.get("asset_name") or get_platform_zip_asset_name()).strip()
     zip_url = str(update_info.get("zip_url") or "").strip()
     sha256_url = str(update_info.get("sha256_url") or "").strip()
     html_url = str(update_info.get("html_url") or f"https://github.com/{GITHUB_REPO}/releases").strip()
     latest_ver = normalize_version_str(str(update_info.get("latest_version") or ""))
 
     if not zip_url:
-        raise ValueError(f"当前新版本 (v{latest_ver}) 尚未包含 Windows 更新包附件 ({ZIP_ASSET_NAME})。")
+        plat_label = "macOS" if is_macos else "Windows"
+        raise ValueError(f"当前新版本 (v{latest_ver}) 尚未包含 {plat_label} 更新包附件 ({target_zip_name})。")
     if not sha256_url:
         raise ValueError(f"当前新版本 (v{latest_ver}) 缺少官方安全校验文件 ({SHA256_ASSET_NAME})，已拒绝自动更新。")
     validate_github_https_url(zip_url)
@@ -441,7 +531,7 @@ def download_and_apply_update(
         stage_dir = create_secure_update_stagedir()
     else:
         stage_dir = Path(tempfile.mkdtemp(prefix="scattered_rev_update_")).resolve()
-    zip_path = stage_dir / ZIP_ASSET_NAME
+    zip_path = stage_dir / target_zip_name
 
     try:
         if progress_fn:
@@ -453,15 +543,15 @@ def download_and_apply_update(
         )
         with _open_with_proxy_fallback(req_sha, timeout=timeout) as resp_sha:
             sums_raw = resp_sha.read(65536).decode("utf-8", errors="replace")
-        expected_zip_sha = parse_sha256sums(sums_raw, ZIP_ASSET_NAME)
-        expected_exe_sha = parse_sha256sums(sums_raw, EXE_ENTRY_NAME)
+        expected_zip_sha = parse_sha256sums(sums_raw, target_zip_name)
+        expected_exe_sha = "" if is_macos else parse_sha256sums(sums_raw, EXE_ENTRY_NAME)
         if not expected_zip_sha:
-            raise ValueError("SHA256SUMS.txt 中未找到更新压缩包的校验值，已安全中止。")
-        if not expected_exe_sha:
+            raise ValueError(f"SHA256SUMS.txt 中未找到更新包 ({target_zip_name}) 的校验值，已安全中止。")
+        if not is_macos and not expected_exe_sha:
             raise ValueError("SHA256SUMS.txt 中未找到主程序的 SHA-256 校验值，已安全中止。")
 
         if progress_fn:
-            progress_fn(6.0, f"正在下载更新包 v{latest_ver} ({ZIP_ASSET_NAME})...")
+            progress_fn(6.0, f"正在下载更新包 v{latest_ver} ({target_zip_name})...")
 
         req_zip = urllib.request.Request(
             zip_url,
@@ -508,6 +598,61 @@ def download_and_apply_update(
             raise ValueError(
                 f"更新包 SHA-256 校验失败（期望 {expected_zip_sha[:12]}...，实际 {actual_zip_sha[:12]}...），已中止更新！"
             )
+
+        if is_macos:
+            if progress_fn:
+                progress_fn(91.0, f"正在解压并验证新版 macOS 应用包 ({MAC_APP_BUNDLE_NAME})...")
+            staged_app = _validate_and_extract_macos_app_from_zip(zip_path, stage_dir)
+            try:
+                zip_path.unlink(missing_ok=True)
+            except OSError:
+                pass
+
+            cur_app = _find_running_macos_app_bundle(Path(sys.executable)) if is_frozen else None
+            if is_frozen and cur_app is not None:
+                _check_macos_app_writable(cur_app)
+                backup_app = cur_app.with_name(cur_app.name + ".old")
+                if progress_fn:
+                    progress_fn(96.0, "正在替换本地应用程序包...")
+                try:
+                    if backup_app.exists():
+                        shutil.rmtree(backup_app, ignore_errors=True)
+                    shutil.move(str(cur_app), str(backup_app))
+                    try:
+                        shutil.move(str(staged_app), str(cur_app))
+                    except Exception:
+                        if backup_app.exists() and not cur_app.exists():
+                            shutil.move(str(backup_app), str(cur_app))
+                        raise
+                    shutil.rmtree(backup_app, ignore_errors=True)
+                except PermissionError as pe:
+                    raise PermissionError(
+                        f"当前应用所在目录（{cur_app.parent}）没有写入权限，无法直接自动替换。\n"
+                        "请将应用移至桌面或具有写入权限的文件夹后重试，或点击「打开 GitHub 发布页」手动下载替换。"
+                    ) from pe
+
+                shutil.rmtree(stage_dir, ignore_errors=True)
+                if progress_fn:
+                    progress_fn(100.0, "更新完成，正在启动新版 macOS 应用程序...")
+                clean_env = _build_clean_relaunch_env()
+                subprocess.Popen(
+                    ["/usr/bin/open", "-n", str(cur_app)],
+                    env=clean_env,
+                    close_fds=True,
+                )
+                return {
+                    "ready_to_restart": True,
+                    "staged_exe": str(cur_app),
+                    "html_url": html_url,
+                }
+
+            if progress_fn:
+                progress_fn(100.0, f"当前为源码运行模式，新版 macOS 应用已提取至：{staged_app}")
+            return {
+                "ready_to_restart": False,
+                "staged_exe": str(staged_app),
+                "html_url": html_url,
+            }
 
         if progress_fn:
             progress_fn(91.0, f"正在安全提取新版主程序 ({EXE_ENTRY_NAME})...")

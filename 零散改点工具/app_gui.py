@@ -129,7 +129,7 @@ try:
 except ImportError:
     _updater_mod = None
 
-RAW_APP_VERSION = "1.9.6"
+RAW_APP_VERSION = "1.9.7"
 APP_VERSION = f"v{RAW_APP_VERSION}"
 check_for_updates = getattr(_updater_mod, "check_for_updates", None)
 download_and_apply_update = getattr(_updater_mod, "download_and_apply_update", None)
@@ -141,7 +141,9 @@ from security_utils import (
     cleanup_stale_ephemeral_workdirs,
     dpapi_decrypt_str,
     dpapi_encrypt_str,
+    get_user_app_data_dir,
     load_api_key_from_env,
+    open_path_in_os,
     parse_api_keys,
     redact_secrets,
 )
@@ -151,7 +153,14 @@ from word_counter import (
     format_counted_docx_name,
     parse_doc_filename,
 )
-from win_dnd import WinFileDropManager
+from win_dnd import WinFileDropManager, create_tk_root
+
+UI_FONT_FAMILY = "PingFang SC" if sys.platform == "darwin" else "Microsoft YaHei UI"
+MONO_FONT_FAMILY = "Menlo" if sys.platform == "darwin" else "Consolas"
+
+
+def _ui_pt(pt: int) -> int:
+    return pt + 3 if sys.platform == "darwin" else pt
 
 
 _BUILTIN_FONT_FALLBACKS: dict[str, str] = {
@@ -422,8 +431,24 @@ def _enable_high_dpi():
 
 def _app_base_dir() -> Path:
     if getattr(sys, "frozen", False):
+        if sys.platform == "darwin":
+            return get_user_app_data_dir()
         return Path(sys.executable).resolve().parent
     return Path(__file__).resolve().parent
+
+
+def _env_search_dirs() -> list[Path]:
+    dirs = [_app_base_dir()]
+    if getattr(sys, "frozen", False) and sys.platform == "darwin":
+        try:
+            exe_p = Path(sys.executable).resolve()
+            for p in exe_p.parents:
+                if p.name.lower().endswith(".app") and p.parent not in dirs:
+                    dirs.append(p.parent)
+                    break
+        except Exception:
+            pass
+    return dirs
 
 
 SETTINGS_FILE = _app_base_dir() / "app_settings.json"
@@ -516,98 +541,252 @@ def _fit_and_center_window(
     return w, h
 
 
-class PrimaryButton(tk.Button):
-    """Consistent primary CTA button with crisp CJK width metrics and full hover/focus/active/disabled states."""
+if sys.platform == "darwin":
 
-    _BG_NORMAL = "#2563eb"
-    _BG_HOVER = "#1d4ed8"
-    _BG_ACTIVE = "#1e40af"
-    _BG_DISABLED = "#94a3b8"
-    _FG_NORMAL = "#ffffff"
-    _FG_DISABLED = "#f1f5f9"
+    class PrimaryButton(tk.Label):
+        """macOS Aqua-safe primary CTA button (tk.Label avoids Aqua white-bezel white-on-white text bug)."""
 
-    def __init__(
-        self,
-        master: tk.Misc,
-        text: str = "",
-        command=None,
-        padx: int = 18,
-        pady: int = 6,
-        font=("Microsoft YaHei UI", 9, "bold"),
-        state: str = tk.NORMAL,
-        **kwargs,
-    ):
-        is_disabled = str(state).lower() == "disabled"
-        init_bg = self._BG_DISABLED if is_disabled else self._BG_NORMAL
-        init_cursor = "arrow" if is_disabled else "hand2"
-        super().__init__(
-            master,
-            text=text,
-            command=command,
-            font=font,
-            bg=init_bg,
-            fg=self._FG_NORMAL,
-            activebackground=self._BG_ACTIVE,
-            activeforeground=self._FG_NORMAL,
-            disabledforeground=self._FG_DISABLED,
-            relief=tk.FLAT,
-            bd=0,
-            padx=padx,
-            pady=pady,
-            cursor=init_cursor,
-            highlightthickness=1,
-            highlightbackground=init_bg,
-            highlightcolor="#93c5fd",
-            state=state,
+        _BG_NORMAL = "#2563eb"
+        _BG_HOVER = "#1d4ed8"
+        _BG_ACTIVE = "#1e40af"
+        _BG_DISABLED = "#94a3b8"
+        _FG_NORMAL = "#ffffff"
+        _FG_DISABLED = "#f1f5f9"
+
+        def __init__(
+            self,
+            master: tk.Misc,
+            text: str = "",
+            command=None,
+            padx: int = 18,
+            pady: int = 6,
+            font=(UI_FONT_FAMILY, _ui_pt(9), "bold"),
+            state: str = tk.NORMAL,
             **kwargs,
-        )
-        self._hovered = False
-        self.bind("<Enter>", self._on_enter, add="+")
-        self.bind("<Leave>", self._on_leave, add="+")
-
-    def _is_disabled(self) -> bool:
-        try:
-            return str(self.cget("state")).lower() == "disabled"
-        except Exception:
-            return False
-
-    def _sync_visual_state(self):
-        if self._is_disabled():
-            super().configure(
-                bg=self._BG_DISABLED,
-                highlightbackground=self._BG_DISABLED,
-                cursor="arrow",
+        ):
+            self._command = command
+            self._btn_state = tk.DISABLED if str(state).lower() == "disabled" else tk.NORMAL
+            self._hovered = False
+            self._pressed = False
+            for unsupported_key in ("default", "overrelief", "repeatdelay", "repeatinterval"):
+                kwargs.pop(unsupported_key, None)
+            is_dis = self._btn_state == tk.DISABLED
+            init_bg = self._BG_DISABLED if is_dis else self._BG_NORMAL
+            init_fg = self._FG_DISABLED if is_dis else self._FG_NORMAL
+            super().__init__(
+                master,
+                text=text,
+                font=font,
+                bg=init_bg,
+                fg=init_fg,
+                relief=tk.FLAT,
+                bd=0,
+                padx=padx,
+                pady=pady,
+                cursor="arrow" if is_dis else "pointinghand",
+                highlightthickness=1,
+                highlightbackground=init_bg,
+                highlightcolor="#93c5fd",
+                takefocus=0 if is_dis else 1,
+                **kwargs,
             )
-        else:
-            target_bg = self._BG_HOVER if self._hovered else self._BG_NORMAL
-            super().configure(
-                bg=target_bg,
-                highlightbackground=target_bg,
-                cursor="hand2",
+            self.bind("<Enter>", self._on_enter, add="+")
+            self.bind("<Leave>", self._on_leave, add="+")
+            self.bind("<ButtonPress-1>", self._on_press, add="+")
+            self.bind("<ButtonRelease-1>", self._on_release, add="+")
+            self.bind("<Return>", self._on_key_activate, add="+")
+            self.bind("<space>", self._on_key_activate, add="+")
+
+        def _is_disabled(self) -> bool:
+            return str(self._btn_state).lower() == "disabled"
+
+        def _sync_visual_state(self):
+            if self._is_disabled():
+                super().configure(
+                    bg=self._BG_DISABLED,
+                    fg=self._FG_DISABLED,
+                    highlightbackground=self._BG_DISABLED,
+                    cursor="arrow",
+                    takefocus=0,
+                )
+            else:
+                if self._pressed and self._hovered:
+                    target_bg = self._BG_ACTIVE
+                elif self._hovered:
+                    target_bg = self._BG_HOVER
+                else:
+                    target_bg = self._BG_NORMAL
+                super().configure(
+                    bg=target_bg,
+                    fg=self._FG_NORMAL,
+                    highlightbackground=target_bg,
+                    cursor="pointinghand",
+                    takefocus=1,
+                )
+
+        def _on_enter(self, _event=None):
+            self._hovered = True
+            self._sync_visual_state()
+
+        def _on_leave(self, _event=None):
+            self._hovered = False
+            self._pressed = False
+            self._sync_visual_state()
+
+        def _on_press(self, _event=None):
+            if not self._is_disabled():
+                self._pressed = True
+                self._sync_visual_state()
+
+        def _on_release(self, event=None):
+            was_pressed = self._pressed
+            self._pressed = False
+            if self._is_disabled():
+                self._sync_visual_state()
+                return
+            inside = self._hovered
+            if event is not None:
+                try:
+                    inside = 0 <= int(event.x) <= int(self.winfo_width()) and 0 <= int(event.y) <= int(self.winfo_height())
+                except Exception:
+                    pass
+            self._hovered = inside
+            self._sync_visual_state()
+            if was_pressed and inside and callable(self._command):
+                self._command()
+
+        def _on_key_activate(self, _event=None):
+            if not self._is_disabled() and callable(self._command):
+                self._command()
+
+        def invoke(self):
+            if not self._is_disabled() and callable(self._command):
+                return self._command()
+            return None
+
+        def cget(self, key: str):
+            if key == "state":
+                return self._btn_state
+            if key == "command":
+                return self._command
+            return super().cget(key)
+
+        def configure(self, cnf=None, **kw):
+            merged = {}
+            if isinstance(cnf, dict):
+                merged.update(cnf)
+            merged.update(kw)
+            state_changed = False
+            if "state" in merged:
+                st = merged.pop("state")
+                self._btn_state = tk.DISABLED if str(st).lower() == "disabled" else tk.NORMAL
+                state_changed = True
+            if "command" in merged:
+                self._command = merged.pop("command")
+            res = super().configure(**merged) if merged else None
+            if state_changed:
+                self._sync_visual_state()
+            return res
+
+        config = configure
+
+        def __setitem__(self, key: str, value):
+            self.configure(**{key: value})
+
+else:
+
+    class PrimaryButton(tk.Button):
+        """Consistent primary CTA button with crisp CJK width metrics and full hover/focus/active/disabled states."""
+
+        _BG_NORMAL = "#2563eb"
+        _BG_HOVER = "#1d4ed8"
+        _BG_ACTIVE = "#1e40af"
+        _BG_DISABLED = "#94a3b8"
+        _FG_NORMAL = "#ffffff"
+        _FG_DISABLED = "#f1f5f9"
+
+        def __init__(
+            self,
+            master: tk.Misc,
+            text: str = "",
+            command=None,
+            padx: int = 18,
+            pady: int = 6,
+            font=(UI_FONT_FAMILY, _ui_pt(9), "bold"),
+            state: str = tk.NORMAL,
+            **kwargs,
+        ):
+            is_disabled = str(state).lower() == "disabled"
+            init_bg = self._BG_DISABLED if is_disabled else self._BG_NORMAL
+            init_cursor = "arrow" if is_disabled else "hand2"
+            super().__init__(
+                master,
+                text=text,
+                command=command,
+                font=font,
+                bg=init_bg,
+                fg=self._FG_NORMAL,
+                activebackground=self._BG_ACTIVE,
+                activeforeground=self._FG_NORMAL,
+                disabledforeground=self._FG_DISABLED,
+                relief=tk.FLAT,
+                bd=0,
+                padx=padx,
+                pady=pady,
+                cursor=init_cursor,
+                highlightthickness=1,
+                highlightbackground=init_bg,
+                highlightcolor="#93c5fd",
+                state=state,
+                **kwargs,
             )
+            self._hovered = False
+            self.bind("<Enter>", self._on_enter, add="+")
+            self.bind("<Leave>", self._on_leave, add="+")
 
-    def _on_enter(self, _event=None):
-        self._hovered = True
-        if not self._is_disabled():
-            super().configure(bg=self._BG_HOVER, highlightbackground=self._BG_HOVER)
+        def _is_disabled(self) -> bool:
+            try:
+                return str(self.cget("state")).lower() == "disabled"
+            except Exception:
+                return False
 
-    def _on_leave(self, _event=None):
-        self._hovered = False
-        if not self._is_disabled():
-            super().configure(bg=self._BG_NORMAL, highlightbackground=self._BG_NORMAL)
+        def _sync_visual_state(self):
+            if self._is_disabled():
+                super().configure(
+                    bg=self._BG_DISABLED,
+                    highlightbackground=self._BG_DISABLED,
+                    cursor="arrow",
+                )
+            else:
+                target_bg = self._BG_HOVER if self._hovered else self._BG_NORMAL
+                super().configure(
+                    bg=target_bg,
+                    highlightbackground=target_bg,
+                    cursor="hand2",
+                )
 
-    def configure(self, cnf=None, **kw):
-        res = super().configure(cnf, **kw)
-        if (isinstance(cnf, dict) and "state" in cnf) or "state" in kw:
-            self._sync_visual_state()
-        return res
+        def _on_enter(self, _event=None):
+            self._hovered = True
+            if not self._is_disabled():
+                super().configure(bg=self._BG_HOVER, highlightbackground=self._BG_HOVER)
 
-    config = configure
+        def _on_leave(self, _event=None):
+            self._hovered = False
+            if not self._is_disabled():
+                super().configure(bg=self._BG_NORMAL, highlightbackground=self._BG_NORMAL)
 
-    def __setitem__(self, key: str, value):
-        super().__setitem__(key, value)
-        if key == "state":
-            self._sync_visual_state()
+        def configure(self, cnf=None, **kw):
+            res = super().configure(cnf, **kw)
+            if (isinstance(cnf, dict) and "state" in cnf) or "state" in kw:
+                self._sync_visual_state()
+            return res
+
+        config = configure
+
+        def __setitem__(self, key: str, value):
+            super().__setitem__(key, value)
+            if key == "state":
+                self._sync_visual_state()
 
 
 def _make_primary_btn(
@@ -616,7 +795,7 @@ def _make_primary_btn(
     command=None,
     padx: int = 18,
     pady: int = 6,
-    font=("Microsoft YaHei UI", 9, "bold"),
+    font=(UI_FONT_FAMILY, _ui_pt(9), "bold"),
     state: str = tk.NORMAL,
     **kwargs,
 ) -> PrimaryButton:
@@ -782,7 +961,7 @@ class ApiKeyPoolDialog(tk.Toplevel):
             chk_frame,
             height=5,
             wrap=tk.WORD,
-            font=("Microsoft YaHei UI", 9),
+            font=(UI_FONT_FAMILY, _ui_pt(9)),
             bg="#f8fafc",
             fg="#0f172a",
             relief=tk.SOLID,
@@ -792,7 +971,7 @@ class ApiKeyPoolDialog(tk.Toplevel):
         )
         self.chk_text.tag_configure("ok", foreground="#15803d")
         self.chk_text.tag_configure("bad", foreground="#b91c1c")
-        self.chk_text.tag_configure("info", foreground="#1d4ed8", font=("Microsoft YaHei UI", 9, "bold"))
+        self.chk_text.tag_configure("info", foreground="#1d4ed8", font=(UI_FONT_FAMILY, _ui_pt(9), "bold"))
         chk_vsb = ttk.Scrollbar(chk_frame, orient=tk.VERTICAL, command=self.chk_text.yview)
         self.chk_text.configure(yscrollcommand=chk_vsb.set)
         self.chk_text.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
@@ -812,7 +991,7 @@ class ApiKeyPoolDialog(tk.Toplevel):
         ttk.Label(
             stat_row,
             textvariable=self.count_var,
-            font=("Microsoft YaHei UI", 9, "bold"),
+            font=(UI_FONT_FAMILY, _ui_pt(9), "bold"),
             foreground="#1d4ed8",
         ).pack(side=tk.LEFT)
 
@@ -853,7 +1032,7 @@ class ApiKeyPoolDialog(tk.Toplevel):
             ed_inner,
             height=8,
             wrap=tk.NONE,
-            font=("Consolas", 9),
+            font=(MONO_FONT_FAMILY, _ui_pt(9)),
             bg="#ffffff",
             fg="#0f172a",
             relief=tk.SOLID,
@@ -1168,7 +1347,7 @@ class LanguageManagerDialog(tk.Toplevel):
         ttk.Label(
             tbl_toolbar,
             textvariable=self.summary_var,
-            font=("Microsoft YaHei UI", 9, "bold"),
+            font=(UI_FONT_FAMILY, _ui_pt(9), "bold"),
             foreground="#1d4ed8",
         ).pack(side=tk.LEFT)
 
@@ -1404,7 +1583,7 @@ class LanguageManagerDialog(tk.Toplevel):
         if not p.exists():
             save_languages(self.entries)
         if p.is_file() and p.suffix.lower() == ".json":
-            os.startfile(str(p))
+            open_path_in_os(p)
 
 
 LangManagerDialog = LanguageManagerDialog
@@ -1474,7 +1653,7 @@ class AmbiguousArticleDialog(tk.Toplevel):
                 "请勾选您本次实际需要提取对比的篇目（支持单选或多选），确认后将逐篇独立导出完整版与仅改点版："
             ),
             foreground="#0f172a",
-            font=("Microsoft YaHei UI", 9, "bold"),
+            font=(UI_FONT_FAMILY, _ui_pt(9), "bold"),
         ).pack(side=tk.TOP, fill=tk.X, pady=(0, 8))
 
         # Pack bottom action bar FIRST so bottom buttons NEVER clip
@@ -1493,7 +1672,7 @@ class AmbiguousArticleDialog(tk.Toplevel):
         ttk.Label(
             bot,
             textvariable=self.count_var,
-            font=("Microsoft YaHei UI", 9, "bold"),
+            font=(UI_FONT_FAMILY, _ui_pt(9), "bold"),
             foreground="#1d4ed8",
         ).pack(side=tk.LEFT)
 
@@ -1632,7 +1811,7 @@ class SoftwareUpdateDialog(tk.Toplevel):
         self.lbl_header = ttk.Label(
             wrap,
             textvariable=self.header_var,
-            font=("Microsoft YaHei UI", 10, "bold"),
+            font=(UI_FONT_FAMILY, _ui_pt(10), "bold"),
             foreground="#1d4ed8",
         )
         self.lbl_header.pack(side=tk.TOP, fill=tk.X, pady=(0, 8))
@@ -1671,7 +1850,7 @@ class SoftwareUpdateDialog(tk.Toplevel):
             notes_frame,
             height=9,
             wrap=tk.WORD,
-            font=("Microsoft YaHei UI", 9),
+            font=(UI_FONT_FAMILY, _ui_pt(9)),
             bg="#f8fafc",
             fg="#0f172a",
             relief=tk.SOLID,
@@ -1964,10 +2143,10 @@ class ScatteredRevisionApp:
         elif "clam" in style.theme_names():
             style.theme_use("clam")
 
-        default_font = ("Microsoft YaHei UI", 9)
-        bold_font = ("Microsoft YaHei UI", 9, "bold")
-        btn_font = ("Microsoft YaHei UI", 10, "bold")
-        tab_font = ("Microsoft YaHei UI", 10, "bold")
+        default_font = (UI_FONT_FAMILY, _ui_pt(9))
+        bold_font = (UI_FONT_FAMILY, _ui_pt(9), "bold")
+        btn_font = (UI_FONT_FAMILY, _ui_pt(10), "bold")
+        tab_font = (UI_FONT_FAMILY, _ui_pt(10), "bold")
 
         self.root.option_add("*Font", default_font)
         style.configure("TLabelframe.Label", font=bold_font, foreground="#1d4ed8")
@@ -2366,7 +2545,10 @@ class ScatteredRevisionApp:
                 pass
 
         if not loaded_key_raw:
-            loaded_key_raw = load_api_key_from_env(_app_base_dir())
+            for env_d in _env_search_dirs():
+                loaded_key_raw = load_api_key_from_env(env_d)
+                if loaded_key_raw:
+                    break
         self._set_pool_multiline_and_sync_entry(loaded_key_raw)
 
         if migrated_plaintext:
@@ -2477,7 +2659,7 @@ class ScatteredRevisionApp:
         tk.Label(
             brand_box,
             text=APP_VERSION,
-            font=("Consolas", 8, "bold"),
+            font=(MONO_FONT_FAMILY, _ui_pt(8), "bold"),
             fg="#1d4ed8",
             bg="#dbeafe",
             padx=6,
@@ -2486,7 +2668,7 @@ class ScatteredRevisionApp:
         tk.Label(
             brand_box,
             text="多语种整理工作台",
-            font=("Microsoft YaHei UI", 10, "bold"),
+            font=(UI_FONT_FAMILY, _ui_pt(10), "bold"),
             fg="#0f172a",
             bg="#f8fafc",
             anchor=tk.W,
@@ -2501,7 +2683,7 @@ class ScatteredRevisionApp:
         tk.Label(
             sidebar_footer,
             text="支持拖拽文件或目录至窗口",
-            font=("Microsoft YaHei UI", 8),
+            font=(UI_FONT_FAMILY, _ui_pt(8)),
             fg="#475569",
             bg="#f8fafc",
             anchor=tk.W,
@@ -2622,7 +2804,7 @@ class ScatteredRevisionApp:
         self.top_status_lbl = tk.Label(
             self.top_toolbar,
             textvariable=self.top_status_summary_var,
-            font=("Microsoft YaHei UI", 9),
+            font=(UI_FONT_FAMILY, _ui_pt(9)),
             fg="#475569",
             bg="#f8fafc",
             cursor="hand2",
@@ -2633,7 +2815,7 @@ class ScatteredRevisionApp:
         tk.Label(
             self.top_toolbar,
             textvariable=self.active_section_title_var,
-            font=("Microsoft YaHei UI", 10, "bold"),
+            font=(UI_FONT_FAMILY, _ui_pt(10), "bold"),
             fg="#0f172a",
             bg="#f8fafc",
             anchor=tk.W,
@@ -2648,17 +2830,10 @@ class ScatteredRevisionApp:
             padx=12,
             pady=6,
         )
-        tk.Button(
+        ttk.Button(
             self.update_banner,
             text="关闭",
-            font=("Microsoft YaHei UI", 8),
-            fg="#475569",
-            bg="#eff6ff",
-            activebackground="#dbeafe",
-            relief=tk.FLAT,
-            padx=8,
-            pady=2,
-            cursor="hand2",
+            style="Compact.TButton",
             command=self.update_banner.grid_remove,
         ).pack(side=tk.RIGHT)
 
@@ -2673,7 +2848,7 @@ class ScatteredRevisionApp:
         self.update_banner_lbl = tk.Label(
             self.update_banner,
             text="发现新版本",
-            font=("Microsoft YaHei UI", 9, "bold"),
+            font=(UI_FONT_FAMILY, _ui_pt(9), "bold"),
             fg="#1d4ed8",
             bg="#eff6ff",
             anchor=tk.W,
@@ -2724,7 +2899,7 @@ class ScatteredRevisionApp:
         lbl_title = tk.Label(
             item,
             text=title,
-            font=("Microsoft YaHei UI", 9),
+            font=(UI_FONT_FAMILY, _ui_pt(9)),
             fg="#334155",
             bg="#f8fafc",
             anchor=tk.W,
@@ -2784,7 +2959,7 @@ class ScatteredRevisionApp:
             bg = "#eff6ff" if is_act else "#f8fafc"
             bar_c = "#2563eb" if is_act else "#f8fafc"
             fg_t = "#1d4ed8" if is_act else "#334155"
-            fnt = ("Microsoft YaHei UI", 9, "bold") if is_act else ("Microsoft YaHei UI", 9)
+            fnt = (UI_FONT_FAMILY, _ui_pt(9), "bold") if is_act else (UI_FONT_FAMILY, _ui_pt(9))
 
             parts["card"].configure(bg=bg)
             parts["bar"].configure(bg=bar_c)
@@ -2834,7 +3009,7 @@ class ScatteredRevisionApp:
         lbl = tk.Label(
             zone,
             text=text,
-            font=("Microsoft YaHei UI", 9, "bold"),
+            font=(UI_FONT_FAMILY, _ui_pt(9), "bold"),
             fg="#1d4ed8",
             bg="#eff6ff",
             anchor=tk.W,
@@ -3075,7 +3250,7 @@ class ScatteredRevisionApp:
         self.btn_oneclick = _make_primary_btn(
             btn_row,
             text="一键输出定稿",
-            font=("Microsoft YaHei UI", 10, "bold"),
+            font=(UI_FONT_FAMILY, _ui_pt(10), "bold"),
             pady=7,
             command=self._on_run_oneclick,
         )
@@ -3096,7 +3271,7 @@ class ScatteredRevisionApp:
         self.stage_lbl = ttk.Label(
             prog_info,
             textvariable=self.stage_var,
-            font=("Microsoft YaHei UI", 9, "bold"),
+            font=(UI_FONT_FAMILY, _ui_pt(9), "bold"),
             foreground="#1d4ed8",
         )
         self.stage_lbl.pack(side=tk.LEFT, fill=tk.X, expand=True)
@@ -3159,7 +3334,7 @@ class ScatteredRevisionApp:
         self.btn_fa_run = _make_primary_btn(
             btn_row,
             text="开始全篇提取对比（逐篇输出完整版 + 仅改点版）",
-            font=("Microsoft YaHei UI", 10, "bold"),
+            font=(UI_FONT_FAMILY, _ui_pt(10), "bold"),
             pady=7,
             command=self._on_run_full_article,
         )
@@ -3176,7 +3351,7 @@ class ScatteredRevisionApp:
         self.fa_stage_lbl = ttk.Label(
             p_info,
             textvariable=self.fa_stage_var,
-            font=("Microsoft YaHei UI", 9, "bold"),
+            font=(UI_FONT_FAMILY, _ui_pt(9), "bold"),
             foreground="#1d4ed8",
         )
         self.fa_stage_lbl.pack(side=tk.LEFT, fill=tk.X, expand=True)
@@ -3350,7 +3525,7 @@ class ScatteredRevisionApp:
         ttk.Label(
             t_bar,
             textvariable=self.fa_title_count_var,
-            font=("Microsoft YaHei UI", 9, "bold"),
+            font=(UI_FONT_FAMILY, _ui_pt(9), "bold"),
             foreground="#1d4ed8",
         ).pack(side=tk.LEFT)
 
@@ -3360,7 +3535,7 @@ class ScatteredRevisionApp:
             ed_wrap,
             height=3,
             wrap=tk.WORD,
-            font=("Microsoft YaHei UI", 9),
+            font=(UI_FONT_FAMILY, _ui_pt(9)),
             bg="#ffffff",
             fg="#0f172a",
             relief=tk.SOLID,
@@ -3442,7 +3617,7 @@ class ScatteredRevisionApp:
         ttk.Label(
             btn_bar,
             textvariable=self.dd_summary_var,
-            font=("Microsoft YaHei UI", 9, "bold"),
+            font=(UI_FONT_FAMILY, _ui_pt(9), "bold"),
             foreground="#1d4ed8",
         ).pack(side=tk.LEFT, fill=tk.X, expand=True)
 
@@ -3524,7 +3699,7 @@ class ScatteredRevisionApp:
         self.btn_dd_run = _make_primary_btn(
             run_row,
             text="开始第一列中文四级查重并导出报告",
-            font=("Microsoft YaHei UI", 10, "bold"),
+            font=(UI_FONT_FAMILY, _ui_pt(10), "bold"),
             pady=7,
             command=self._on_run_dedup,
         )
@@ -3541,7 +3716,7 @@ class ScatteredRevisionApp:
         self.dd_stage_lbl = ttk.Label(
             p_info,
             textvariable=self.dd_stage_var,
-            font=("Microsoft YaHei UI", 9, "bold"),
+            font=(UI_FONT_FAMILY, _ui_pt(9), "bold"),
             foreground="#1d4ed8",
         )
         self.dd_stage_lbl.pack(side=tk.LEFT, fill=tk.X, expand=True)
@@ -3594,7 +3769,7 @@ class ScatteredRevisionApp:
         ttk.Label(
             bot,
             textvariable=self.wc_summary_var,
-            font=("Microsoft YaHei UI", 9, "bold"),
+            font=(UI_FONT_FAMILY, _ui_pt(9), "bold"),
             foreground="#1d4ed8",
         ).pack(side=tk.LEFT, fill=tk.X, expand=True)
 
@@ -3875,7 +4050,7 @@ class ScatteredRevisionApp:
 
         mode_row = ttk.Frame(cfg_frame)
         mode_row.pack(fill=tk.X, pady=(4, 2))
-        ttk.Label(mode_row, text="输出方式：", font=("Microsoft YaHei UI", 9, "bold")).pack(side=tk.LEFT)
+        ttk.Label(mode_row, text="输出方式：", font=(UI_FONT_FAMILY, _ui_pt(9), "bold")).pack(side=tk.LEFT)
         for disp_txt, mode_val in OUTPUT_MODES:
             ttk.Radiobutton(
                 mode_row,
@@ -3949,7 +4124,7 @@ class ScatteredRevisionApp:
         ttk.Label(
             run_row,
             textvariable=self.fel_summary_var,
-            font=("Microsoft YaHei UI", 9, "bold"),
+            font=(UI_FONT_FAMILY, _ui_pt(9), "bold"),
             foreground="#0f172a",
         ).pack(side=tk.LEFT, fill=tk.X, expand=True)
 
@@ -3964,7 +4139,7 @@ class ScatteredRevisionApp:
         self.fel_stage_lbl = ttk.Label(
             p_info,
             textvariable=self.fel_stage_var,
-            font=("Microsoft YaHei UI", 9, "bold"),
+            font=(UI_FONT_FAMILY, _ui_pt(9), "bold"),
             foreground="#1d4ed8",
         )
         self.fel_stage_lbl.pack(side=tk.LEFT, fill=tk.X, expand=True)
@@ -4039,7 +4214,7 @@ class ScatteredRevisionApp:
         ttk.Label(
             gap_row,
             text="两处黄色高亮自动连片最大间隔词数：",
-            font=("Microsoft YaHei UI", 9, "bold"),
+            font=(UI_FONT_FAMILY, _ui_pt(9), "bold"),
             foreground="#0f172a",
         ).pack(side=tk.LEFT)
         self.spin_yellow_gap = ttk.Spinbox(
@@ -4174,13 +4349,13 @@ class ScatteredRevisionApp:
         ttk.Label(
             key_hdr,
             textvariable=self.settings_key_count_var,
-            font=("Microsoft YaHei UI", 9, "bold"),
+            font=(UI_FONT_FAMILY, _ui_pt(9), "bold"),
             foreground="#1d4ed8",
         ).pack(side=tk.RIGHT)
         ttk.Label(
             key_hdr,
             text="API Key 池列表（每行 1 个 Key，支持 # 备注，与弹窗实时同步）：",
-            font=("Microsoft YaHei UI", 9, "bold"),
+            font=(UI_FONT_FAMILY, _ui_pt(9), "bold"),
             foreground="#0f172a",
         ).pack(side=tk.LEFT)
 
@@ -4201,7 +4376,7 @@ class ScatteredRevisionApp:
             ed_inner,
             height=5,
             wrap=tk.NONE,
-            font=("Consolas", 9),
+            font=(MONO_FONT_FAMILY, _ui_pt(9)),
             bg="#ffffff",
             fg="#0f172a",
             relief=tk.SOLID,
@@ -4227,7 +4402,7 @@ class ScatteredRevisionApp:
             parent,
             height=height,
             wrap=tk.WORD,
-            font=("Microsoft YaHei UI", 9),
+            font=(UI_FONT_FAMILY, _ui_pt(9)),
             bg="#f8fafc",
             fg="#0f172a",
             relief=tk.SOLID,
@@ -4235,9 +4410,9 @@ class ScatteredRevisionApp:
             padx=8,
             pady=5,
         )
-        tw.tag_configure("header", foreground="#1d4ed8", font=("Microsoft YaHei UI", 9, "bold"))
-        tw.tag_configure("ok", foreground="#15803d", font=("Microsoft YaHei UI", 9, "bold"))
-        tw.tag_configure("err", foreground="#b91c1c", font=("Microsoft YaHei UI", 9, "bold"))
+        tw.tag_configure("header", foreground="#1d4ed8", font=(UI_FONT_FAMILY, _ui_pt(9), "bold"))
+        tw.tag_configure("ok", foreground="#15803d", font=(UI_FONT_FAMILY, _ui_pt(9), "bold"))
+        tw.tag_configure("err", foreground="#b91c1c", font=(UI_FONT_FAMILY, _ui_pt(9), "bold"))
         tw.tag_configure("retry", foreground="#b45309")
         tw.tag_configure("dim", foreground="#475569")
         sb = ttk.Scrollbar(parent, orient=tk.VERTICAL, command=tw.yview)
@@ -4899,7 +5074,7 @@ class ScatteredRevisionApp:
         d = self.fa_output_dir_var.get().strip()
         p = Path(d).resolve() if d else None
         if p and p.exists() and p.is_dir():
-            os.startfile(str(p))
+            open_path_in_os(p)
         else:
             messagebox.showinfo("提示", "请先选择真实存在的输出保存目录。")
 
@@ -5301,7 +5476,7 @@ class ScatteredRevisionApp:
         d = self.dd_out_dir_var.get().strip()
         p = Path(d).resolve() if d else None
         if p and p.exists() and p.is_dir():
-            os.startfile(str(p))
+            open_path_in_os(p)
         else:
             messagebox.showinfo("提示", "请先选择真实存在的输出目录。")
 
@@ -5313,7 +5488,7 @@ class ScatteredRevisionApp:
         if 0 <= idx < len(self.dd_files):
             p = Path(self.dd_files[idx])
             if p.parent.exists():
-                os.startfile(str(p.parent))
+                open_path_in_os(p.parent)
 
     def _on_drop_dd_pkg_dir(self, paths: list[Path]):
         p = paths[0].resolve()
@@ -5551,7 +5726,7 @@ class ScatteredRevisionApp:
         d = self.fel_output_dir_var.get().strip()
         p = Path(d).resolve() if d else None
         if p and p.exists() and p.is_dir():
-            os.startfile(str(p))
+            open_path_in_os(p)
         else:
             messagebox.showinfo("提示", "请先选择真实存在的输出保存目录。")
 
@@ -5563,7 +5738,7 @@ class ScatteredRevisionApp:
         if 0 <= idx < len(self.fel_files):
             p = Path(self.fel_files[idx])
             if p.parent.exists():
-                os.startfile(str(p.parent))
+                open_path_in_os(p.parent)
 
     def _fel_inspect_cached(self, fp_str: str) -> dict:
         cached = self._fel_inspect_cache.get(fp_str)
@@ -5809,7 +5984,7 @@ class ScatteredRevisionApp:
             p = Path(self.wc_files[idx])
             target_dir = p.parent if p.parent.exists() else None
             if target_dir:
-                os.startfile(str(target_dir))
+                open_path_in_os(target_dir)
 
     def _wc_analyze_one(self, file_path: str) -> dict:
         return _call_compatible(
@@ -6214,7 +6389,7 @@ class ScatteredRevisionApp:
         d = self.output_dir_var.get().strip()
         p = Path(d).resolve() if d else None
         if p and p.exists() and p.is_dir():
-            os.startfile(str(p))
+            open_path_in_os(p)
         else:
             messagebox.showinfo("提示", "请先选择真实存在的输出文件夹目录。")
 
@@ -6777,8 +6952,8 @@ def _run_frozen_self_test() -> int:
     from ai_client import format_friendly_api_error as _ai_friendly_err
     from ai_client import local_align_col3_spans
 
-    if RAW_APP_VERSION != "1.9.6":
-        raise RuntimeError(f"RAW_APP_VERSION expected '1.9.6', got {RAW_APP_VERSION!r}")
+    if RAW_APP_VERSION != "1.9.7":
+        raise RuntimeError(f"RAW_APP_VERSION expected '1.9.7', got {RAW_APP_VERSION!r}")
 
     is_frozen = bool(getattr(sys, "frozen", False))
     if is_frozen and hasattr(sys, "_MEIPASS"):
@@ -6946,9 +7121,18 @@ def _run_frozen_self_test() -> int:
             raise RuntimeError("pipeline.resolve_sc1_input_docx_list missing in self-test")
 
         upd_ver = str(getattr(_upd_test, "APP_VERSION", "")).lstrip("vV")
-        expected_vers = ("1.9.6",) if require_v18_siblings else ("1.7.0", "1.8.0", "1.8.1", "1.9.0", "1.9.1", "1.9.2", "1.9.3", "1.9.4", "1.9.5", "1.9.6")
+        expected_vers = ("1.9.7",) if require_v18_siblings else ("1.7.0", "1.8.0", "1.8.1", "1.9.0", "1.9.1", "1.9.2", "1.9.3", "1.9.4", "1.9.5", "1.9.6", "1.9.7")
         if upd_ver not in expected_vers:
             raise RuntimeError(f"updater.APP_VERSION mismatch: {getattr(_upd_test, 'APP_VERSION', None)!r}")
+        plat_fn = getattr(_upd_test, "get_platform_zip_asset_name", None)
+        if not callable(plat_fn):
+            raise RuntimeError("updater.get_platform_zip_asset_name missing in self-test")
+        if (
+            plat_fn("win32", "AMD64") != "ScatteredRevisionTool-Windows-x64.zip"
+            or plat_fn("darwin", "arm64") != "ScatteredRevisionTool-macOS-arm64.zip"
+            or plat_fn("darwin", "x86_64") != "ScatteredRevisionTool-macOS-x64.zip"
+        ):
+            raise RuntimeError("updater.get_platform_zip_asset_name platform matrix failed")
         if not callable(getattr(_upd_test, "check_for_updates", None)) or not callable(
             getattr(_upd_test, "download_and_apply_update", None)
         ):
@@ -7020,7 +7204,7 @@ def main():
         except Exception:
             pass
     _enable_high_dpi()
-    root = tk.Tk()
+    root = create_tk_root()
     ScatteredRevisionApp(root)
     root.mainloop()
 

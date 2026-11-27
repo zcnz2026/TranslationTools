@@ -1,15 +1,21 @@
 import base64
 import ctypes
-from ctypes import wintypes
 import hashlib
+import hmac
 import os
 from pathlib import Path
 import re
 import shutil
+import subprocess
 import sys
 import tempfile
 import time
 import urllib.parse
+
+if sys.platform == "win32":
+    from ctypes import wintypes
+else:
+    wintypes = None  # type: ignore[assignment]
 
 ALLOWED_API_HOSTS = frozenset({
     "aiplatform.googleapis.com",
@@ -21,35 +27,152 @@ _KEY_PATTERNS = [
     re.compile(r"AIza[0-9A-Za-z_-]{16,}"),
     re.compile(r"AQ\.[0-9A-Za-z._-]{16,}"),
     re.compile(r"ya29\.[0-9A-Za-z._-]{16,}"),
+    re.compile(r"(?:dpapi|posix):v1:[A-Za-z0-9+/=:_-]{12,}"),
     re.compile(r"(?i)(x-goog-api-key|authorization)\s*[:=]\s*['\"]?[^\s,'\"]+"),
 ]
 
 _DPAPI_PREFIX = "dpapi:v1:"
+_POSIX_ENC_PREFIX = "posix:v1:"
 _DPAPI_ENTROPY = b"ScatteredRevisionTool::APIKey::v1"
 _CRYPTPROTECT_UI_FORBIDDEN = 0x01
 _FILE_ATTRIBUTE_REPARSE_POINT = 0x0400
 
+if sys.platform == "win32":
+    class _DATA_BLOB(ctypes.Structure):
+        _fields_ = [
+            ("cbData", wintypes.DWORD),
+            ("pbData", ctypes.POINTER(ctypes.c_char)),
+        ]
 
-class _DATA_BLOB(ctypes.Structure):
-    _fields_ = [
-        ("cbData", wintypes.DWORD),
-        ("pbData", ctypes.POINTER(ctypes.c_char)),
-    ]
+    def _make_blob(data: bytes):
+        buf = ctypes.create_string_buffer(data, len(data))
+        blob = _DATA_BLOB(len(data), ctypes.cast(buf, ctypes.POINTER(ctypes.c_char)))
+        return blob, buf
 
 
-def _make_blob(data: bytes):
-    buf = ctypes.create_string_buffer(data, len(data))
-    blob = _DATA_BLOB(len(data), ctypes.cast(buf, ctypes.POINTER(ctypes.c_char)))
-    return blob, buf
+def get_user_app_data_dir() -> Path:
+    """
+    Return the per-user application data directory across Windows, macOS, and Linux:
+      - Windows: `%LOCALAPPDATA%\\ScatteredRevisionTool`
+      - macOS:   `~/Library/Application Support/ScatteredRevisionTool`
+      - Linux:   `$XDG_DATA_HOME/ScatteredRevisionTool` or `~/.local/share/ScatteredRevisionTool`
+    """
+    if sys.platform == "win32":
+        local_app = os.environ.get("LOCALAPPDATA", "").strip()
+        base = Path(local_app) if local_app else Path(tempfile.gettempdir())
+    elif sys.platform == "darwin":
+        base = Path.home() / "Library" / "Application Support"
+    else:
+        xdg = os.environ.get("XDG_DATA_HOME", "").strip()
+        base = Path(xdg) if xdg else (Path.home() / ".local" / "share")
+    app_dir = base / "ScatteredRevisionTool"
+    try:
+        app_dir.mkdir(parents=True, exist_ok=True)
+        if sys.platform != "win32":
+            try:
+                os.chmod(app_dir, 0o700)
+            except OSError:
+                pass
+        return app_dir
+    except OSError:
+        fb = Path(tempfile.gettempdir()) / "ScatteredRevisionTool"
+        fb.mkdir(parents=True, exist_ok=True)
+        return fb
+
+
+def open_path_in_os(target: Path | str) -> None:
+    """Open a local file or directory in Windows Explorer, macOS Finder, or Linux desktop."""
+    p_str = str(target)
+    if sys.platform == "win32":
+        os.startfile(p_str)  # type: ignore[attr-defined]
+    elif sys.platform == "darwin":
+        subprocess.Popen(["/usr/bin/open", p_str], close_fds=True)
+    else:
+        subprocess.Popen(["xdg-open", p_str], close_fds=True)
+
+
+def _get_or_create_posix_master_key() -> bytes:
+    """Load or create a 0o600 32-byte random master secret in the user's private App Support dir."""
+    app_dir = get_user_app_data_dir()
+    key_file = app_dir / ".master_key"
+    if key_file.is_symlink():
+        raise RuntimeError(f"Refusing symlinked master key file: {key_file}")
+    if key_file.is_file():
+        raw = key_file.read_bytes()
+        if len(raw) == 32:
+            return raw
+    secret = os.urandom(32)
+    fd = os.open(str(key_file), os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    try:
+        os.write(fd, secret)
+    finally:
+        os.close(fd)
+    try:
+        os.chmod(key_file, 0o600)
+    except OSError:
+        pass
+    return secret
+
+
+def _posix_ctr_xor(key: bytes, nonce: bytes, data: bytes) -> bytes:
+    out = bytearray(len(data))
+    counter = 0
+    off = 0
+    while off < len(data):
+        block = hmac.new(key, nonce + counter.to_bytes(8, "big") + _DPAPI_ENTROPY, hashlib.sha256).digest()
+        take = min(32, len(data) - off)
+        for i in range(take):
+            out[off + i] = data[off + i] ^ block[i]
+        off += take
+        counter += 1
+    return bytes(out)
+
+
+def _posix_encrypt_str(plaintext: str) -> str:
+    master = _get_or_create_posix_master_key()
+    enc_key = hmac.new(master, b"enc::v1", hashlib.sha256).digest()
+    mac_key = hmac.new(master, b"mac::v1", hashlib.sha256).digest()
+    nonce = os.urandom(16)
+    ct = _posix_ctr_xor(enc_key, nonce, plaintext.encode("utf-8"))
+    tag = hmac.new(mac_key, nonce + ct + _DPAPI_ENTROPY, hashlib.sha256).hexdigest()
+    return f"{_POSIX_ENC_PREFIX}{nonce.hex()}:{base64.b64encode(ct).decode('ascii')}:{tag}"
+
+
+def _posix_decrypt_str(token: str) -> str:
+    body = token[len(_POSIX_ENC_PREFIX) :]
+    parts = body.split(":")
+    if len(parts) != 3:
+        return ""
+    try:
+        nonce = bytes.fromhex(parts[0])
+        ct = base64.b64decode(parts[1], validate=True)
+        tag = parts[2].lower()
+    except Exception:
+        return ""
+    if len(nonce) != 16:
+        return ""
+    try:
+        master = _get_or_create_posix_master_key()
+    except Exception:
+        return ""
+    enc_key = hmac.new(master, b"enc::v1", hashlib.sha256).digest()
+    mac_key = hmac.new(master, b"mac::v1", hashlib.sha256).digest()
+    expected_tag = hmac.new(mac_key, nonce + ct + _DPAPI_ENTROPY, hashlib.sha256).hexdigest()
+    if not hmac.compare_digest(tag, expected_tag):
+        return ""
+    try:
+        return _posix_ctr_xor(enc_key, nonce, ct).decode("utf-8")
+    except Exception:
+        return ""
 
 
 def dpapi_encrypt_str(plaintext: str) -> str:
-    """Encrypt string with Windows CurrentUser DPAPI (bound to current Windows login account)."""
+    """Encrypt string with Windows CurrentUser DPAPI on Windows, or 0o600 authenticated keystore on macOS/Linux."""
     s = (plaintext or "").strip()
     if not s:
         return ""
     if sys.platform != "win32":
-        raise RuntimeError("DPAPI encryption is only supported on Windows.")
+        return _posix_encrypt_str(s)
 
     crypt32 = ctypes.windll.crypt32
     kernel32 = ctypes.windll.kernel32
@@ -90,9 +213,13 @@ def dpapi_encrypt_str(plaintext: str) -> str:
 
 
 def dpapi_decrypt_str(token: str) -> str:
-    """Decrypt a dpapi:v1:... token bound to current Windows user. Returns '' on failure/other machine."""
+    """Decrypt a dpapi:v1:... (Windows) or posix:v1:... (macOS/Linux) token. Returns '' on failure."""
     t = (token or "").strip()
-    if not t or not t.startswith(_DPAPI_PREFIX) or sys.platform != "win32":
+    if not t:
+        return ""
+    if t.startswith(_POSIX_ENC_PREFIX):
+        return _posix_decrypt_str(t)
+    if not t.startswith(_DPAPI_PREFIX) or sys.platform != "win32":
         return ""
     try:
         enc_bytes = base64.b64decode(t[len(_DPAPI_PREFIX) :], validate=True)
@@ -255,9 +382,7 @@ def _is_reparse_or_symlink(p: Path) -> bool:
 
 
 def _resolve_secure_work_root() -> Path:
-    local_app = os.environ.get("LOCALAPPDATA", "").strip()
-    base_root = Path(local_app) if local_app else Path(tempfile.gettempdir())
-    tool_root = base_root / "ScatteredRevisionTool"
+    tool_root = get_user_app_data_dir()
     app_root = tool_root / "work"
 
     for check_p in (tool_root, app_root):
@@ -355,12 +480,10 @@ def create_ephemeral_workdir(stem: str, max_age_hours: float = 6.0) -> Path:
 def create_secure_update_stagedir(max_age_hours: float = 2.0) -> Path:
     """
     Create and return a per-user update staging directory under
-    `%LOCALAPPDATA%\\ScatteredRevisionTool\\updates\\`, rejecting symlink or NTFS
+    `ScatteredRevisionTool/updates/`, rejecting symlink or NTFS
     reparse points on every ancestor/target directory (mitigates CWE-377 / CWE-59).
     """
-    local_app = os.environ.get("LOCALAPPDATA", "").strip()
-    base_root = Path(local_app) if local_app else Path(tempfile.gettempdir())
-    tool_root = base_root / "ScatteredRevisionTool"
+    tool_root = get_user_app_data_dir()
     updates_root = tool_root / "updates"
 
     for check_p in (tool_root, updates_root):

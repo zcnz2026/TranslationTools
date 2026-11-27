@@ -18,8 +18,13 @@ from typing import List, Optional, Sequence
 from ai_client import ApiKeyPool
 from library_ingester import run_library_ingestion_pipeline
 from proofread_ingester import run_proofread_ingestion_pipeline
+from security_utils import open_path_in_os
 from sheets_reader import ColumnMappingConfig, GoogleOAuthManager
 from win_dnd import WinFileDropManager
+
+_UI_FONT = "PingFang SC" if sys.platform == "darwin" else "Microsoft YaHei UI"
+_MONO_FONT = "Menlo" if sys.platform == "darwin" else "Consolas"
+_PT_9 = 12 if sys.platform == "darwin" else 9
 
 
 class _WinRect(ctypes.Structure):
@@ -129,7 +134,7 @@ def _make_drop_banner(parent: tk.Misc, text: str, on_click) -> tk.Frame:
     lbl = tk.Label(
         zone,
         text=text,
-        font=("Microsoft YaHei UI", 9, "bold"),
+        font=(_UI_FONT, _PT_9, "bold"),
         fg="#1d4ed8",
         bg="#eff6ff",
         anchor=tk.W,
@@ -194,7 +199,7 @@ class GoogleOAuthDialog(tk.Toplevel):
             step2_box,
             textvariable=self.status_var,
             foreground="#1d4ed8",
-            font=("Microsoft YaHei UI", 9, "bold"),
+            font=(_UI_FONT, _PT_9, "bold"),
         ).pack(anchor=tk.W, fill=tk.X, pady=(0, 10))
 
         btn_row = ttk.Frame(step2_box)
@@ -498,7 +503,7 @@ class IngestTabPanel:
         self.log_box = scrolledtext.ScrolledText(
             bot_box,
             height=8,
-            font=("Consolas", 9),
+            font=(_MONO_FONT, _PT_9),
             wrap=tk.WORD,
             state=tk.DISABLED,
         )
@@ -554,7 +559,7 @@ class IngestTabPanel:
         ttk.Label(self.pr_lbl_row_3a, text="可选：通读定稿表（粘贴 Google Sheets 链接，或直接将本地 .xlsx/.csv 拖入下方框内）：").pack(side=tk.LEFT)
         ttk.Button(self.pr_lbl_row_3a, text="+ 添加本地 Excel", command=self._add_3a_xlsx).pack(side=tk.RIGHT)
 
-        self.a3_proofread_txt = scrolledtext.ScrolledText(parent, height=3, font=("Consolas", 9))
+        self.a3_proofread_txt = scrolledtext.ScrolledText(parent, height=3, font=(_MONO_FONT, _PT_9))
         self.a3_proofread_txt.grid(row=6, column=0, columnspan=3, sticky=tk.EW, pady=(0, 4))
 
         # Row 7: Conflict policy
@@ -623,7 +628,7 @@ class IngestTabPanel:
         ).pack(side=tk.LEFT)
         ttk.Button(self.lbl_row_3b, text="+ 添加本地 Excel/CSV", command=self._add_3b_local_sheet).pack(side=tk.RIGHT)
 
-        self.b3_links_txt = scrolledtext.ScrolledText(parent, height=6, font=("Consolas", 9))
+        self.b3_links_txt = scrolledtext.ScrolledText(parent, height=6, font=(_MONO_FONT, _PT_9))
         self.b3_links_txt.grid(row=4, column=0, columnspan=3, sticky=tk.NSEW, pady=(0, 6))
 
         act_row = ttk.Frame(parent)
@@ -838,10 +843,7 @@ class IngestTabPanel:
     def _open_last_output(self):
         target = self._last_out_dir or self.out_dir_var.get().strip() or self.pr_out_dir_var.get().strip()
         if target and Path(target).is_dir():
-            try:
-                os.startfile(target)  # type: ignore[attr-defined]
-            except Exception:
-                pass
+            open_path_in_os(target)
         else:
             messagebox.showinfo("提示", "请先选择或生成有效的输出目录。")
 

@@ -98,6 +98,8 @@ def _resolve_cache_path(resolved_lib_dir: Path) -> Path:
     env_override = os.environ.get("SCATTERED_REV_CACHE_DIR", "").strip()
     if env_override:
         candidates.append(Path(env_override))
+    if sys.platform == "darwin":
+        candidates.append(Path.home() / "Library" / "Application Support" / "ScatteredRevisionTool")
     local_app = os.environ.get("LOCALAPPDATA", "").strip()
     if local_app:
         candidates.append(Path(local_app) / "ScatteredRevisionTool")

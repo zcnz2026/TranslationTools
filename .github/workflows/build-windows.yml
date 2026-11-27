@@ -1,4 +1,4 @@
-name: Build Windows Desktop App
+name: Build Windows & macOS Desktop Apps
 
 on:
   push:
@@ -49,9 +49,53 @@ jobs:
           if-no-files-found: error
           retention-days: 90
 
+  build-macos:
+    name: Build macOS (${{ matrix.arch }}) App Bundle
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 15
+    permissions:
+      contents: read
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: arm64
+            runner: macos-15
+          - arch: x64
+            runner: macos-15-intel
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Set up Python 3.13
+        uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
+        with:
+          python-version: "3.13"
+
+      - name: Verify Tcl/Tk runtime & build macOS .app bundle
+        shell: bash
+        run: |
+          set -euo pipefail
+          python -c "import tkinter, _tkinter; print('Bundled Tk version:', tkinter.TkVersion)"
+          python ./.github/scripts/ci_build_macos.py --arch "${{ matrix.arch }}"
+
+      - name: Upload macOS (${{ matrix.arch }}) package artifact
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: ScatteredRevisionTool-macOS-${{ matrix.arch }}
+          path: |
+            artifact_out/ScatteredRevisionTool-macOS-${{ matrix.arch }}.zip
+            artifact_out/SHA256SUMS.mac-${{ matrix.arch }}.txt
+          if-no-files-found: error
+          retention-days: 90
+
   publish-release:
     name: Publish GitHub Release
-    needs: build-windows
+    needs:
+      - build-windows
+      - build-macos
     if: startsWith(github.ref, 'refs/tags/v')
     runs-on: windows-latest
     permissions:
@@ -61,26 +105,55 @@ jobs:
         uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
         with:
           name: ScatteredRevisionTool-Windows-x64
-          path: release_assets
+          path: release_assets/win
 
-      - name: Create or update GitHub Release
+      - name: Download built macOS arm64 package
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: ScatteredRevisionTool-macOS-arm64
+          path: release_assets/mac-arm64
+
+      - name: Download built macOS x64 package
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: ScatteredRevisionTool-macOS-x64
+          path: release_assets/mac-x64
+
+      - name: Merge unified SHA256SUMS.txt and publish GitHub Release
         shell: pwsh
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           REPO_SLUG: ${{ github.repository }}
           TAG_NAME: ${{ github.ref_name }}
         run: |
+          $winSums = [System.IO.File]::ReadAllText(".\release_assets\win\SHA256SUMS.txt").Trim()
+          $macArmSums = [System.IO.File]::ReadAllText(".\release_assets\mac-arm64\SHA256SUMS.mac-arm64.txt").Trim()
+          $macX64Sums = [System.IO.File]::ReadAllText(".\release_assets\mac-x64\SHA256SUMS.mac-x64.txt").Trim()
+          $mergedSums = "$winSums`n$macArmSums`n$macX64Sums`n"
+          $utf8NoBom = [System.Text.UTF8Encoding]::new($false)
+          [System.IO.File]::WriteAllText("$PWD\release_assets\SHA256SUMS.txt", $mergedSums, $utf8NoBom)
+          Write-Host "=== Unified SHA256SUMS.txt ==="
+          Write-Host $mergedSums
+
           gh release view "$env:TAG_NAME" --repo "$env:REPO_SLUG" 2>$null
           if ($LASTEXITCODE -eq 0) {
             gh release upload "$env:TAG_NAME" `
-              ".\release_assets\ScatteredRevisionTool-Windows-x64.zip" `
+              ".\release_assets\win\ScatteredRevisionTool-Windows-x64.zip" `
+              ".\release_assets\mac-arm64\ScatteredRevisionTool-macOS-arm64.zip" `
+              ".\release_assets\mac-x64\ScatteredRevisionTool-macOS-x64.zip" `
               ".\release_assets\SHA256SUMS.txt" `
               --clobber --repo "$env:REPO_SLUG"
+            gh release edit "$env:TAG_NAME" `
+              --title "Scattered Revision Tool $env:TAG_NAME (Windows & macOS)" `
+              --notes-file ".\release_assets\win\RELEASE_NOTES.md" `
+              --repo "$env:REPO_SLUG"
           } else {
             gh release create "$env:TAG_NAME" `
-              ".\release_assets\ScatteredRevisionTool-Windows-x64.zip" `
+              ".\release_assets\win\ScatteredRevisionTool-Windows-x64.zip" `
+              ".\release_assets\mac-arm64\ScatteredRevisionTool-macOS-arm64.zip" `
+              ".\release_assets\mac-x64\ScatteredRevisionTool-macOS-x64.zip" `
               ".\release_assets\SHA256SUMS.txt" `
-              --title "Scattered Revision Tool $env:TAG_NAME (Windows x64)" `
-              --notes-file ".\release_assets\RELEASE_NOTES.md" `
+              --title "Scattered Revision Tool $env:TAG_NAME (Windows & macOS)" `
+              --notes-file ".\release_assets\win\RELEASE_NOTES.md" `
               --repo "$env:REPO_SLUG"
           }
